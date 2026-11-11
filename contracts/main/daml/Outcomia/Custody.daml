@@ -62,6 +62,13 @@ data BalanceMovement = BalanceMovement with
     walletHoldings : [ContractId H.Holding]
   deriving (Eq, Show)
 
+-- | Internal settlement result. The other holding is bound by the calling
+-- reserve to its successor; it is never a wallet receipt or an extra credit.
+data BackingPartition = BackingPartition with
+    balance : ContractId AssetBalance
+    otherCash : Optional (ContractId H.Holding)
+  deriving (Eq, Show)
+
 -- | One canonical vault holding backs this trader's available balance. Its
 -- amount must equal available, checked before every move. A zero balance has no
 -- holding. One holding avoids unbounded input growth during later settlement;
@@ -134,6 +141,46 @@ template AssetBalance
         next <- create this with available = available - amount; cash = nextCash
         pure BalanceMovement with balance = next; walletHoldings = result.received
 
+    -- | Inputs: another vault holding, its recorded amount, signed account
+    -- delta and registry context. Requires BOTH owner and vault authority;
+    -- ordinary traders cannot invoke this internal settlement choice alone.
+    -- Rejects: inconsistent backing, insufficient funds, zero delta or fragmenting
+    -- outputs. Result: two disjoint canonical holdings and the account successor.
+    -- The calling reserve must bind otherCash to its own updated accounting.
+    -- Raw vault signers remain trusted, as they already can move registry funds.
+    choice AssetBalance_Repartition : BackingPartition
+      with
+        otherCash : Optional (ContractId H.Holding)
+        otherAmount : Decimal
+        delta : Decimal
+        extraArgs : ExtraArgs
+      controller owner, vault
+      do
+        validateBacking this
+        assertMsg "Other backing shape is invalid"
+          (otherAmount >= 0.0 && ((otherAmount == 0.0) == (otherCash == None)))
+        total <- holdingTotal (H.InstrumentId instrument.admin instrument.id)
+          (H.Account (Some vault) None "") (optionalHoldings otherCash)
+        assertMsg "Other backing amount is incorrect" (total == otherAmount)
+        let nextAvailable = available + delta
+        let nextOther = otherAmount - delta
+        assertMsg "Partition must move a covered positive amount"
+          (delta /= 0.0 && nextAvailable >= 0.0 && nextOther >= 0.0)
+        -- Example: available=5, reserve=2, delta=-3 => available=2, reserve=5.
+        -- Both old holdings are consumed; no unchanged holding can also back a
+        -- successor elsewhere. If the account empties, receive the whole reserve
+        -- instead: the generic transfer boundary disallows zero transfers.
+        let target = if nextAvailable > 0.0 then nextAvailable else nextOther
+        intent <- transferIntent vault vault target
+          (optionalHoldings cash ++ optionalHoldings otherCash) extraArgs
+        result <- transferExact factory instrument intent
+        received <- exactlyOne result.received
+        change <- canonicalOptional (if nextAvailable > 0.0 then nextOther else 0.0) result.change
+        let accountCash = if nextAvailable > 0.0 then Some received else None
+        let reserveCash = if nextAvailable > 0.0 then change else Some received
+        next <- create this with available = nextAvailable; cash = accountCash
+        pure BackingPartition with balance = next; otherCash = reserveCash
+
 -- | Input: signed account state. Rejects an inactive, locked, foreign or
 -- incorrectly sized backing holding. Result: no mutation; the fetch binds the
 -- checked holding to the same atomic transaction as its subsequent consumption.
@@ -153,6 +200,14 @@ exactlyOne : [ContractId H.Holding] -> Update (ContractId H.Holding)
 exactlyOne holdings = case holdings of
   [cid] -> pure cid
   _ -> abort "Registry must return one canonical receiver holding"
+
+-- | Inputs: expected nonnegative amount and verified transfer outputs. Rejects
+-- fragmentation or a zero/nonzero shape mismatch. Result: canonical optional ID.
+canonicalOptional : Decimal -> [ContractId H.Holding] -> Update (Optional (ContractId H.Holding))
+canonicalOptional amount holdings = case (amount, holdings) of
+  (0.0, []) -> pure None
+  (_, [cid]) | amount > 0.0 -> pure (Some cid)
+  _ -> abort "Registry returned noncanonical backing change"
 
 -- | Inputs: fixed owners, amount, holdings and registry context. Result: a
 -- request bounded to one minute from ledger time. Transfer validation remains

@@ -20,6 +20,14 @@ data CollateralInstrument = CollateralInstrument with
     id : Text
   deriving (Eq, Ord, Show)
 
+-- | Stable market identity across Draft/Open/Closed contract revisions. Clients
+-- must also pin the configured protocol lineage; names are not globally unique.
+data MarketKey = MarketKey with
+    operator : Party
+    protocolName : Text
+    marketId : Int
+  deriving (Eq, Ord, Show)
+
 -- | These criteria are authoritative structured market terms. The attachment
 -- hash identifies an external document; its bytes must be verified by clients.
 -- The ledger cannot download an HTTP/Arweave document during interpretation.
