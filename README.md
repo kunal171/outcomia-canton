@@ -14,3 +14,23 @@ No private environment files, keys or deployment credentials were copied.
 
 Each checkpoint uses small commits on a feature branch, one pull request, and a
 merge before the next checkpoint begins. See [the plan](docs/delivery-plan.md).
+
+## App
+
+Use Node 24 (`nvm use`), then:
+
+```bash
+cd app
+npm ci
+cp .env.example .env.local  # First setup only.
+npm run dev -- --port 3012
+```
+
+The wallet must have an allocated primary party on the configured Canton
+network (`canton:devnet` by default). See [the app guide](app/README.md) and
+[wallet boundary](docs/wallet-gateway.md).
+
+## Checkpoint status
+
+The Console Wallet gateway is implemented. Canton market contracts are not yet
+deployed. See [verification and the real-wallet smoke step](docs/checkpoint-01-verification.md).
