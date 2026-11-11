@@ -1,0 +1,3 @@
+# Unified patches contain context prefixes before tabs and empty context lines.
+# Preserve that syntax; normal source files keep Git's whitespace checks.
+tools/patches/*.patch -whitespace
