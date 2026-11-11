@@ -3,7 +3,8 @@
 This checkpoint added Daml contracts for draft creation, opening and administrative
 closure. [Transfers](collateral-transfers.md), [balances](collateral-custody.md)
 and [complete sets](complete-set-positions.md) are separate contract modules.
-Orders, matching, resolution and payouts remain unimplemented. The
+[Resting orders](binary-limit-orders.md) add funding/cancellation; matching,
+resolution and payouts remain unimplemented. The
 shared frontend must keep showing `Market deployment pending` until a deployment
 and wallet-to-ledger integration are verified.
 

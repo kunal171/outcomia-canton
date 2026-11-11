@@ -2,7 +2,8 @@
 
 A split reserves one collateral unit and creates one YES plus one NO unit. A
 merge consumes one of each and returns one collateral unit to the trader's
-available balance. There are no orders, outcome transfers or final payouts yet.
+available balance. [Resting orders](binary-limit-orders.md) can now escrow buys
+and sells. Trade execution, outcome transfers and final payouts remain.
 
 ```mermaid
 flowchart LR

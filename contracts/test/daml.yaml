@@ -2,6 +2,11 @@ sdk-version: 3.7.1
 name: outcomia-markets-test
 version: 0.1.0
 source: daml
+# The genuine 128-order test returns its full IDE-ledger history, including
+# successive book snapshots. Bound test transport at 32 MiB; production ledger
+# submission limits are separate and must still be measured before deployment.
+script-service:
+  grpc-max-message-size: 33554432
 dependencies:
   - daml-prim
   - daml-stdlib
