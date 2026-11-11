@@ -1,5 +1,6 @@
 -- | Authorized binary market creation and lifecycle. This package cannot hold
--- funds, place orders, resolve outcomes or redeem positions yet.
+-- funds, place orders, resolve outcomes or redeem positions yet. Token transfers
+-- are handled separately by Outcomia.Assets; they do not create balances.
 --
 -- The operator is a trust anchor, not a privileged trader: it approves creator
 -- permissions and co-signs market contracts. Each creation consumes one protocol
@@ -9,6 +10,8 @@ module Outcomia.Binary where
 
 import DA.List (unique)
 import qualified DA.Text as T
+import Outcomia.Assets (AssetAdmission(..))
+import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Outcomia.Types
 import Outcomia.Validation
 
@@ -36,6 +39,21 @@ template Protocol
         assertMsg "Admins must be unique, include the operator and number at most 64"
           (validAdmins operator replacementAdmins)
         create this with admins = replacementAdmins
+
+    -- | Inputs: asset identity and the exact factory verified by the operator.
+    -- Rejects: another caller, blank asset ID or a mismatched factory admin.
+    -- Result: revocable admission for new transfers, not a token balance.
+    -- The view comparison is a consistency check; the operator must authenticate
+    -- the registry's factory contract and vetted code before approving it.
+    nonconsuming choice Protocol_ApproveAsset : ContractId AssetAdmission
+      with
+        instrument : CollateralInstrument
+        factory : ContractId T.TransferFactory
+      controller operator
+      do
+        factoryView <- exercise factory T.TransferFactory_PublicFetch with actors = [operator]
+        assertMsg "Registry factory has the wrong instrument admin" (factoryView.admin == instrument.admin)
+        create AssetAdmission with operator; instrument; factory
 
     -- | Inputs: creator and immutable binary terms. The creator must authorize
     -- this choice; this protocol's signatory supplies the operator authorization.
