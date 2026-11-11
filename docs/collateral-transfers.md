@@ -3,7 +3,8 @@
 This is the first part of collateral support. It moves real ledger holdings
 through the Token Standard V2 interface and verifies the result. It does not
 create an Outcomia balance, lock backing collateral, mint YES/NO positions or
-connect the shared UI to a live registry yet.
+connect the shared UI to a live registry yet. [Custody balances](collateral-custody.md)
+now use this boundary for deposits and withdrawals.
 
 ```mermaid
 flowchart LR
@@ -92,8 +93,8 @@ make DPM="$PWD/target/tools/dpm" test
 ```
 
 The local DPM override addresses [the separate path issue](dpm-local-path-issue.md).
-There are 21 passing Daml scripts: 11 transfer scripts and the existing 10
-lifecycle/validation scripts. Four Python tests cover dependency download
+There are 31 passing Daml scripts: 11 transfer scripts, 10 custody scripts and
+10 lifecycle/validation scripts. Four Python tests cover dependency download
 integrity and source/path restrictions.
 
 Coverage includes both-owner authorization, approval/revocation, forged admin

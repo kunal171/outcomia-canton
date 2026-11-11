@@ -1,8 +1,9 @@
 # Collateral custody
 
-Status: decision pending. There are no deposit balances or outcome positions yet.
+Decision: use a dedicated vault party for the first version. Its signer/hosting
+trust remains explicit. Outcome positions are the next part of this checkpoint.
 
-The next contracts must hold real collateral before issuing YES/NO positions.
+The custody contracts hold real collateral before issuing YES/NO positions.
 Our [transfer adapter](collateral-transfers.md) verifies unlocked transfers; it
 does not reserve tokens or prevent their owner from spending them later.
 
@@ -26,6 +27,51 @@ would not implement a reservation system.
 
 No public registry, asset or hosting arrangement has been selected for this
 checkpoint. Local test holdings are not evidence of public-network support.
+
+## Available balances
+
+`VaultAuthority` is signed by the operator and a distinct vault party. A trader
+enrolls once per asset using an active admission. Enrollment consumes the current
+authority revision, so two enrollments for the same trader/asset cannot succeed
+within that lineage. Clients must pin one configured root: joint operator/vault
+signers could create another root. The prototype index holds at most 1,024
+enrollments. This bounds contract size but serializes onboarding and exposes
+enrolled keys to subsequent enrollees; it is unsuitable for private club accounts
+without a separate privacy/uniqueness design.
+
+`AssetBalance` is signed by the trader and vault. Its available amount is backed
+by one vault-owned holding. A zero account has no holding. No account is tied to
+a particular market, and neither operator nor trader alone can forge a funded
+account. Joint vault/trader signers remain trusted.
+
+Deposits use an active admission matching the enrolled operator, asset and exact
+factory. A pinned transfer choice performs these checks without granting the
+trader operator authority. Wallet inputs move to the vault and are consolidated
+with existing backing in the same transaction. For example, 2 available plus a
+deposit of 3 produces one holding of 5 and a new balance revision. Wallet change
+is returned separately.
+
+Only the owner can withdraw through the balance choice. It consumes backing and
+creates the successor with exact change, using the saved factory even after
+admission revocation. Both paths check the old holding amount against the signed
+balance; stale accounts and consumed holdings cannot be reused.
+
+Consolidation must return one receiver holding with no change. Withdrawal must
+return at most one change holding. Fragmenting registries are unsupported by
+this custody adapter even when their transfers satisfy the generic standard.
+The existing transfer limit is 16 inputs, including old backing during
+consolidation. Unsupported output shapes roll back the entire operation.
+
+Clients still need registry context and visibility/disclosures for referenced
+contracts. Local tests use issuer read access to supply visibility; that is not
+a production wallet integration or permission to sign as the issuer.
+
+Ten custody scripts cover deposits, consolidation, partial/full withdrawals,
+owner authorization, duplicate/stale enrollment, invalid amounts, receipt
+replay, revoked admission, asset/factory/operator isolation, faulty registry
+rollback, mismatched backing, capacity limits and the smallest Decimal amount.
+The complete suite passes 31 Daml scripts and four dependency-integrity tests.
+The production DAR also passes validation. These are local ledger checks.
 
 ## Rules for either model
 
