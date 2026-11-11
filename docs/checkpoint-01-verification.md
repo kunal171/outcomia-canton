@@ -1,37 +1,49 @@
 # Checkpoint 1 verification
 
-Verified on 2026-11-11 with Node 24.21.0, Next.js 16.4.6 and Console Wallet SDK
-3.0.0. This report covers the wallet gateway, not market contracts or settlement.
+The wallet implementation now lives in the
+[shared Outcomia app](https://github.com/kunal171/outcomia/tree/master/app).
+This checkpoint verifies the wallet gateway, not Canton market contracts.
 
 ## Automated checks
 
-- TypeScript check and production build: passed.
-- Five identity/network tests: passed.
-- `npm audit` after compatible fixes: zero known vulnerabilities reported.
-- Browser at 320, 390, 768 and 1440 px: no page overflow; screenshots reviewed.
-- Light/dark appearance and cookie restoration: passed.
-- No wallet requests before the user initiates connection: passed.
-- Unconnected direct navigation to `/markets`: returns to the gateway.
-- Successful connection, reload verification, rejected approval, wrong network,
-  missing extension, account changes and stale account reads: passed.
-- Manual disconnect and wallet-side revocation clear the gated workspace.
-- The browser fixture used the real SDK with mocked extension postMessage
-  responses. No external requests, signatures or transactions were issued.
+In the shared app, TypeScript, production build and five Canton session tests
+passed, along with the existing prediction, wallet, shared-trading, RPC, theme
+and five-language translation checks.
 
-The browser fixture and screenshots are local validation artifacts in ignored
-`target/`; they are not a production wallet implementation or shipped mock.
-The committed identity tests run with `cd app && npm test`.
+Local browser checks used the real Console Wallet SDK with mocked extension
+responses and a Solana wallet-standard fixture. They covered:
 
-## Real-wallet smoke test still required
+- Landing at 320, 390, 768 and 1440 px, without overflow.
+- No chain reads or wallet requests before selection.
+- Both wallet paths, switching in both directions and same-wallet reconnect.
+- Reload verification and preservation of a requested Solana page.
+- Rejected approval, wrong network and absent Console extension.
+- Account changes and stale asynchronous party responses.
+- Disconnect, wallet-side revocation and wrong-chain URLs.
+- No Solana RPC reads while using Canton; queued requests stop on exit.
 
-On the presentation machine, install Console Wallet and select the configured
-network (`canton:devnet` by default) with an allocated primary party. Start the
-app, approve connection, inspect the displayed party, change accounts, then
-disconnect. Check rejection once as well. No real extension account or key was
-available in the automated browser, so live wallet approval is not claimed here.
+Existing Solana prediction and spot browser checks also passed, including
+claims, cancellation after close, exact amounts, retained inputs, failed reads
+and zero-balance withdrawal guards. No real signatures or transactions were
+submitted. Fixtures and screenshots are local artifacts in the shared checkout's
+ignored `target/ui-checks/`.
 
-## Current product boundary
+The shared lockfile audit still has 50 findings (53 on the previous master).
+Next.js is updated to 16.4.6; remaining dependency work is separate from this
+repository-ownership correction. The earlier standalone app's clean audit does
+not describe the larger shared app.
 
-The app reports `Market deployment pending`. Daml market creation, collateral,
-orders, matching, resolution and redemption are subsequent feature PRs. No mock
-market listings or successful settlements are displayed.
+## Real-wallet smoke still required
+
+On the presentation machine, install Console Wallet and select an allocated
+primary party on the configured network. Run the shared app, approve the
+connection, inspect party/network, change accounts, switch wallets and disconnect.
+Reject one connection request as well. Automated fixtures do not establish that
+an actual installed extension approved a live account.
+
+## Product boundary
+
+The Canton workspace reports `Market deployment pending`. Market creation,
+collateral, orders, matching, resolution and redemption are subsequent feature
+PRs. The removed duplicate app remains available in Git history; the shared app
+is the single frontend source.

@@ -1,36 +1,24 @@
 # Outcomia Canton
 
-A limit-order prediction market for Canton Network.
+Canton contracts and services for Outcomia's limit-order prediction markets.
+Binary markets come first, followed by multi-outcome markets, clubs/private
+markets and governance-created markets. Multi-outcome markets initially have
+exactly one winner. Canton spot trading is outside the current scope.
 
-The product starts with binary YES/NO markets, followed by markets with multiple
-outcomes, clubs/private markets and governance-created markets. Multi-outcome
-markets initially have exactly one winning outcome. Spot trading and Solana
-integration are outside this repository's current scope.
+## Shared frontend
 
-The UI reuses Outcomia's design from `kunal171/outcomia` at commit `60309a9`.
-No private environment files, keys or deployment credentials were copied.
+The UI lives in [`kunal171/outcomia/app`](https://github.com/kunal171/outcomia/tree/master/app).
+There is no separate Canton frontend. That app uses the selected wallet to open
+Solana markets or the Canton prediction workspace. Console Wallet must provide
+an allocated primary party on the configured network (`canton:devnet` by default).
+
+Run the shared app using [its setup guide](https://github.com/kunal171/outcomia/blob/master/app/README.md).
+See [the wallet boundary](docs/wallet-gateway.md) and
+[verification](docs/checkpoint-01-verification.md).
 
 ## Delivery
 
-Each checkpoint uses small commits on a feature branch, one pull request, and a
-merge before the next checkpoint begins. See [the plan](docs/delivery-plan.md).
-
-## App
-
-Use Node 24 (`nvm use`), then:
-
-```bash
-cd app
-npm ci
-cp .env.example .env.local  # First setup only.
-npm run dev -- --port 3012
-```
-
-The wallet must have an allocated primary party on the configured Canton
-network (`canton:devnet` by default). See [the app guide](app/README.md) and
-[wallet boundary](docs/wallet-gateway.md).
-
-## Checkpoint status
-
-The Console Wallet gateway is implemented. Canton market contracts are not yet
-deployed. See [verification and the real-wallet smoke step](docs/checkpoint-01-verification.md).
+Use small commits, a feature PR, and a merge before the next checkpoint. See
+[the plan](docs/delivery-plan.md). The shared wallet gateway is implemented;
+Canton market contracts, collateral, order matching and settlement are next.
+No Canton markets are deployed yet.
