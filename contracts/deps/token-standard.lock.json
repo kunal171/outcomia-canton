@@ -1,0 +1,19 @@
+{
+  "repository": "canton-network/splice",
+  "revision": "c961df87ba6943a8647911e7911f010938bfdd0b",
+  "directory": "daml/dars",
+  "artifacts": [
+    {
+      "name": "splice-api-token-metadata-v1-1.0.0.dar",
+      "sha256": "455eb160cb5abd4ae9918a6fbb9dad471f721adda39f0e5c76feef08d05637fc"
+    },
+    {
+      "name": "splice-api-token-holding-v2-1.0.0.dar",
+      "sha256": "f044b34d7a28c2b6c8a540af720297d55450a889b451dc4eed64a9914f1d6b00"
+    },
+    {
+      "name": "splice-api-token-transfer-instruction-v2-1.0.0.dar",
+      "sha256": "720e766456b33abdd26bfc21e54d19413559f0a7ee52000e12d3b6c308199faa"
+    }
+  ]
+}
