@@ -1,0 +1,199 @@
+-- | Real holding transfers and account revisions must commit together. Negative
+-- authorization tests grant read access so invisibility cannot explain failure.
+module Outcomia.CustodyTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1
+import Outcomia.AssetTransferTest qualified as F
+import Outcomia.Assets
+import Outcomia.Binary
+import Outcomia.Custody
+import Outcomia.TokenHarness
+import Outcomia.Types
+
+data Fixture = Fixture with
+    asset : F.Fixture
+    vault : Party
+    authority : ContractId VaultAuthority
+    balance : ContractId AssetBalance
+  deriving (Eq, Show)
+
+setup : FactoryMode -> Script Fixture
+setup mode = script do
+  asset <- F.setup mode
+  vault <- allocatePartyByHint (PartyIdHint ("Vault-" <> show mode))
+  root <- submit [asset.operator, vault] do
+    createCmd VaultAuthority with operator = asset.operator; vault; protocolName = "outcomia"; accounts = []
+  (authority, balance) <- submit (actAs asset.alice <> readAs asset.operator) do
+    exerciseCmd root VaultAuthority_OpenBalance with owner = asset.alice; admission = asset.admission
+  pure Fixture with asset; vault; authority; balance
+
+registryContext : ExtraArgs
+registryContext = ExtraArgs emptyChoiceContext emptyMetadata
+
+deposit : Fixture -> ContractId AssetBalance -> Decimal -> [ContractId H.Holding] -> Script BalanceMovement
+deposit f balance amount inputs = submit (actAs f.asset.alice <> readAs [f.asset.operator, f.asset.issuer]) do
+  exerciseCmd balance AssetBalance_Deposit with admission = f.asset.admission; inputs; amount; extraArgs = registryContext
+
+withdraw : Fixture -> ContractId AssetBalance -> Decimal -> Script BalanceMovement
+withdraw f balance amount = submit (actAs f.asset.alice <> readAs f.asset.issuer) do
+  exerciseCmd balance AssetBalance_Withdraw with amount; extraArgs = registryContext
+
+loadAccount : Fixture -> ContractId AssetBalance -> Script AssetBalance
+loadAccount f cid = do
+  found <- queryContractId f.asset.alice cid
+  case found of Some value -> pure value; None -> abort "Expected an active account"
+
+-- Compare the recorded balance to the actual registry's vault-owned supply,
+-- and check total asset conservation rather than only transaction return values.
+assertSupply : Fixture -> ContractId AssetBalance -> Decimal -> Script ()
+assertSupply f cid expected = do
+  value <- loadAccount f cid
+  holdings <- query @TestHolding f.asset.issuer
+  assert (value.available == expected)
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some f.vault] == expected)
+  assert (sum [h.amount | (_, h) <- holdings] == 5.0)
+
+testDepositConsolidationAndWithdraw : Script ()
+testDepositConsolidationAndWithdraw = script do
+  f <- setup Good
+  first <- deposit f f.balance 3.0 [toInterfaceContractId @H.Holding f.asset.input]
+  assertSupply f first.balance 3.0
+  second <- deposit f first.balance 1.0 first.walletHoldings
+  assertSupply f second.balance 4.0
+  value <- loadAccount f second.balance
+  assert (value.cash /= None && length second.walletHoldings == 1)
+  partial <- withdraw f second.balance 1.5
+  assertSupply f partial.balance 2.5
+  assert (length partial.walletHoldings == 1)
+  final <- withdraw f partial.balance 2.5
+  assertSupply f final.balance 0.0
+  empty <- loadAccount f final.balance
+  assert (empty.cash == None)
+
+testBalanceOwnerAuthorization : Script ()
+testBalanceOwnerAuthorization = script do
+  f <- setup Good
+  forA_ [f.asset.bob, f.asset.operator, f.vault] (\caller -> do
+    submitMustFail (actAs caller <> readAs [f.asset.alice, f.asset.operator, f.asset.issuer]) do
+      exerciseCmd f.balance AssetBalance_Deposit with
+        admission = f.asset.admission; inputs = [toInterfaceContractId @H.Holding f.asset.input]; amount = 3.0; extraArgs = registryContext)
+  funded <- deposit f f.balance 3.0 [toInterfaceContractId @H.Holding f.asset.input]
+  forA_ [f.asset.bob, f.asset.operator, f.vault] (\caller -> do
+    submitMustFail (actAs caller <> readAs [f.asset.alice, f.vault, f.asset.issuer]) do
+      exerciseCmd funded.balance AssetBalance_Withdraw with amount = 1.0; extraArgs = registryContext)
+  value <- loadAccount f funded.balance
+  submitMustFail f.asset.alice do createCmd value
+  submitMustFail f.vault do createCmd value
+  submitMustFail f.asset.alice do archiveCmd funded.balance
+  assertSupply f funded.balance 3.0
+
+testDuplicateEnrollmentAndStaleRevision : Script ()
+testDuplicateEnrollmentAndStaleRevision = script do
+  f <- setup Good
+  submitMustFail (actAs f.asset.alice <> readAs f.asset.operator) do
+    exerciseCmd f.authority VaultAuthority_OpenBalance with owner = f.asset.alice; admission = f.asset.admission
+  (_, bobBalance) <- submit (actAs f.asset.bob <> readAs f.asset.operator) do
+    exerciseCmd f.authority VaultAuthority_OpenBalance with owner = f.asset.bob; admission = f.asset.admission
+  bob <- queryContractId f.asset.bob bobBalance
+  assert (bob /= None)
+  submitMustFail (actAs f.asset.alice <> readAs f.asset.operator) do
+    exerciseCmd f.authority VaultAuthority_OpenBalance with owner = f.asset.alice; admission = f.asset.admission
+
+testInvalidAmountsAndReceiptReplay : Script ()
+testInvalidAmountsAndReceiptReplay = script do
+  f <- setup Good
+  forA_ [0.0, -1.0, 6.0] (\amount -> do
+    submitMustFail (actAs f.asset.alice <> readAs [f.asset.operator, f.asset.issuer]) do
+      exerciseCmd f.balance AssetBalance_Deposit with
+        admission = f.asset.admission; inputs = [toInterfaceContractId @H.Holding f.asset.input]; amount; extraArgs = registryContext)
+  funded <- deposit f f.balance 3.0 [toInterfaceContractId @H.Holding f.asset.input]
+  forA_ [0.0, -1.0, 3.0000000001] (\amount -> do
+    submitMustFail (actAs f.asset.alice <> readAs f.asset.issuer) do
+      exerciseCmd funded.balance AssetBalance_Withdraw with amount; extraArgs = registryContext)
+  -- Both replaying the old account and crediting its consumed input into a new
+  -- account revision must fail independently.
+  submitMustFail (actAs f.asset.alice <> readAs [f.asset.operator, f.asset.issuer]) do
+    exerciseCmd f.balance AssetBalance_Deposit with admission = f.asset.admission; inputs = funded.walletHoldings; amount = 1.0; extraArgs = registryContext
+  submitMustFail (actAs f.asset.alice <> readAs [f.asset.operator, f.asset.issuer]) do
+    exerciseCmd funded.balance AssetBalance_Deposit with admission = f.asset.admission; inputs = [toInterfaceContractId @H.Holding f.asset.input]; amount = 1.0; extraArgs = registryContext
+  assertSupply f funded.balance 3.0
+
+testRevocationPreservesWithdrawal : Script ()
+testRevocationPreservesWithdrawal = script do
+  f <- setup Good
+  funded <- deposit f f.balance 3.0 [toInterfaceContractId @H.Holding f.asset.input]
+  submit f.asset.operator do archiveCmd f.asset.admission
+  submitMustFail (actAs f.asset.alice <> readAs [f.asset.operator, f.asset.issuer]) do
+    exerciseCmd funded.balance AssetBalance_Deposit with admission = f.asset.admission; inputs = funded.walletHoldings; amount = 1.0; extraArgs = registryContext
+  exited <- withdraw f funded.balance 3.0
+  assertSupply f exited.balance 0.0
+
+testWrongAdmissionAndAssetIsolation : Script ()
+testWrongAdmissionAndAssetIsolation = script do
+  f <- setup Good
+  otherAsset <- submit (actAs f.asset.operator <> readAs f.asset.issuer) do
+    exerciseCmd f.asset.protocol Protocol_ApproveAsset with instrument = CollateralInstrument f.asset.issuer "other"; factory = toInterfaceContractId @T.TransferFactory f.asset.registry
+  otherRegistry <- submit f.asset.issuer do createCmd TestRegistry with issuer = f.asset.issuer; mode = Good
+  otherFactory <- submit (actAs f.asset.operator <> readAs f.asset.issuer) do
+    exerciseCmd f.asset.protocol Protocol_ApproveAsset with instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory otherRegistry
+  otherOperator <- submit f.asset.bob do
+    createCmd AssetAdmission with operator = f.asset.bob; instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory f.asset.registry
+  forA_ [otherAsset, otherFactory, otherOperator] (\admission -> do
+    submitMustFail (actAs f.asset.alice <> readAs [f.asset.operator, f.asset.bob, f.asset.issuer]) do
+      exerciseCmd f.balance AssetBalance_Deposit with admission; inputs = [toInterfaceContractId @H.Holding f.asset.input]; amount = 3.0; extraArgs = registryContext)
+  (_, otherBalance) <- submit (actAs f.asset.alice <> readAs f.asset.operator) do
+    exerciseCmd f.authority VaultAuthority_OpenBalance with owner = f.asset.alice; admission = otherAsset
+  value <- loadAccount f otherBalance
+  assert (value.instrument.id == "other" && value.available == 0.0)
+  assertSupply f f.balance 0.0
+
+testFaultyRegistryCannotCredit : Script ()
+testFaultyRegistryCannotCredit = script do
+  forA_ [Pending, Failed, ShortPayment, WrongChange, WrongAsset, WrongReceiver, LockedOutput, DuplicateOutput, NoOutputs, FragmentedSelf] (\mode -> do
+    f <- setup mode
+    submitMustFail (actAs f.asset.alice <> readAs [f.asset.operator, f.asset.issuer]) do
+      exerciseCmd f.balance AssetBalance_Deposit with admission = f.asset.admission; inputs = [toInterfaceContractId @H.Holding f.asset.input]; amount = 3.0; extraArgs = registryContext
+    F.assertOriginalSupply f.asset
+    assertSupply f f.balance 0.0)
+
+testBackingMismatchRejectsWithdrawal : Script ()
+testBackingMismatchRejectsWithdrawal = script do
+  f <- setup Good
+  funded <- deposit f f.balance 3.0 [toInterfaceContractId @H.Holding f.asset.input]
+  value <- loadAccount f funded.balance
+  -- Joint vault/owner signers can directly construct state: they remain a trust
+  -- boundary. Even then, a numeric credit cannot spend mismatched backing.
+  malformed <- submit [f.vault, f.asset.alice] do createCmd (value with available = 4.0)
+  submitMustFail (actAs f.asset.alice <> readAs f.asset.issuer) do
+    exerciseCmd malformed AssetBalance_Withdraw with amount = 1.0; extraArgs = registryContext
+  assertSupply f funded.balance 3.0
+
+testEnrollmentBoundaries : Script ()
+testEnrollmentBoundaries = script do
+  f <- setup Good
+  submitMustFail (actAs f.vault <> readAs f.asset.operator) do
+    exerciseCmd f.authority VaultAuthority_OpenBalance with owner = f.vault; admission = f.asset.admission
+  wrong <- submit f.asset.bob do
+    createCmd AssetAdmission with operator = f.asset.bob; instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory f.asset.registry
+  submitMustFail (actAs f.asset.alice <> readAs f.asset.bob) do
+    exerciseCmd f.authority VaultAuthority_OpenBalance with owner = f.asset.alice; admission = wrong
+  -- A full index uses distinct real keys so duplicate detection cannot be the
+  -- reason for failure. This is a deployment capacity limit, not a fund lock.
+  full <- submit [f.asset.operator, f.vault] do
+    createCmd VaultAuthority with
+      operator = f.asset.operator; vault = f.vault; protocolName = "capacity-test"
+      accounts = map (\n -> (f.asset.bob, CollateralInstrument f.asset.issuer (show n))) [1..1024]
+  submitMustFail (actAs f.asset.alice <> readAs f.asset.operator) do
+    exerciseCmd full VaultAuthority_OpenBalance with owner = f.asset.alice; admission = f.asset.admission
+
+testFractionalDepositAndExit : Script ()
+testFractionalDepositAndExit = script do
+  f <- setup Good
+  funded <- deposit f f.balance 0.0000000001 [toInterfaceContractId @H.Holding f.asset.input]
+  assertSupply f funded.balance 0.0000000001
+  exited <- withdraw f funded.balance 0.0000000001
+  assertSupply f exited.balance 0.0

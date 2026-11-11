@@ -7,7 +7,7 @@ import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Splice.Api.Token.MetadataV1
 
-data FactoryMode = Good | Pending | Failed | ShortPayment | WrongChange | WrongAsset | WrongReceiver | LockedOutput | DuplicateOutput | NoOutputs
+data FactoryMode = Good | Pending | Failed | ShortPayment | WrongChange | WrongAsset | WrongReceiver | LockedOutput | DuplicateOutput | NoOutputs | FragmentedSelf
   deriving (Eq, Show)
 
 template TestHolding
@@ -63,15 +63,22 @@ registryTransfer issuer mode factory args = do
     Pending -> pure (T.TransferInstructionResult (T.TransferInstructionResult_Pending (coerceContractId factory)) [] emptyMetadata)
     Failed -> pure (T.TransferInstructionResult T.TransferInstructionResult_Failed [] emptyMetadata)
     _ -> do
-      let amount = if mode == ShortPayment then transfer.amount / 2.0 else transfer.amount
+      let fragmented = mode == FragmentedSelf && sender == receiver
+      let amount = if mode == ShortPayment || fragmented then transfer.amount / 2.0 else transfer.amount
       let account = if mode == WrongReceiver then H.Account (Some issuer) None "" else transfer.receiver
       let instrument = if mode == WrongAsset then H.InstrumentId issuer "other" else transfer.instrumentId
       let locked = if mode == LockedOutput then Some (H.Lock [issuer] None None (Some "test lock")) else None
       received <- create TestHolding with issuer; account; instrument; amount; locked
+      -- A standards-compatible fragmented self-transfer tests application-level
+      -- canonicalization failure after the preceding deposit already succeeded.
+      extra <- if fragmented then do
+        cid <- create TestHolding with issuer; account; instrument; amount; locked
+        pure [toInterfaceContractId @H.Holding cid]
+        else pure []
       let changeAmount = total - transfer.amount + (if mode == WrongChange then 1.0 else 0.0)
       change <- if changeAmount == 0.0 then pure [] else do
         cid <- create TestHolding with issuer; account = transfer.sender; instrument = transfer.instrumentId; amount = changeAmount; locked = None
         pure [toInterfaceContractId @H.Holding cid]
       let receivedCid = toInterfaceContractId @H.Holding received
-      let outputs = if mode == NoOutputs then [] else if mode == DuplicateOutput then [receivedCid, receivedCid] else [receivedCid]
+      let outputs = if mode == NoOutputs then [] else if mode == DuplicateOutput then [receivedCid, receivedCid] else receivedCid :: extra
       pure (T.TransferInstructionResult (T.TransferInstructionResult_Completed outputs) change emptyMetadata)
