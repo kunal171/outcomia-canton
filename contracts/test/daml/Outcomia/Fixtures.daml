@@ -1,0 +1,23 @@
+-- | Test-only market terms. These are not deployed markets or real instruments.
+module Outcomia.Fixtures where
+
+import DA.Time (addRelTime, hours)
+import Outcomia.Types
+
+termsFor : Party -> Time -> BinaryTerms
+termsFor issuer now = BinaryTerms with
+  question = "Will the same rocket booster launch twice in 24 hours?"
+  collateral = CollateralInstrument issuer "test-USD"
+  rules = ResolutionRules with
+    yesCriteria = "Two orbital launches by the same booster before cutoff."
+    noCriteria = "No qualifying pair of orbital launches before cutoff."
+    invalidCriteria = "Official launch records become permanently unavailable."
+    evidenceRequirements = "Operator flight records with launch timestamps."
+    documentUri = "ar://example-test-rules"
+    documentSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  closeAt = addRelTime now (hours 24)
+  earliestResolutionAt = None
+  fallback = None
+  resolutionDelaySeconds = 3600
+  priceTick = 0.01
+  quantityLot = 1

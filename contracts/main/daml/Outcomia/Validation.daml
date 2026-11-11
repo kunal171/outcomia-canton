@@ -1,0 +1,55 @@
+-- | Pure creation-time checks shared by factory choices and template invariants.
+-- Time comparisons use ledger effective time; they do not assert exact wall time.
+module Outcomia.Validation where
+
+import qualified DA.Text as T
+import Outcomia.Types
+
+-- | Inputs: a character limit and text. Result: False for blank/oversized text.
+-- Stored content is not silently trimmed or normalized after approval.
+boundedText : Int -> Text -> Bool
+boundedText limit text = T.trim (T.replace "\t" " " (T.replace "\n" " " (T.replace "\r" " " text))) /= "" && T.length text <= limit
+
+-- | Inputs: a digest. Result: True only for 64 lowercase hexadecimal characters.
+-- This checks encoding, not the availability or contents of an external document.
+validDigest : Text -> Bool
+validDigest value = T.length value == 64 && all hex (T.toCodePoints value)
+  where hex c = (48 <= c && c <= 57) || (97 <= c && c <= 102)
+
+-- | Inputs: creator, creation time and immutable terms. Result: all detected
+-- problems, with no ledger effects. The factory rejects these with messages;
+-- the template also enforces an empty list to prevent malformed direct creates.
+termsErrors : Party -> Time -> BinaryTerms -> [Text]
+termsErrors creator createdAt terms =
+  [ message | (message, valid) <- checks, not valid ]
+  where
+    effectiveEarliest = case terms.earliestResolutionAt of
+      None -> terms.closeAt
+      Some earliest -> earliest
+    rules = terms.rules
+    checks =
+      [ ("Question must contain 1 to 500 characters", boundedText 500 terms.question)
+      , ("Collateral instrument ID is required and limited to 128 characters", boundedText 128 terms.collateral.id)
+      , ("YES criteria are required and limited to 4096 characters", boundedText 4096 rules.yesCriteria)
+      , ("NO criteria are required and limited to 4096 characters", boundedText 4096 rules.noCriteria)
+      , ("Invalid-market criteria are required and limited to 4096 characters", boundedText 4096 rules.invalidCriteria)
+      , ("Evidence requirements are required and limited to 4096 characters", boundedText 4096 rules.evidenceRequirements)
+      , ("Rules URI must use ar:// or https:// and be limited to 512 characters",
+          boundedText 512 rules.documentUri &&
+          ((T.isPrefixOf "ar://" rules.documentUri && T.length rules.documentUri > 5) ||
+           (T.isPrefixOf "https://" rules.documentUri && T.length rules.documentUri > 8)))
+      , ("Rules hash must be lowercase SHA-256 hex", validDigest rules.documentSha256)
+      , ("Trading cutoff must be after creation", createdAt < terms.closeAt)
+      , ("Earliest resolution cannot precede trading cutoff", terms.closeAt <= effectiveEarliest)
+      , ("Resolution delay must be 1 to 604800 seconds", 1 <= terms.resolutionDelaySeconds && terms.resolutionDelaySeconds <= 604800)
+      , ("Price tick must be greater than zero and less than one collateral unit", 0.0 < terms.priceTick && terms.priceTick < 1.0)
+      , ("Quantity lot must be positive", terms.quantityLot > 0)
+      ] ++ case terms.fallback of
+        None -> []
+        Some policy ->
+          [ ("Fallback resolver must differ from the creator", policy.resolver /= creator)
+          , ("Fallback cannot start before the earliest resolution time", effectiveEarliest <= policy.availableAt)
+          , ("Fallback deadline must be strictly after availability", case policy.deadlineAt of
+              None -> True
+              Some deadline -> policy.availableAt < deadline)
+          ]

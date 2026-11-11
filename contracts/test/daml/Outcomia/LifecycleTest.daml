@@ -1,0 +1,163 @@
+-- | Ledger-level tests use the compiled production DAR, not a copied model.
+-- readAs is used in negative cases so failure cannot be explained merely by
+-- invisibility. It grants knowledge, never the missing choice authorization.
+module Outcomia.LifecycleTest where
+
+import Daml.Script
+import DA.Time (addRelTime, hours, seconds)
+import Outcomia.Binary
+import Outcomia.Fixtures
+import Outcomia.Types
+
+setup : () -> Script (Party, Party, Party, ContractId Protocol, (Time, BinaryTerms))
+setup () = script do
+  operator <- allocatePartyByHint (PartyIdHint "Operator")
+  creator <- allocatePartyByHint (PartyIdHint "Creator")
+  outsider <- allocatePartyByHint (PartyIdHint "Outsider")
+  now <- getTime
+  protocol <- submit operator do
+    createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator, creator]; nextMarketId = 1
+  pure (operator, creator, outsider, protocol, (now, termsFor operator now))
+
+marketFor : Party -> ContractId BinaryMarket -> Script BinaryMarket
+marketFor party cid = do
+  found <- queryContractId party cid
+  case found of
+    Some market -> pure market
+    None -> abort "Expected an active market"
+
+-- Creation allocates IDs atomically; state changes consume old contracts while
+-- retaining every signed term. Closed markets cannot be reopened or reclosed.
+testLifecycle : Script ()
+testLifecycle = script do
+  (operator, creator, _, protocol, (now, terms)) <- setup ()
+  (next, draft) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  initial <- marketFor creator draft
+  assert (initial.marketId == 1 && initial.status == Draft && initial.terms == terms && initial.createdAt == now)
+  submitMustFail creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  (latest, second) <- submit creator do exerciseCmd next Protocol_CreateBinary with creator; terms
+  secondMarket <- marketFor creator second
+  assert (secondMarket.marketId == 2)
+  opened <- submit creator do exerciseCmd draft Binary_Open with protocol = latest
+  old <- queryContractId creator draft
+  assert (old == None)
+  current <- marketFor creator opened
+  assert (current.status == Open && current.terms == terms && current.marketId == 1)
+  submitMustFail creator do exerciseCmd opened Binary_Open with protocol = latest
+  submitMustFail creator do exerciseCmd opened Binary_Close with protocol = latest; reason = " "
+  closed <- submit creator do exerciseCmd opened Binary_Close with protocol = latest; reason = "Administrative stop"
+  final <- marketFor operator closed
+  assert (final.status == Closed && final.terms == terms && final.closeReason == Some "Administrative stop")
+  submitMustFail creator do exerciseCmd closed Binary_Open with protocol = latest
+  submitMustFail creator do exerciseCmd closed Binary_Close with protocol = latest; reason = "Again"
+
+-- A readable protocol does not make the reader an admin or let them impersonate
+-- a creator. Direct creates also require both market signatories.
+testCreationAuthorization : Script ()
+testCreationAuthorization = script do
+  (operator, creator, outsider, protocol, (now, terms)) <- setup ()
+  submitMustFail (actAs outsider <> readAs operator) do
+    exerciseCmd protocol Protocol_CreateBinary with creator = outsider; terms
+  submitMustFail (actAs outsider <> readAs operator) do
+    exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  submitMustFail (actAs creator <> readAs operator) do
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Open; closeReason = None
+  submitMustFail (actAs operator <> readAs creator) do
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Open; closeReason = None
+  (_, draft) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  submitMustFail (actAs creator <> readAs operator) do archiveCmd draft
+  submitMustFail (actAs operator <> readAs creator) do archiveCmd draft
+  remaining <- marketFor creator draft
+  assert (remaining.status == Draft)
+
+-- Revocation applies to already-created markets. Regranting restores only the
+-- creator's rights; another active admin cannot act on their market.
+testCurrentAdminAndCreatorRequired : Script ()
+testCurrentAdminAndCreatorRequired = script do
+  (operator, creator, outsider, protocol, (_, terms)) <- setup ()
+  (next, draft) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  revoked <- submit operator do exerciseCmd next Protocol_SetAdmins with replacementAdmins = [operator, outsider]
+  submitMustFail (actAs creator <> readAs operator) do exerciseCmd draft Binary_Open with protocol = revoked
+  submitMustFail (actAs outsider <> readAs operator) do exerciseCmd draft Binary_Open with protocol = revoked
+  restored <- submit operator do exerciseCmd revoked Protocol_SetAdmins with replacementAdmins = [operator, creator, outsider]
+  submitMustFail creator do exerciseCmd draft Binary_Open with protocol = next
+  opened <- submit creator do exerciseCmd draft Binary_Open with protocol = restored
+  again <- submit operator do exerciseCmd restored Protocol_SetAdmins with replacementAdmins = [operator, outsider]
+  submitMustFail (actAs creator <> readAs operator) do exerciseCmd opened Binary_Close with protocol = again; reason = "Stop"
+  submitMustFail (actAs outsider <> readAs operator) do exerciseCmd opened Binary_Close with protocol = again; reason = "Stop"
+  final <- submit operator do exerciseCmd again Protocol_SetAdmins with replacementAdmins = [operator, creator]
+  _ <- submit creator do exerciseCmd opened Binary_Close with protocol = final; reason = "Stop"
+  pure ()
+
+testWrongProtocolRejected : Script ()
+testWrongProtocolRejected = script do
+  (operator, creator, outsider, protocol, (_, terms)) <- setup ()
+  (next, draft) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  wrongOperator <- submit outsider do createCmd Protocol with operator = outsider; protocolName = "outcomia"; admins = [outsider, creator]; nextMarketId = 1
+  wrongName <- submit operator do createCmd Protocol with operator; protocolName = "other"; admins = [operator, creator]; nextMarketId = 1
+  submitMustFail creator do exerciseCmd draft Binary_Open with protocol = wrongOperator
+  submitMustFail creator do exerciseCmd draft Binary_Open with protocol = wrongName
+  _ <- submit creator do exerciseCmd draft Binary_Open with protocol = next
+  pure ()
+
+-- The exact closeAt boundary is exclusive. Administrative closure can happen
+-- after cutoff, but it cannot change the signed resolution schedule.
+testCutoffAndClosure : Script ()
+testCutoffAndClosure = script do
+  (operator, creator, _, protocol, (_, terms)) <- setup ()
+  (next, unopened) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  (latest, draft) <- submit creator do exerciseCmd next Protocol_CreateBinary with creator; terms
+  opened <- submit creator do exerciseCmd draft Binary_Open with protocol = latest
+  setTime terms.closeAt
+  submitMustFail creator do exerciseCmd unopened Binary_Open with protocol = latest
+  submitMustFail creator do exerciseCmd latest Protocol_CreateBinary with creator; terms
+  closed <- submit creator do exerciseCmd opened Binary_Close with protocol = latest; reason = "Cutoff reached"
+  final <- marketFor operator closed
+  assert (final.terms.closeAt == terms.closeAt)
+
+-- A removed creator can abandon an unfunded draft. Cancellation neither opens
+-- the market nor grants another admin control of it.
+testCancelledDraft : Script ()
+testCancelledDraft = script do
+  (operator, creator, outsider, protocol, (_, terms)) <- setup ()
+  (next, draft) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  revoked <- submit operator do exerciseCmd next Protocol_SetAdmins with replacementAdmins = [operator]
+  submitMustFail (actAs outsider <> readAs operator) do exerciseCmd draft Binary_CancelDraft
+  cancelled <- submit creator do exerciseCmd draft Binary_CancelDraft
+  final <- marketFor creator cancelled
+  assert (final.status == Closed && final.closeReason == Some "Draft cancelled")
+  submitMustFail (actAs creator <> readAs operator) do exerciseCmd cancelled Binary_Open with protocol = revoked
+  submitMustFail creator do exerciseCmd cancelled Binary_CancelDraft
+
+-- Failed updates must not consume the live protocol or reset its sequence.
+testAdminConfiguration : Script ()
+testAdminConfiguration = script do
+  (operator, creator, outsider, protocol, (_, terms)) <- setup ()
+  submitMustFail (actAs creator <> readAs operator) do exerciseCmd protocol Protocol_SetAdmins with replacementAdmins = [operator, creator, outsider]
+  submitMustFail operator do exerciseCmd protocol Protocol_SetAdmins with replacementAdmins = []
+  submitMustFail operator do exerciseCmd protocol Protocol_SetAdmins with replacementAdmins = [creator]
+  submitMustFail operator do exerciseCmd protocol Protocol_SetAdmins with replacementAdmins = [operator, creator, creator]
+  submitMustFail operator do exerciseCmd protocol Protocol_SetAdmins with replacementAdmins = replicate 65 operator
+  (next, _) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  current <- submit operator do exerciseCmd next Protocol_SetAdmins with replacementAdmins = [operator]
+  (_, operatorDraft) <- submit operator do exerciseCmd current Protocol_CreateBinary with creator = operator; terms
+  own <- marketFor operator operatorDraft
+  assert (own.marketId == 2 && own.creator == operator)
+
+-- Optional scheduling fields are truly optional; no epoch or fake party is
+-- substituted. A configured fallback may also omit its final deadline.
+testOptionalResolutionSchedule : Script ()
+testOptionalResolutionSchedule = script do
+  (_, creator, outsider, protocol, (_, terms)) <- setup ()
+  let noDeadline = terms with fallback = Some (FallbackPolicy outsider terms.closeAt None)
+  (next, first) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms = noDeadline
+  saved <- marketFor creator first
+  assert (saved.terms.earliestResolutionAt == None && saved.terms.fallback == noDeadline.fallback)
+  let earliest = addRelTime terms.closeAt (hours 1)
+  let fallbackStart = addRelTime earliest (hours 1)
+  let scheduled = terms with
+        earliestResolutionAt = Some earliest
+        fallback = Some (FallbackPolicy outsider fallbackStart (Some (addRelTime fallbackStart (seconds 1))))
+  (_, second) <- submit creator do exerciseCmd next Protocol_CreateBinary with creator; terms = scheduled
+  final <- marketFor creator second
+  assert (final.terms == scheduled)

@@ -9,4 +9,5 @@
 - Do not copy secrets, private keys or deployment credentials from sibling projects.
 - Read current Canton 3.x docs, installed SDK types and relevant Next.js guides before implementation.
 - Keep copy short. No fake markets, prices or settlement presented as live.
-- Checkpoint 1 is wallet connectivity and the gated workspace; implement contracts in subsequent PRs.
+- Binary lifecycle contracts are in `contracts/main`; their separate tests are in `contracts/test`. Run `make test` before merging contract changes.
+- The shared UI must keep Canton trading disabled until contracts, wallet submission and network deployment are verified.

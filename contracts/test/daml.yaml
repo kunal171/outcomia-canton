@@ -1,0 +1,13 @@
+sdk-version: 3.7.1
+name: outcomia-markets-test
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - ../main/.daml/dist/outcomia-markets-0.1.0.dar
+build-options:
+  - --target=2.1
+  - --ghc-option=-Werror

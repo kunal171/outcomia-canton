@@ -19,6 +19,13 @@ See [the wallet boundary](docs/wallet-gateway.md) and
 ## Delivery
 
 Use small commits, a feature PR, and a merge before the next checkpoint. See
-[the plan](docs/delivery-plan.md). The shared wallet gateway is implemented;
-Canton market contracts, collateral, order matching and settlement are next.
-No Canton markets are deployed yet.
+[the plan](docs/delivery-plan.md). The shared wallet gateway and the [binary lifecycle contracts](docs/binary-market-lifecycle.md)
+are implemented and locally tested. Collateral, order matching and settlement are
+next. No Canton markets are deployed yet.
+
+## Contracts
+
+Use DPM SDK 3.7.1 and Java 17 or newer. `make build` builds the separate production
+and test DARs; `make test` runs the IDE-ledger suite. The production package does
+not depend on `daml-script`. For checkouts with spaces, see the [DPM path issue
+and explicit local override](docs/dpm-local-path-issue.md).
