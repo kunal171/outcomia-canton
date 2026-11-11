@@ -1,0 +1,329 @@
+-- | Fully funded resting orders and owner cancellation. No matching or fills
+-- occur in this checkpoint: crossed orders can coexist until settlement exists.
+-- A buy owns separate cash backing; a sell owns outcome quantities removed from
+-- position lots. Neither can also be spent through the owner's available state.
+--
+-- The bounded market index commits acceptance sequence and references. A future
+-- matcher must validate best-price/FIFO against it inside settlement, not trust
+-- an off-ledger candidate. Vault/registry custody assumptions still apply.
+module Outcomia.Orders where
+
+import DA.List (unique, sortOn)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Outcomia.Assets (holdingTotal)
+import Outcomia.Binary
+import Outcomia.Custody
+import Outcomia.Positions
+import Outcomia.Types
+import Outcomia.Validation (boundedText, termsErrors)
+
+data OrderSide = Buy | Sell deriving (Eq, Show)
+
+-- | A buy's exact price*quantity holding or a sell's quantity of its selected
+-- outcome. Sell backing is represented directly in the signed order, not by a
+-- reusable reference to an unlocked position lot.
+data OrderBacking = CashEscrow (ContractId H.Holding) | OutcomeEscrow
+  deriving (Eq, Show)
+
+data OrderReference = OrderReference with
+    orderId : Int
+    order : ContractId LimitOrder
+    outcome : Outcome
+    side : OrderSide
+    price : Decimal
+  deriving (Eq, Show)
+
+data PlacementResult = PlacementResult with
+    book : ContractId OrderBook
+    order : ContractId LimitOrder
+    balance : Optional (ContractId AssetBalance)
+    remainder : Optional (ContractId PositionLot)
+  deriving (Eq, Show)
+
+data ReleasedBacking = ReleasedBacking with
+    balance : Optional (ContractId AssetBalance)
+    position : Optional (ContractId PositionLot)
+  deriving (Eq, Show)
+
+data CancellationResult = CancellationResult with
+    book : ContractId OrderBook
+    released : ReleasedBacking
+  deriving (Eq, Show)
+
+-- | One configured order-registry lineage, separate from account/reserve roots.
+-- Joint operator/vault signers can bootstrap another root, so services must pin
+-- this root too. The 1,024-ID index bounds initialization work and contract size.
+template OrderRegistry
+  with
+    operator : Party
+    vault : Party
+    protocolName : Text
+    marketIds : [Int]
+  where
+    signatory operator, vault
+    ensure operator /= vault && boundedText 64 protocolName &&
+      length marketIds <= 1024 && unique marketIds && all (> 0) marketIds
+
+    -- | Inputs: active creator, current protocol/market and its existing reserve.
+    -- Rejects: revoked/non-creator, foreign reserve/namespace, changed terms,
+    -- expired/Closed market or duplicate/full registration. Result: empty book
+    -- with sequence 1 and a new registry revision; no collateral is moved.
+    choice OrderRegistry_CreateBook : (ContractId OrderRegistry, ContractId OrderBook)
+      with
+        creator : Party
+        protocol : ContractId Protocol
+        market : ContractId BinaryMarket
+        reserve : ContractId MarketReserve
+      controller creator
+      do
+        pool <- fetch reserve
+        assertMsg "Reserve does not belong to order registry/creator"
+          (pool.key.operator == operator && pool.key.protocolName == protocolName &&
+           pool.vault == vault && pool.creator == creator)
+        checkCreator protocol operator protocolName creator
+        current <- fetch market
+        assertMsg "Market does not match the registered reserve"
+          (current.operator == operator && current.protocolName == protocolName &&
+           current.marketId == pool.key.marketId && current.creator == creator &&
+           current.createdAt == pool.createdAt && current.terms == pool.terms)
+        now <- getTime
+        assertMsg "Book requires an unexpired Draft or Open market"
+          (current.status /= Closed && now < current.terms.closeAt)
+        assertMsg "Order book already registered" (not (current.marketId `elem` marketIds))
+        assertMsg "Order registry is full" (length marketIds < 1024)
+        next <- create this with marketIds = current.marketId :: marketIds
+        book <- create OrderBook with
+          key = pool.key; vault; creator
+          terms = pool.terms
+          marketCreatedAt = pool.createdAt
+          factory = pool.factory
+          nextOrderId = 1
+          orders = []
+        pure (next, book)
+
+-- | One bounded committed index per market, covering YES/NO and both sides.
+-- Placement/cancellation consume this revision. Independent markets do not
+-- contend, but requests on the same market must reload/retry stale IDs.
+template OrderBook
+  with
+    key : MarketKey
+    vault : Party
+    creator : Party
+    terms : BinaryTerms
+    marketCreatedAt : Time
+    factory : ContractId T.TransferFactory
+    nextOrderId : Int
+    orders : [OrderReference]
+  where
+    signatory key.operator, vault
+    observer creator
+    ensure key.operator /= vault && key.marketId > 0 && boundedText 64 key.protocolName &&
+      null (termsErrors creator marketCreatedAt terms) && nextOrderId > 0 &&
+      length orders <= 128 && unique (map (\r -> r.orderId) orders) &&
+      unique (map (\r -> r.order) orders) &&
+      all (\r -> r.orderId > 0 && r.orderId < nextOrderId && validPrice terms.priceTick r.price) orders
+
+    -- | Inputs: owner, current Open market, enrolled account, outcome, price,
+    -- quantity and registry context. Rejects: cutoff, off-tick/lot values,
+    -- foreign/insufficient account, capacity or sequence exhaustion.
+    -- Result: price*quantity collateral escrow, account successor and new book.
+    -- Example: 3 YES at 0.40 locks exactly 1.20 collateral, before future fees.
+    choice OrderBook_PlaceBuy : PlacementResult
+      with
+        owner : Party
+        market : ContractId BinaryMarket
+        balance : ContractId AssetBalance
+        outcome : Outcome
+        price : Decimal
+        quantity : Int
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        checkPlacement this market price quantity
+        checkOrderAccount key vault terms.collateral factory owner balance
+        let notional = price * intToDecimal quantity
+        partition <- exercise balance AssetBalance_Repartition with
+          otherCash = None; otherAmount = 0.0; delta = negate notional; extraArgs
+        cash <- case partition.otherCash of Some cid -> pure cid; None -> abort "Buy order must have cash backing"
+        now <- getTime
+        order <- create LimitOrder with
+          key; vault; owner; factory; outcome; price; quantity
+          instrument = terms.collateral
+          side = Buy
+          orderId = nextOrderId
+          acceptedAt = now
+          backing = CashEscrow cash
+        next <- create this with
+          nextOrderId = nextOrderId + 1
+          orders = orders ++ [OrderReference nextOrderId order outcome Buy price]
+        pure PlacementResult with book = next; order; balance = Some partition.balance; remainder = None
+
+    -- | Inputs: owner, current market, 1..16 unique position lots and order terms.
+    -- Rejects: invalid market/price/quantity, wrong owner/market/vault or shortage
+    -- of the selected outcome. Result: exactly quantity contracts in escrow;
+    -- all other quantities remain in a successor lot. Reserve backing is unchanged.
+    choice OrderBook_PlaceSell : PlacementResult
+      with
+        owner : Party
+        market : ContractId BinaryMarket
+        positions : [ContractId PositionLot]
+        outcome : Outcome
+        price : Decimal
+        quantity : Int
+      controller owner
+      do
+        checkPlacement this market price quantity
+        assertMsg "Sell requires 1 to 16 unique position lots"
+          (not (null positions) && length positions <= 16 && unique positions)
+        lots <- mapA (\cid -> do
+          lot <- fetch cid
+          assertMsg "Sell position owner, market or vault does not match"
+            (lot.owner == owner && lot.key == key && lot.vault == vault)
+          exercise cid Archive
+          pure lot) positions
+        let yes = sum (map (\lot -> lot.yes) lots)
+        let no = sum (map (\lot -> lot.no) lots)
+        let selected = if outcome == Yes then yes else no
+        assertMsg "Insufficient outcome contracts for sell" (selected >= quantity)
+        let remainingYes = yes - (if outcome == Yes then quantity else 0)
+        let remainingNo = no - (if outcome == No then quantity else 0)
+        remainder <- createRemainder key vault owner remainingYes remainingNo
+        now <- getTime
+        order <- create LimitOrder with
+          key; vault; owner; factory; outcome; price; quantity
+          instrument = terms.collateral
+          side = Sell
+          orderId = nextOrderId
+          acceptedAt = now
+          backing = OutcomeEscrow
+        next <- create this with
+          nextOrderId = nextOrderId + 1
+          orders = orders ++ [OrderReference nextOrderId order outcome Sell price]
+        pure PlacementResult with book = next; order; balance = None; remainder
+
+    -- | Inputs: owner, exact active order reference, optional buy refund account
+    -- and registry context. Rejects: foreign/unindexed order, another owner or
+    -- wrong refund account. Result: order archived, index entry removed, backing
+    -- restored. No live market, admin or admission is required for cancellation.
+    choice OrderBook_Cancel : CancellationResult
+      with
+        owner : Party
+        order : ContractId LimitOrder
+        balance : Optional (ContractId AssetBalance)
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        current <- fetch order
+        let reference = OrderReference current.orderId order current.outcome current.side current.price
+        assertMsg "Order does not belong to this book or owner"
+          (current.key == key && current.vault == vault && current.owner == owner &&
+           current.instrument == terms.collateral && current.factory == factory && reference `elem` orders)
+        released <- exercise order LimitOrder_Release with balance; extraArgs
+        next <- create this with orders = filter (\r -> r.order /= order) orders
+        pure CancellationResult with book = next; released
+
+-- | Active order and its exclusive escrow. No fill or amendment choice exists
+-- yet. Cancellation goes through the book to remove the committed reference;
+-- the internal release choice requires both owner and vault authorization.
+template LimitOrder
+  with
+    key : MarketKey
+    vault : Party
+    owner : Party
+    instrument : CollateralInstrument
+    factory : ContractId T.TransferFactory
+    outcome : Outcome
+    side : OrderSide
+    price : Decimal
+    quantity : Int
+    orderId : Int
+    acceptedAt : Time
+    backing : OrderBacking
+  where
+    signatory vault, owner
+    observer key.operator
+    ensure vault /= key.operator && owner /= vault && key.marketId > 0 &&
+      boundedText 64 key.protocolName && boundedText 128 instrument.id &&
+      price > 0.0 && price < 1.0 && quantity > 0 && orderId > 0 &&
+      (case (side, backing) of (Buy, CashEscrow _) -> True; (Sell, OutcomeEscrow) -> True; _ -> False)
+
+    -- | Inputs: buy refund account (None for a sell), registry context.
+    -- Rejects: missing/wrong account, unexpected sell account, invalid backing
+    -- or missing owner/vault authority. Result: exact collateral refund or a
+    -- restored outcome lot. Registry failure rolls back the enclosing cancellation.
+    choice LimitOrder_Release : ReleasedBacking
+      with
+        balance : Optional (ContractId AssetBalance)
+        extraArgs : ExtraArgs
+      controller owner, vault
+      do
+        case backing of
+          CashEscrow cash -> do
+            account <- case balance of Some cid -> pure cid; None -> abort "Buy cancellation requires its owner's account"
+            checkOrderAccount key vault instrument factory owner account
+            let amount = price * intToDecimal quantity
+            total <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") [cash]
+            assertMsg "Buy escrow amount is incorrect" (total == amount)
+            partition <- exercise account AssetBalance_Repartition with
+              otherCash = Some cash; otherAmount = amount; delta = amount; extraArgs
+            assertMsg "Cancelled buy must release all escrow" (partition.otherCash == None)
+            pure ReleasedBacking with balance = Some partition.balance; position = None
+          OutcomeEscrow -> do
+            assertMsg "Sell cancellation does not take a cash account" (balance == None)
+            position <- createRemainder key vault owner
+              (if outcome == Yes then quantity else 0) (if outcome == No then quantity else 0)
+            pure ReleasedBacking with balance = None; position
+
+-- | Inputs: signed book, current market and proposed order terms. Rejects stale
+-- lifecycle IDs, altered terms, closed/cutoff markets, off-tick/lot values or
+-- exhausted bounds. Result: validated placement; no assets moved by this helper.
+checkPlacement : OrderBook -> ContractId BinaryMarket -> Decimal -> Int -> Update ()
+checkPlacement book market price quantity = do
+  current <- fetch market
+  assertMsg "Market identity or terms do not match order book"
+    (current.operator == book.key.operator && current.protocolName == book.key.protocolName &&
+     current.marketId == book.key.marketId && current.creator == book.creator &&
+     current.createdAt == book.marketCreatedAt && current.terms == book.terms)
+  now <- getTime
+  assertMsg "Orders require an Open market before cutoff" (current.status == Open && now < book.terms.closeAt)
+  assertMsg "Price must lie strictly between 0 and 1 and follow the market tick" (validPrice book.terms.priceTick price)
+  checkQuantity book.terms.quantityLot quantity
+  assertMsg "Market active-order limit reached" (length book.orders < 128)
+  assertMsg "Order sequence limit reached" (book.nextOrderId < 9223372036854775807)
+
+-- | Inputs: admitted decimal tick and candidate price. Result: exact tick
+-- alignment. Decimal has 10 fractional digits, so scaling sub-unit prices by
+-- 10^10 gives exact Int values below 10^10. Integer remainder avoids division
+-- rounding accidentally accepting a near-tick price such as 0.4000000001.
+validPrice : Decimal -> Decimal -> Bool
+validPrice tick price =
+  if tick <= 0.0 || tick >= 1.0 || price <= 0.0 || price >= 1.0 then False
+  else truncate (price * 10000000000.0) % truncate (tick * 10000000000.0) == 0
+
+-- | Inputs: pinned deployment/asset/factory, caller and account. Rejects any
+-- mismatch. Result: no mutation; only a fetched signed revision can fund/refund.
+checkOrderAccount : MarketKey -> Party -> CollateralInstrument -> ContractId T.TransferFactory -> Party -> ContractId AssetBalance -> Update ()
+checkOrderAccount key vault instrument factory owner cid = do
+  account <- fetch cid
+  assertMsg "Order account owner, asset, factory or deployment does not match"
+    (account.operator == key.operator && account.protocolName == key.protocolName &&
+     account.vault == vault && account.owner == owner && account.instrument == instrument && account.factory == factory)
+
+-- | Inputs: remaining quantities. Result: None when empty, otherwise one lot.
+-- PositionLot validation rejects negatives; callers subtract only covered amounts.
+createRemainder : MarketKey -> Party -> Party -> Int -> Int -> Update (Optional (ContractId PositionLot))
+createRemainder key vault owner yes no = if yes == 0 && no == 0 then pure None else do
+  cid <- create PositionLot with key; vault; owner; yes; no
+  pure (Some cid)
+
+-- | Inputs: committed references and selected outcome/side. Result: best price,
+-- then lowest acceptance ID. Ledger time is informational; equal timestamps do
+-- not tie priority. This helper defines selection but does not yet settle trades.
+bestOrderReference : [OrderReference] -> Outcome -> OrderSide -> Optional OrderReference
+bestOrderReference references outcome side =
+  case sortOn (\r -> (if side == Buy then negate r.price else r.price, r.orderId))
+       (filter (\r -> r.outcome == outcome && r.side == side) references) of
+    [] -> None
+    first :: _ -> Some first
