@@ -1,0 +1,166 @@
+-- | Prefunded balances held by a dedicated vault party. Balances are per trader
+-- and asset, independent of any market. Actual registry holdings are consumed
+-- with every balance change; numeric balances alone never prove payment.
+--
+-- The vault's hosts remain trusted: raw vault signing authority can bypass
+-- these choices at the registry. Deployments must pin one authority lineage and
+-- vetted factories. This module does not make a vault party equivalent to a PDA.
+module Outcomia.Custody where
+
+import DA.List (unique)
+import DA.Time (addRelTime, seconds)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Outcomia.Assets
+import Outcomia.Types (CollateralInstrument)
+import Outcomia.Validation (boundedText)
+
+-- | Enrollment index for one configured deployment. Consuming enrollment
+-- serializes duplicate account creation, not ordinary deposits or withdrawals.
+-- The bounded list is a prototype limit; sharding needs an explicit uniqueness
+-- design. Joint operator/vault creation of a second root is outside this guard.
+template VaultAuthority
+  with
+    operator : Party
+    vault : Party
+    protocolName : Text
+    accounts : [(Party, CollateralInstrument)]
+  where
+    signatory operator, vault
+    ensure operator /= vault && boundedText 64 protocolName &&
+      length accounts <= 1024 && unique accounts
+
+    -- | Inputs: trader and active admission. Rejects: duplicate enrollment,
+    -- another operator, vault self-enrollment or a full index.
+    -- Result: empty account and successor index; no tokens are minted or moved.
+    choice VaultAuthority_OpenBalance : (ContractId VaultAuthority, ContractId AssetBalance)
+      with
+        owner : Party
+        admission : ContractId AssetAdmission
+      controller owner
+      do
+        admitted <- fetch admission
+        assertMsg "Admission belongs to another operator" (admitted.operator == operator)
+        assertMsg "Vault cannot enroll as a trader" (owner /= vault)
+        let key = (owner, admitted.instrument)
+        assertMsg "Balance already enrolled" (not (key `elem` accounts))
+        assertMsg "Vault enrollment index is full" (length accounts < 1024)
+        next <- create this with accounts = key :: accounts
+        balance <- create AssetBalance with
+          operator; vault; protocolName; owner
+          instrument = admitted.instrument
+          factory = admitted.factory
+          available = 0.0
+          cash = None
+        pure (next, balance)
+
+-- | Returned wallet holdings are spendable outputs, not another credit receipt.
+-- Callers must replace their old balance ID with the returned revision.
+data BalanceMovement = BalanceMovement with
+    balance : ContractId AssetBalance
+    walletHoldings : [ContractId H.Holding]
+  deriving (Eq, Show)
+
+-- | One canonical vault holding backs this trader's available balance. Its
+-- amount must equal available, checked before every move. A zero balance has no
+-- holding. One holding avoids unbounded input growth during later settlement;
+-- deposits consolidate atomically rather than append IDs forever.
+template AssetBalance
+  with
+    operator : Party
+    vault : Party
+    protocolName : Text
+    owner : Party
+    instrument : CollateralInstrument
+    factory : ContractId T.TransferFactory
+    available : Decimal
+    cash : Optional (ContractId H.Holding)
+  where
+    signatory vault, owner
+    observer operator
+    ensure operator /= vault && owner /= vault && boundedText 64 protocolName &&
+      boundedText 128 instrument.id && available >= 0.0 &&
+      ((available == 0.0) == (cash == None))
+
+    -- | Inputs: live matching admission, wallet inputs, amount and registry
+    -- context. Rejects: wrong/revoked factory admission, nonpositive or invalid
+    -- transfers, stale backing or unsupported fragmented consolidation.
+    -- Result: successor credit plus wallet change, atomically backed by tokens.
+    choice AssetBalance_Deposit : BalanceMovement
+      with
+        admission : ContractId AssetAdmission
+        inputs : [ContractId H.Holding]
+        amount : Decimal
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        validateBacking this
+        intent <- transferIntent owner vault amount inputs extraArgs
+        receipt <- exercise admission AssetAdmission_TransferPinned with
+          expectedOperator = operator
+          expectedInstrument = instrument
+          expectedFactory = factory
+          intent
+        -- Example: old backing 2 plus a deposit of 3 becomes one holding of 5.
+        -- Spending both into the new holding prevents receipt reuse and keeps
+        -- the resulting balance independent of caller-selected holding IDs.
+        consolidation <- transferIntent vault vault (available + amount)
+          (optionalHoldings cash ++ receipt.received) extraArgs
+        combined <- transferExact factory instrument consolidation
+        nextCash <- exactlyOne combined.received
+        assertMsg "Consolidation must leave no change" (null combined.change)
+        next <- create this with available = available + amount; cash = Some nextCash
+        pure BalanceMovement with balance = next; walletHoldings = receipt.change
+
+    -- | Inputs: amount and registry context. Only the owner can withdraw.
+    -- Rejects: insufficient/nonpositive amount, stale backing or faulty output.
+    -- Result: wallet tokens and successor balance. No market, admin role or live
+    -- admission is required: revocation cannot itself freeze available funds.
+    choice AssetBalance_Withdraw : BalanceMovement
+      with
+        amount : Decimal
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        assertMsg "Withdrawal must be positive and covered" (amount > 0.0 && amount <= available)
+        validateBacking this
+        intent <- transferIntent vault owner amount (optionalHoldings cash) extraArgs
+        result <- transferExact factory instrument intent
+        nextCash <- case result.change of
+          [] -> pure None
+          [cid] -> pure (Some cid)
+          _ -> abort "Registry must return one canonical change holding"
+        next <- create this with available = available - amount; cash = nextCash
+        pure BalanceMovement with balance = next; walletHoldings = result.received
+
+-- | Input: signed account state. Rejects an inactive, locked, foreign or
+-- incorrectly sized backing holding. Result: no mutation; the fetch binds the
+-- checked holding to the same atomic transaction as its subsequent consumption.
+validateBacking : AssetBalance -> Update ()
+validateBacking balance = do
+  total <- holdingTotal (H.InstrumentId balance.instrument.admin balance.instrument.id)
+    (H.Account (Some balance.vault) None "") (optionalHoldings balance.cash)
+  assertMsg "Account backing does not equal available balance" (total == balance.available)
+
+-- | Input: optional canonical holding. Result: the bounded transfer input list.
+optionalHoldings : Optional a -> [a]
+optionalHoldings value = case value of None -> []; Some cid -> [cid]
+
+-- | Input: completed receiver outputs. Rejects fragmentation. Result: one
+-- canonical holding; all prior registry effects roll back if unsupported.
+exactlyOne : [ContractId H.Holding] -> Update (ContractId H.Holding)
+exactlyOne holdings = case holdings of
+  [cid] -> pure cid
+  _ -> abort "Registry must return one canonical receiver holding"
+
+-- | Inputs: fixed owners, amount, holdings and registry context. Result: a
+-- request bounded to one minute from ledger time. Transfer validation remains
+-- in transferExact; clients cannot extend this contract's execution window.
+transferIntent : Party -> Party -> Decimal -> [ContractId H.Holding] -> ExtraArgs -> Update TransferIntent
+transferIntent sender receiver amount inputs extraArgs = do
+  now <- getTime
+  pure TransferIntent with
+    sender; receiver; amount; inputs; extraArgs
+    requestedAt = now
+    executeBefore = addRelTime now (seconds 60)

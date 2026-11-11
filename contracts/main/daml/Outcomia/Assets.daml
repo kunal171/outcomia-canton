@@ -60,6 +60,22 @@ template AssetAdmission
           (operator == expectedOperator && instrument == expectedInstrument)
         transferExact factory instrument intent
 
+    -- | Inputs: enrolled operator, instrument, exact factory and transfer.
+    -- Rejects: any changed binding or invalid transfer. Result: actual outputs.
+    -- A balance can exercise this choice with the two owners' authority without
+    -- borrowing operator signing rights merely to fetch the private admission.
+    nonconsuming choice AssetAdmission_TransferPinned : ExactTransferResult
+      with
+        expectedOperator : Party
+        expectedInstrument : CollateralInstrument
+        expectedFactory : ContractId T.TransferFactory
+        intent : TransferIntent
+      controller intent.sender, intent.receiver
+      do
+        assertMsg "Deposit admission does not match the enrolled asset/factory"
+          (operator == expectedOperator && instrument == expectedInstrument && factory == expectedFactory)
+        transferExact factory instrument intent
+
 -- | Inputs: an already-approved factory, asset identity and jointly authorized
 -- transfer. Result: exact completed outputs, with conservation including change.
 -- Callers must pin factory/instrument themselves; this helper is not an admission

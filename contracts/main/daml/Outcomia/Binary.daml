@@ -1,6 +1,6 @@
--- | Authorized binary market creation and lifecycle. This package cannot hold
--- funds, place orders, resolve outcomes or redeem positions yet. Token transfers
--- are handled separately by Outcomia.Assets; they do not create balances.
+-- | Authorized binary market creation and lifecycle. This module does not hold
+-- funds, place orders, resolve outcomes or redeem positions. Outcomia.Assets
+-- handles transfers; Outcomia.Custody binds holdings to available balances.
 --
 -- The operator is a trust anchor, not a privileged trader: it approves creator
 -- permissions and co-signs market contracts. Each creation consumes one protocol

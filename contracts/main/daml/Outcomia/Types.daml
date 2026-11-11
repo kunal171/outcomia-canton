@@ -18,7 +18,7 @@ data MarketStatus = Draft | Open | Closed
 data CollateralInstrument = CollateralInstrument with
     admin : Party
     id : Text
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 -- | These criteria are authoritative structured market terms. The attachment
 -- hash identifies an external document; its bytes must be verified by clients.
