@@ -1,0 +1,144 @@
+-- | Authorized binary market creation and lifecycle. This package cannot hold
+-- funds, place orders, resolve outcomes or redeem positions yet.
+--
+-- The operator is a trust anchor, not a privileged trader: it approves creator
+-- permissions and co-signs market contracts. Each creation consumes one protocol
+-- revision, allocating a unique number within that configured lineage. Parallel
+-- creations contend on that revision; clients must reload and retry stale IDs.
+module Outcomia.Binary where
+
+import DA.List (unique)
+import qualified DA.Text as T
+import Outcomia.Types
+import Outcomia.Validation
+
+-- | One operator-approved protocol lineage. Discovery/services must pin its
+-- operator and protocol name. The package does not enforce global uniqueness
+-- against an operator deliberately creating a second root with the same name.
+template Protocol
+  with
+    operator : Party
+    protocolName : Text
+    admins : [Party]
+    nextMarketId : Int
+  where
+    signatory operator
+    observer admins
+    ensure boundedText 64 protocolName && validAdmins operator admins && nextMarketId > 0
+
+    -- | Inputs: replacement admin list, including the operator.
+    -- Rejects: non-operator authorization, duplicates, empty/oversized lists or
+    -- removal of the operator. Result: new revision preserving the ID counter.
+    choice Protocol_SetAdmins : ContractId Protocol
+      with replacementAdmins : [Party]
+      controller operator
+      do
+        assertMsg "Admins must be unique, include the operator and number at most 64"
+          (validAdmins operator replacementAdmins)
+        create this with admins = replacementAdmins
+
+    -- | Inputs: creator and immutable binary terms. The creator must authorize
+    -- this choice; this protocol's signatory supplies the operator authorization.
+    -- Rejects: inactive creators, invalid terms, elapsed cutoff or ID exhaustion.
+    -- Result: next protocol revision and a Draft market, in the same transaction.
+    choice Protocol_CreateBinary : (ContractId Protocol, ContractId BinaryMarket)
+      with
+        creator : Party
+        terms : BinaryTerms
+      controller creator
+      do
+        assertMsg "Creator must be an active admin" (creator `elem` admins)
+        assertMsg "Market ID limit reached" (nextMarketId < 9223372036854775807)
+        now <- getTime
+        let problems = termsErrors creator now terms
+        assertMsg (T.intercalate "; " problems) (null problems)
+        next <- create this with nextMarketId = nextMarketId + 1
+        market <- create BinaryMarket with
+          operator
+          protocolName
+          marketId = nextMarketId
+          creator
+          terms
+          createdAt = now
+          status = Draft
+          closeReason = None
+        pure (next, market)
+
+-- | Immutable terms plus explicit lifecycle state. Both operator and creator
+-- are signatories, so a creator alone cannot bypass choices via a direct create
+-- or the automatic Archive choice. Joint signatories remain trusted; this is
+-- not protection against a malicious operator colluding with a creator.
+template BinaryMarket
+  with
+    operator : Party
+    protocolName : Text
+    marketId : Int
+    creator : Party
+    terms : BinaryTerms
+    createdAt : Time
+    status : MarketStatus
+    closeReason : Optional Text
+  where
+    signatory operator, creator
+    ensure boundedText 64 protocolName && marketId > 0 &&
+      null (termsErrors creator createdAt terms) &&
+      (case (status, closeReason) of
+        (Closed, Some reason) -> boundedText 500 reason
+        (Closed, None) -> False
+        (_, None) -> True
+        (_, Some _) -> False)
+
+    -- | Inputs: the current protocol revision for this operator/name.
+    -- Rejects: other callers, revoked admin, wrong/stale protocol, non-Draft state
+    -- or now >= cutoff. Result: an Open successor with exactly the same terms.
+    choice Binary_Open : ContractId BinaryMarket
+      with protocol : ContractId Protocol
+      controller creator
+      do
+        checkCreator protocol operator protocolName creator
+        assertMsg "Only a draft can open" (status == Draft)
+        now <- getTime
+        assertMsg "Trading cutoff has passed" (now < terms.closeAt)
+        create this with status = Open
+
+    -- | Inputs: current protocol revision and a short closure reason.
+    -- Rejects: other callers, revoked admin, wrong/stale protocol, non-Open state
+    -- or blank/oversized reason. Result: a terminal Closed successor. This is a
+    -- trading stop only: it does not pick YES/NO or move the resolution cutoff.
+    choice Binary_Close : ContractId BinaryMarket
+      with
+        protocol : ContractId Protocol
+        reason : Text
+      controller creator
+      do
+        checkCreator protocol operator protocolName creator
+        assertMsg "Only an open market can close" (status == Open)
+        assertMsg "Closure reason must contain 1 to 500 characters" (boundedText 500 reason)
+        create this with status = Closed; closeReason = Some reason
+
+    -- | Inputs: none. Rejects: other callers or non-Draft state. Result: a Closed
+    -- draft marked cancelled. Removed creators can abandon unused drafts without
+    -- needing admin reinstatement. This grants no rights over future user funds.
+    choice Binary_CancelDraft : ContractId BinaryMarket
+      controller creator
+      do
+        assertMsg "Only a draft can be cancelled" (status == Draft)
+        create this with status = Closed; closeReason = Some "Draft cancelled"
+
+-- | Inputs: operator and full proposed admin list. Result: whether it is valid.
+-- Bound the list before duplicate checking. The operator is always an
+-- admin; no separate implicit role can drift from the configured membership.
+validAdmins : Party -> [Party] -> Bool
+validAdmins operator admins =
+  length admins <= 64 && operator `elem` admins && unique admins
+
+-- | Inputs: live protocol ID and the market's operator, namespace and creator.
+-- Rejects: archived/wrong namespace, different operator or revoked creator.
+-- Result: no state change; the fetch participates in transaction conflict checks
+-- so a committed revocation invalidates a stale authorization dependency.
+checkCreator : ContractId Protocol -> Party -> Text -> Party -> Update ()
+checkCreator protocol operator protocolName creator = do
+  current <- fetch protocol
+  assertMsg "Protocol does not belong to this market"
+    (current.operator == operator && current.protocolName == protocolName)
+  assertMsg "Creator must still be an active admin" (creator `elem` current.admins)
