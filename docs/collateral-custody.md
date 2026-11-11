@@ -1,9 +1,10 @@
 # Collateral custody
 
 Decision: use a dedicated vault party for the first version. Its signer/hosting
-trust remains explicit. Outcome positions are the next part of this checkpoint.
+trust remains explicit. [Outcome positions](complete-set-positions.md) now use
+market reserves for complete-set split and merge.
 
-The custody contracts hold real collateral before issuing YES/NO positions.
+The custody contracts hold real collateral before the position contracts issue YES/NO.
 Our [transfer adapter](collateral-transfers.md) verifies unlocked transfers; it
 does not reserve tokens or prevent their owner from spending them later.
 
@@ -70,8 +71,8 @@ Ten custody scripts cover deposits, consolidation, partial/full withdrawals,
 owner authorization, duplicate/stale enrollment, invalid amounts, receipt
 replay, revoked admission, asset/factory/operator isolation, faulty registry
 rollback, mismatched backing, capacity limits and the smallest Decimal amount.
-The complete suite passes 31 Daml scripts and four dependency-integrity tests.
-The production DAR also passes validation. These are local ledger checks.
+Run the complete suite with `make DPM="$PWD/target/tools/dpm" test`.
+These are local ledger checks; production DAR validation is a separate check.
 
 ## Rules for either model
 

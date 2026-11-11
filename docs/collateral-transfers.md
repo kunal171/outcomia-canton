@@ -93,8 +93,8 @@ make DPM="$PWD/target/tools/dpm" test
 ```
 
 The local DPM override addresses [the separate path issue](dpm-local-path-issue.md).
-There are 31 passing Daml scripts: 11 transfer scripts, 10 custody scripts and
-10 lifecycle/validation scripts. Four Python tests cover dependency download
+The suite includes 11 transfer scripts, 10 custody scripts, 10 lifecycle/validation
+scripts and the [position tests](complete-set-positions.md). Four Python tests cover dependency download
 integrity and source/path restrictions.
 
 Coverage includes both-owner authorization, approval/revocation, forged admin
