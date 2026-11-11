@@ -21,6 +21,12 @@ Each numbered checkpoint may be split into smaller feature PRs. A checkpoint is
 complete only when its working flow, failure checks and documentation are ready.
 Do not start a new feature branch before closing the current checkpoint.
 
+## Current status
+
+The shared wallet gateway and locally tested binary lifecycle are complete. The
+next contract milestone is collateral and positions. No public Canton deployment
+or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
+
 ## Checkpoint 1 boundary
 
 In the original Outcomia app, the wallet selects Solana markets or the Canton

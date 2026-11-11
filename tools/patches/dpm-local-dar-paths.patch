@@ -1,0 +1,133 @@
+diff --git a/UNRELEASED.md b/UNRELEASED.md
+index 3be1ef1..2bc4713 100644
+--- a/UNRELEASED.md
++++ b/UNRELEASED.md
+@@ -2,6 +2,10 @@
+ 
+ Unreleased Changes since last tagged release (1.0.22)
+ 
++## Fixes
++
++- Preserve filesystem paths when resolving local DAR dependencies, including spaces, Unicode and literal `%`, `#` and `?` in filenames. Components receive local paths rather than URL-escaped strings.
++
+ ## Additions
+ 
+ - **Git dependencies.** You can depend on a pre-built `.dar` stored in a Git repository, as well as on one published to an OCI registry. Declare it in `dependencies` or `data-dependencies` in `daml.yaml`, or add it with `dpm add dar <git-uri> --dependencies` (or `--data-dependencies`).
+diff --git a/pkg/damlpackage/localpath_test.go b/pkg/damlpackage/localpath_test.go
+new file mode 100644
+index 0000000..db2d8a7
+--- /dev/null
++++ b/pkg/damlpackage/localpath_test.go
+@@ -0,0 +1,30 @@
++// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package damlpackage
++
++import (
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestLocalDarPathsPreserveFilenameCharacters(t *testing.T) {
++	for _, name := range []string{"a b.dar", "a%20b.dar", "100%.dar", "a#b.dar", "a?b.dar", "café.dar"} {
++		t.Run(name, func(t *testing.T) {
++			root := filepath.Join(t.TempDir(), "workspace with spaces")
++			p := &DamlPackage{AbsolutePath: filepath.Join(root, "daml.yaml")}
++			path := filepath.Join(root, name)
++			parsed, err := p.parseLocations([]*RawDependency{{ValueOnly: &path}}, nil)
++			require.NoError(t, err)
++			dep := parsed[path]
++			require.NotNil(t, dep)
++			assert.Equal(t, "file", dep.FullUrl.Scheme)
++			assert.Equal(t, filepath.ToSlash(path), dep.FullUrl.Path)
++			assert.Empty(t, dep.FullUrl.Fragment)
++			assert.Empty(t, dep.FullUrl.RawQuery)
++		})
++	}
++}
+diff --git a/pkg/damlpackage/locations.go b/pkg/damlpackage/locations.go
+index a2ce77c..36bd2e3 100644
+--- a/pkg/damlpackage/locations.go
++++ b/pkg/damlpackage/locations.go
+@@ -185,11 +185,9 @@ func (p *DamlPackage) parseLocations(rawDeps []*RawDependency, artifactLocations
+ 			}
+ 		} else if utils.IsDarPath(d) {
+ 			absPath := utils.ResolvePath(filepath.Dir(p.AbsolutePath), d)
+-			u, err := url.Parse("file://" + filepath.ToSlash(absPath))
+-			if err != nil {
+-				errs = append(errs, err)
+-				continue
+-			}
++			// A filesystem path is not a URL string: parsing it would treat
++			// literal %, # and ? as escapes, a fragment or a query.
++			u := &url.URL{Scheme: "file", Path: filepath.ToSlash(absPath)}
+ 			parsedLocations[d] = &ParsedDarDependency{
+ 				Location:      nil,
+ 				FullUrl:       u,
+diff --git a/pkg/resolver/deepresolver.go b/pkg/resolver/deepresolver.go
+index c3ff238..96957b2 100644
+--- a/pkg/resolver/deepresolver.go
++++ b/pkg/resolver/deepresolver.go
+@@ -208,8 +208,13 @@ func (d *DeepResolver) resolvePackageDars(absPath string) (deps []string, dataDe
+ func (d *DeepResolver) resolveDar(dar *damlpackage.ParsedDarDependency) ([]string, error) {
+ 	scheme := dar.Scheme()
+ 
+-	if scheme == "builtin" || scheme == "file" {
+-		return []string{strings.TrimPrefix(dar.FullUrl.String(), scheme+"://")}, nil
++	if scheme == "builtin" {
++		return []string{dar.FullUrl.Host}, nil
++	}
++	if scheme == "file" {
++		// Components consume filesystem paths, not escaped URL strings.
++		// Host preserves drive prefixes in existing file://C:/... URLs.
++		return []string{dar.FullUrl.Host + dar.FullUrl.Path}, nil
+ 	}
+ 	if scheme == "oci" {
+ 		_, ref, err := dar.GetOciRemote()
+diff --git a/pkg/resolver/localpath_test.go b/pkg/resolver/localpath_test.go
+new file mode 100644
+index 0000000..397145f
+--- /dev/null
++++ b/pkg/resolver/localpath_test.go
+@@ -0,0 +1,37 @@
++// Copyright (c) 2026 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package resolver
++
++import (
++	"net/url"
++	"testing"
++
++	"daml.com/x/assistant/pkg/damlpackage"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestResolveDarReturnsFilesystemPaths(t *testing.T) {
++	for _, path := range []string{"/workspace with spaces/a.dar", "/workspace/a%20b.dar", "/workspace/a#b?.dar", "/workspace/café.dar"} {
++		t.Run(path, func(t *testing.T) {
++			dep := &damlpackage.ParsedDarDependency{FullUrl: &url.URL{Scheme: "file", Path: path}}
++			got, err := (&DeepResolver{}).resolveDar(dep)
++			require.NoError(t, err)
++			assert.Equal(t, []string{path}, got)
++		})
++	}
++	for _, tc := range []struct{ uri, want string }{
++		{"builtin://daml-script", "daml-script"},
++		{"file://C:/Users/Alice%20Smith/test.dar", "C:/Users/Alice Smith/test.dar"},
++		{"file:////server/share/a%20b.dar", "//server/share/a b.dar"},
++	} {
++		t.Run(tc.uri, func(t *testing.T) {
++			u, err := url.Parse(tc.uri)
++			require.NoError(t, err)
++			got, err := (&DeepResolver{}).resolveDar(&damlpackage.ParsedDarDependency{FullUrl: u})
++			require.NoError(t, err)
++			assert.Equal(t, []string{tc.want}, got)
++		})
++	}
++}
