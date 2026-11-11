@@ -28,6 +28,9 @@ are locally tested. Collateral support is partial: custody-backed balances and
 complete-set positions are next. No public Canton deployment
 or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
 
+Before implementing deposits, select the [collateral custody model](collateral-custody.md).
+The existing transfer adapter does not itself secure backing collateral.
+
 ## Checkpoint 1 boundary
 
 In the original Outcomia app, the wallet selects Solana markets or the Canton
