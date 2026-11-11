@@ -1,0 +1,56 @@
+-- | Public types for binary prediction markets. Cash and outcome ownership are
+-- introduced separately; a lifecycle contract alone never proves collateral.
+module Outcomia.Types where
+
+-- | YES and NO are outcomes, not votes. The eventual winning contract pays one
+-- unit of the configured collateral instrument, subject to final resolution.
+data Outcome = Yes | No
+  deriving (Eq, Show)
+
+-- | Closed is an administrative trading stop, not an outcome or a payout.
+-- There is no reopen transition. Future settlement must use separate states.
+data MarketStatus = Draft | Open | Closed
+  deriving (Eq, Show)
+
+-- | Identify an asset by issuer/admin and instrument ID, never by ticker alone.
+-- This matches the Token Standard's identity shape but is not a token holding
+-- or a declaration that its transfer API is supported by this implementation.
+data CollateralInstrument = CollateralInstrument with
+    admin : Party
+    id : Text
+  deriving (Eq, Show)
+
+-- | These criteria are authoritative structured market terms. The attachment
+-- hash identifies an external document; its bytes must be verified by clients.
+-- The ledger cannot download an HTTP/Arweave document during interpretation.
+data ResolutionRules = ResolutionRules with
+    yesCriteria : Text
+    noCriteria : Text
+    invalidCriteria : Text
+    evidenceRequirements : Text
+    documentUri : Text
+    documentSha256 : Text
+  deriving (Eq, Show)
+
+-- | A missing deadline means fallback has no expiry. A missing policy means no
+-- fallback resolver is configured; it does not silently select the operator.
+data FallbackPolicy = FallbackPolicy with
+    resolver : Party
+    availableAt : Time
+    deadlineAt : Optional Time
+  deriving (Eq, Show)
+
+-- | All terms are fixed when a draft is created. To correct them, cancel the
+-- draft and create a new market. The creator is the primary resolver; fallback
+-- terms are recorded now but cannot resolve anything in this lifecycle package.
+data BinaryTerms = BinaryTerms with
+    question : Text
+    collateral : CollateralInstrument
+    rules : ResolutionRules
+    closeAt : Time
+    earliestResolutionAt : Optional Time
+    fallback : Optional FallbackPolicy
+    resolutionDelaySeconds : Int
+    priceTick : Decimal
+    quantityLot : Int
+  deriving (Eq, Show)

@@ -8,3 +8,6 @@ target/
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store
+
+# Daml build products and local test-service state.
+.daml/
