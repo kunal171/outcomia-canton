@@ -56,11 +56,11 @@ The full upstream Go suite still fails `TestComponentDependencyPaths` and
 on unchanged upstream `79bf2d7`; they are not reported as passing or fixed by
 this patch. Other package suites, including the Git puller, pass.
 
-A matching escaped-local-DAR issue was not found in the initial issue search.
-That is not proof none exists. Recheck issues and recent PRs before publishing.
-The fresh SDK skeleton reproduction fails with the original binary and builds
-with the candidate, independently of Outcomia source. No upstream issue or PR has
-been submitted by this checkpoint.
+The reproduction is published as [upstream issue #340](https://github.com/digital-asset/dpm/issues/340),
+with the candidate fix in [PR #341](https://github.com/digital-asset/dpm/pull/341)
+from [kunal171/dpm](https://github.com/kunal171/dpm). The fresh SDK skeleton fails
+with the original binary and builds with the candidate, independently of Outcomia
+source. Cached builds can hide this failure; always use a fresh reproduction.
 
 ## Local use
 

@@ -1,7 +1,7 @@
 # Binary market lifecycle
 
-This checkpoint adds Daml contracts for draft creation, opening and administrative
-closure. It does not add balances, orders, matching, resolution or payouts. The
+This checkpoint added Daml contracts for draft creation, opening and administrative
+closure. Approved token transfers are now covered [separately](collateral-transfers.md). It does not add balances, orders, matching, resolution or payouts. The
 shared frontend must keep showing `Market deployment pending` until a deployment
 and wallet-to-ledger integration are verified.
 

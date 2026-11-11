@@ -23,8 +23,9 @@ Do not start a new feature branch before closing the current checkpoint.
 
 ## Current status
 
-The shared wallet gateway and locally tested binary lifecycle are complete. The
-next contract milestone is collateral and positions. No public Canton deployment
+The shared wallet gateway, binary lifecycle and [approved asset transfers](collateral-transfers.md)
+are locally tested. Collateral support is partial: custody-backed balances and
+complete-set positions are next. No public Canton deployment
 or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
 
 ## Checkpoint 1 boundary
