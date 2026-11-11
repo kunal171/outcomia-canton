@@ -1,0 +1,129 @@
+-- | Token Standard V2 transfer boundary. No internal cash balances or outcome
+-- positions are created here. Only completed, exact, on-ledger transfers pass.
+module Outcomia.Assets where
+
+import DA.List (dedup, unique)
+import DA.Time (addRelTime, seconds)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Outcomia.Types (CollateralInstrument)
+import Outcomia.Validation (boundedText)
+
+-- | Arguments authorized by both asset owners. Only basic, provider-free accounts
+-- are supported. Registry-specific context is interpreted by the pinned factory,
+-- not treated as evidence that a transfer has happened.
+data TransferIntent = TransferIntent with
+    sender : Party
+    receiver : Party
+    amount : Decimal
+    inputs : [ContractId H.Holding]
+    requestedAt : Time
+    executeBefore : Time
+    extraArgs : ExtraArgs
+  deriving (Eq, Show)
+
+-- | Actual resulting holdings, suitable for a later custody contract to bind.
+-- These IDs cannot be reused as deposit evidence without another consuming
+-- transfer. A holding view alone is never a deposit receipt.
+data ExactTransferResult = ExactTransferResult with
+    received : [ContractId H.Holding]
+    change : [ContractId H.Holding]
+  deriving (Eq, Show)
+
+-- | An operator-approved instrument and exact registry factory. Approval assumes
+-- the operator has verified the factory's origin and vetted implementation; a
+-- self-reported admin in an interface view is not proof of authenticity.
+-- Future market contracts must bind operator/instrument to their own signed terms.
+template AssetAdmission
+  with
+    operator : Party
+    instrument : CollateralInstrument
+    factory : ContractId T.TransferFactory
+  where
+    signatory operator
+    ensure boundedText 128 instrument.id
+
+    -- | Inputs: expected operator/instrument from the calling market and intent.
+    -- Rejects: wrong binding, missing sender/receiver authority, invalid holdings,
+    -- pending/failed transfers, fees, locks and inaccurate output/change amounts.
+    -- Result: actual resulting holdings. Any failed post-check rolls the whole
+    -- registry operation back; no pending instruction or partial transfer remains.
+    nonconsuming choice AssetAdmission_Transfer : ExactTransferResult
+      with
+        expectedOperator : Party
+        expectedInstrument : CollateralInstrument
+        intent : TransferIntent
+      controller intent.sender, intent.receiver
+      do
+        assertMsg "Asset admission does not match the calling market"
+          (operator == expectedOperator && instrument == expectedInstrument)
+        transferExact factory instrument intent
+
+-- | Inputs: an already-approved factory, asset identity and jointly authorized
+-- transfer. Result: exact completed outputs, with conservation including change.
+-- Callers must pin factory/instrument themselves; this helper is not an admission
+-- check. It will also serve exits using a saved factory after admission revocation.
+transferExact : ContractId T.TransferFactory -> CollateralInstrument -> TransferIntent -> Update ExactTransferResult
+transferExact factory instrument intent = do
+  now <- getTime
+  assertMsg "Transfer amount must be positive" (intent.amount > 0.0)
+  assertMsg "Transfer must have 1 to 16 unique input holdings"
+    (not (null intent.inputs) && length intent.inputs <= 16 && unique intent.inputs)
+  assertMsg "Transfer time window is invalid"
+    (intent.requestedAt <= now && now < intent.executeBefore && intent.executeBefore <= addRelTime now (seconds 300))
+  let asset = H.InstrumentId instrument.admin instrument.id
+  let sender = H.Account (Some intent.sender) None ""
+  let receiver = H.Account (Some intent.receiver) None ""
+  total <- holdingTotal asset sender intent.inputs
+  assertMsg "Input holdings do not cover the transfer" (total >= intent.amount)
+  let actors = dedup [intent.sender, intent.receiver]
+  factoryView <- exercise factory T.TransferFactory_PublicFetch with actors
+  assertMsg "Registry factory has the wrong instrument admin" (factoryView.admin == instrument.admin)
+  result <- exercise factory T.TransferFactory_Transfer with
+    actors
+    extraArgs = intent.extraArgs
+    transfer = T.Transfer with
+      sender
+      receiver
+      amount = intent.amount
+      instrumentId = asset
+      requestedAt = intent.requestedAt
+      executeBefore = intent.executeBefore
+      inputHoldingCids = intent.inputs
+      meta = intent.extraArgs.meta
+  case result.output of
+    T.TransferInstructionResult_Completed received -> do
+      let change = result.senderChangeCids
+      assertMsg "Registry must return 1 to 16 receiver holdings"
+        (not (null received) && length received <= 16)
+      assertMsg "Registry returned too many change holdings" (length change <= 16)
+      assertMsg "Registry reused input or output holding IDs"
+        (unique (received ++ change) && all (\cid -> not (cid `elem` intent.inputs)) (received ++ change))
+      receivedTotal <- holdingTotal asset receiver received
+      changeTotal <- holdingTotal asset sender change
+      -- Example: spend 3 from inputs totaling 5. Receiver must get exactly 3,
+      -- sender exactly 2. Fees, rounding and hidden deductions are unsupported.
+      assertMsg "Registry receiver amount is not exact" (receivedTotal == intent.amount)
+      assertMsg "Registry change amount is not exact" (changeTotal == total - intent.amount)
+      pure ExactTransferResult with received; change
+    T.TransferInstructionResult_Pending _ -> abort "Pending transfers cannot fund Outcomia"
+    T.TransferInstructionResult_Failed -> abort "Registry transfer failed"
+
+-- | Inputs: expected instrument/account and a bounded list of holdings.
+-- Rejects: archived IDs, missing admin signature, wrong assets/accounts,
+-- nonpositive amounts or any lock.
+-- Result: an exact Decimal sum. Arithmetic overflow rejects rather than wraps.
+holdingTotal : H.InstrumentId -> H.Account -> [ContractId H.Holding] -> Update Decimal
+holdingTotal instrument account holdings = do
+  amounts <- mapA (\cid -> do
+    holding <- fetch cid
+    let value = view holding
+    assertMsg "Holding must be signed by the admitted instrument admin"
+      (instrument.admin `elem` signatory holding)
+    assertMsg "Holding belongs to another instrument or account"
+      (value.instrumentId == instrument && value.account == account)
+    assertMsg "Holding amount must be positive" (value.amount > 0.0)
+    assertMsg "Locked holdings are unsupported" (value.lock == None)
+    pure value.amount) holdings
+  pure (sum amounts)

@@ -11,3 +11,6 @@ next-env.d.ts
 
 # Daml build products and local test-service state.
 .daml/
+
+# Python tooling caches.
+__pycache__/

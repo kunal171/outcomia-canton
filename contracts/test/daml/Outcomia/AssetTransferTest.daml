@@ -1,0 +1,215 @@
+-- | Transfers exercise the actual standard interface against a ledger registry,
+-- not an off-chain response stub. Faults after consumption must restore inputs.
+module Outcomia.AssetTransferTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, seconds)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1
+import Outcomia.Assets
+import Outcomia.Binary
+import Outcomia.Types
+import Outcomia.TokenHarness
+
+data Fixture = Fixture with
+    operator : Party
+    issuer : Party
+    alice : Party
+    bob : Party
+    protocol : ContractId Protocol
+    admission : ContractId AssetAdmission
+    registry : ContractId TestRegistry
+    input : ContractId TestHolding
+    now : Time
+    instrument : CollateralInstrument
+  deriving (Eq, Show)
+
+setup : FactoryMode -> Script Fixture
+setup mode = script do
+  operator <- allocatePartyByHint (PartyIdHint ("Operator-" <> show mode))
+  issuer <- allocatePartyByHint (PartyIdHint ("Issuer-" <> show mode))
+  alice <- allocatePartyByHint (PartyIdHint ("Alice-" <> show mode))
+  bob <- allocatePartyByHint (PartyIdHint ("Bob-" <> show mode))
+  now <- getTime
+  protocol <- submit operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator]; nextMarketId = 1
+  registry <- submit issuer do createCmd TestRegistry with issuer; mode
+  let instrument = CollateralInstrument issuer "test-USD"
+  admission <- submit (actAs operator <> readAs issuer) do
+    exerciseCmd protocol Protocol_ApproveAsset with instrument; factory = toInterfaceContractId @T.TransferFactory registry
+  input <- submit issuer do
+    createCmd TestHolding with issuer; account = H.Account (Some alice) None ""; instrument = H.InstrumentId issuer "test-USD"; amount = 5.0; locked = None
+  pure Fixture with operator; issuer; alice; bob; protocol; admission; registry; input; now; instrument
+
+intentFor : Fixture -> TransferIntent
+intentFor f = TransferIntent with
+  sender = f.alice
+  receiver = f.bob
+  amount = 3.0
+  inputs = [toInterfaceContractId @H.Holding f.input]
+  requestedAt = f.now
+  executeBefore = addRelTime f.now (seconds 60)
+  extraArgs = ExtraArgs emptyChoiceContext emptyMetadata
+
+move : Fixture -> TransferIntent -> Script ExactTransferResult
+move f intent = submit (actAs [f.alice, f.bob] <> readAs [f.operator, f.issuer]) do
+  exerciseCmd f.admission AssetAdmission_Transfer with expectedOperator = f.operator; expectedInstrument = f.instrument; intent
+
+reject : Fixture -> TransferIntent -> Script ()
+reject f intent = submitMustFail (actAs [f.alice, f.bob] <> readAs [f.operator, f.issuer]) do
+  exerciseCmd f.admission AssetAdmission_Transfer with expectedOperator = f.operator; expectedInstrument = f.instrument; intent
+
+-- Registry faults must not destroy inputs, issue outputs or leave a pending
+-- transfer behind. Merely returning a successful-looking response is insufficient.
+assertOriginalSupply : Fixture -> Script ()
+assertOriginalSupply f = do
+  original <- queryContractId f.alice f.input
+  assert (original /= None)
+  holdings <- query @TestHolding f.issuer
+  assert (sum (map (\(_, holding) -> holding.amount) holdings) == 5.0)
+
+testExactTransferAndReplay : Script ()
+testExactTransferAndReplay = script do
+  f <- setup Good
+  result <- move f (intentFor f)
+  assert (length result.received == 1 && length result.change == 1)
+  original <- queryContractId f.alice f.input
+  assert (original == None)
+  holdings <- query @TestHolding f.issuer
+  assert (sum (map (\(_, holding) -> holding.amount) holdings) == 5.0)
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some f.bob] == 3.0)
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some f.alice] == 2.0)
+  reject f (intentFor f)
+
+testExactSpendAndSmallestAmount : Script ()
+testExactSpendAndSmallestAmount = script do
+  f <- setup Good
+  result <- move f ((intentFor f) with amount = 5.0)
+  assert (null result.change)
+  g <- setup ShortPayment
+  -- Use a separate honest factory for the fractional transfer.
+  registry <- submit g.issuer do createCmd TestRegistry with issuer = g.issuer; mode = Good
+  admission <- submit (actAs g.operator <> readAs g.issuer) do
+    exerciseCmd g.protocol Protocol_ApproveAsset with instrument = g.instrument; factory = toInterfaceContractId @T.TransferFactory registry
+  _ <- move (g with admission) ((intentFor g) with amount = 0.0000000001)
+  holdings <- query @TestHolding g.issuer
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some g.bob] == 0.0000000001)
+  assert (sum (map (\(_, h) -> h.amount) holdings) == 5.0)
+
+testBothOwnersMustAuthorize : Script ()
+testBothOwnersMustAuthorize = script do
+  f <- setup Good
+  let intent = intentFor f
+  submitMustFail (actAs f.alice <> readAs [f.bob, f.operator, f.issuer]) do
+    exerciseCmd f.admission AssetAdmission_Transfer with expectedOperator = f.operator; expectedInstrument = f.instrument; intent
+  submitMustFail (actAs f.bob <> readAs [f.alice, f.operator, f.issuer]) do
+    exerciseCmd f.admission AssetAdmission_Transfer with expectedOperator = f.operator; expectedInstrument = f.instrument; intent
+  assertOriginalSupply f
+  _ <- move f intent
+  pure ()
+
+testAdmissionBindingAndRevocation : Script ()
+testAdmissionBindingAndRevocation = script do
+  f <- setup Good
+  let intent = intentFor f
+  submitMustFail (actAs f.alice <> readAs [f.operator, f.issuer]) do
+    exerciseCmd f.protocol Protocol_ApproveAsset with instrument = f.instrument; factory = toInterfaceContractId @T.TransferFactory f.registry
+  submitMustFail (actAs f.operator <> readAs f.issuer) do
+    exerciseCmd f.protocol Protocol_ApproveAsset with instrument = CollateralInstrument f.bob "test-USD"; factory = toInterfaceContractId @T.TransferFactory f.registry
+  submitMustFail (actAs [f.alice, f.bob] <> readAs [f.operator, f.issuer]) do
+    exerciseCmd f.admission AssetAdmission_Transfer with expectedOperator = f.alice; expectedInstrument = f.instrument; intent
+  submitMustFail (actAs [f.alice, f.bob] <> readAs [f.operator, f.issuer]) do
+    exerciseCmd f.admission AssetAdmission_Transfer with expectedOperator = f.operator; expectedInstrument = CollateralInstrument f.issuer "other"; intent
+  submit f.operator do archiveCmd f.admission
+  reject f intent
+  assertOriginalSupply f
+
+testInvalidAmountsInputsAndTime : Script ()
+testInvalidAmountsInputsAndTime = script do
+  f <- setup Good
+  let valid = intentFor f
+  let invalid =
+        [ (valid with amount = 0.0)
+        , (valid with amount = -1.0)
+        , (valid with amount = 6.0)
+        , (valid with inputs = [])
+        , (valid with inputs = valid.inputs ++ valid.inputs)
+        , (valid with requestedAt = addRelTime f.now (seconds 1))
+        , (valid with executeBefore = f.now)
+        , (valid with executeBefore = addRelTime f.now (seconds 301))
+        ]
+  forA_ invalid (reject f)
+  assertOriginalSupply f
+
+testFactoryFaultsRollback : Script ()
+testFactoryFaultsRollback = script do
+  forA_ [Pending, Failed, ShortPayment, WrongChange, WrongAsset, WrongReceiver, LockedOutput, DuplicateOutput, NoOutputs] (\mode -> do
+    f <- setup mode
+    reject f (intentFor f)
+    assertOriginalSupply f)
+
+testWrongInputAccountAssetAndLock : Script ()
+testWrongInputAccountAssetAndLock = script do
+  f <- setup Good
+  let valid = intentFor f
+  let cases =
+        [ (H.Account (Some f.bob) None "", H.InstrumentId f.issuer "test-USD", None)
+        , (H.Account (Some f.alice) None "", H.InstrumentId f.issuer "other", None)
+        , (H.Account (Some f.alice) (Some f.operator) "", H.InstrumentId f.issuer "test-USD", None)
+        , (H.Account (Some f.alice) None "subaccount", H.InstrumentId f.issuer "test-USD", None)
+        , (H.Account (Some f.alice) None "", H.InstrumentId f.issuer "test-USD", Some (H.Lock [f.operator] None None None))
+        ]
+  forA_ cases (\(account, instrument, locked) -> do
+    cid <- submit f.issuer do createCmd TestHolding with issuer = f.issuer; account; instrument; amount = 5.0; locked
+    reject f (valid with inputs = [toInterfaceContractId @H.Holding cid]))
+  original <- queryContractId f.alice f.input
+  assert (original /= None)
+
+testForgedInstrumentAdminRejected : Script ()
+testForgedInstrumentAdminRejected = script do
+  f <- setup Good
+  -- A view can name the real instrument while its contract has another signer.
+  fake <- submit f.bob do
+    createCmd TestHolding with issuer = f.bob; account = H.Account (Some f.alice) None ""; instrument = H.InstrumentId f.issuer "test-USD"; amount = 5.0; locked = None
+  reject f ((intentFor f) with inputs = [toInterfaceContractId @H.Holding fake])
+  preserved <- queryContractId f.alice fake
+  assert (preserved /= None)
+
+-- Selecting multiple holdings must consume each once and return exact change.
+testMultipleInputsConserveSupply : Script ()
+testMultipleInputsConserveSupply = script do
+  f <- setup Good
+  second <- submit f.issuer do
+    createCmd TestHolding with issuer = f.issuer; account = H.Account (Some f.alice) None ""; instrument = H.InstrumentId f.issuer "test-USD"; amount = 7.0; locked = None
+  result <- move f ((intentFor f) with amount = 8.0; inputs = [toInterfaceContractId @H.Holding f.input, toInterfaceContractId @H.Holding second])
+  assert (length result.change == 1)
+  holdings <- query @TestHolding f.issuer
+  assert (sum (map (\(_, h) -> h.amount) holdings) == 12.0)
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some f.bob] == 8.0)
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some f.alice] == 4.0)
+
+-- The limit is tested with genuinely distinct contracts, not repeated IDs that
+-- might fail the duplicate check instead. Sixteen is accepted; seventeen is not.
+testInputCountBoundary : Script ()
+testInputCountBoundary = script do
+  f <- setup Good
+  inputs <- submit f.issuer do
+    mapA (\_ -> createCmd TestHolding with issuer = f.issuer; account = H.Account (Some f.alice) None ""; instrument = H.InstrumentId f.issuer "test-USD"; amount = 1.0; locked = None) [1..17]
+  let ids = map (toInterfaceContractId @H.Holding) inputs
+  reject f ((intentFor f) with inputs = ids)
+  _ <- move f ((intentFor f) with inputs = take 16 ids)
+  holdings <- query @TestHolding f.issuer
+  assert (sum (map (\(_, h) -> h.amount) holdings) == 22.0)
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some f.bob] == 3.0)
+
+-- Self-transfers support later vault consolidation without duplicate actors.
+testSelfTransfer : Script ()
+testSelfTransfer = script do
+  f <- setup Good
+  let intent = (intentFor f) with receiver = f.alice; amount = 5.0
+  result <- submit (actAs f.alice <> readAs [f.operator, f.issuer]) do
+    exerciseCmd f.admission AssetAdmission_Transfer with expectedOperator = f.operator; expectedInstrument = f.instrument; intent
+  assert (null result.change && length result.received == 1)
+  holdings <- query @TestHolding f.issuer
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some f.alice] == 5.0)
