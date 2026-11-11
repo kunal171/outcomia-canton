@@ -1,0 +1,77 @@
+-- | Test-only registry implementing the real, pinned Token Standard interfaces.
+-- Fault modes deliberately violate registry guarantees to check atomic rollback.
+-- These contracts are never included in the production DAR or shown as assets.
+module Outcomia.TokenHarness where
+
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1
+
+data FactoryMode = Good | Pending | Failed | ShortPayment | WrongChange | WrongAsset | WrongReceiver | LockedOutput | DuplicateOutput | NoOutputs
+  deriving (Eq, Show)
+
+template TestHolding
+  with
+    issuer : Party
+    account : H.Account
+    instrument : H.InstrumentId
+    amount : Decimal
+    locked : Optional H.Lock
+  where
+    signatory issuer
+    observer account.owner, account.provider
+    ensure amount > 0.0
+    interface instance H.Holding for TestHolding where
+      view = H.HoldingView with account; instrumentId = instrument; amount; lock = locked; meta = emptyMetadata
+
+template TestRegistry
+  with
+    issuer : Party
+    mode : FactoryMode
+  where
+    signatory issuer
+    interface instance T.TransferFactory for TestRegistry where
+      view = T.TransferFactoryView issuer emptyMetadata
+      transferFactory_transferExtraObservers _ = []
+      transferFactory_publicFetchImpl _ _ = pure (T.TransferFactoryView issuer emptyMetadata)
+      transferFactory_transferImpl cid args = registryTransfer issuer mode cid args
+
+-- | Inputs: registry identity, behavior and a standard transfer request.
+-- Result: actual ledger holdings, or a deliberate faulty response for a test.
+-- Genuine input holdings are archived before producing the response so an
+-- application rejection must restore them through transaction rollback.
+registryTransfer : Party -> FactoryMode -> ContractId T.TransferFactory -> T.TransferFactory_Transfer -> Update T.TransferInstructionResult
+registryTransfer issuer mode factory args = do
+  let transfer = args.transfer
+  (sender, receiver) <- case (transfer.sender.owner, transfer.receiver.owner) of
+    (Some sender, Some receiver) -> pure (sender, receiver)
+    _ -> abort "Harness factory requires basic owned accounts"
+  assertMsg "Harness factory requires sender and receiver authorization"
+    (sender `elem` args.actors && receiver `elem` args.actors)
+  amounts <- mapA (\cid -> do
+    typed <- fetchFromInterface @TestHolding cid
+    case typed of
+      None -> abort "Harness only accepts its own holdings"
+      Some (typedCid, holding) -> do
+        assertMsg "Harness input issuer/account/instrument mismatch"
+          (holding.issuer == issuer && holding.account == transfer.sender && holding.instrument == transfer.instrumentId)
+        exercise typedCid Archive
+        pure holding.amount) transfer.inputHoldingCids
+  let total = sum amounts
+  assertMsg "Harness input amount is insufficient" (total >= transfer.amount)
+  case mode of
+    Pending -> pure (T.TransferInstructionResult (T.TransferInstructionResult_Pending (coerceContractId factory)) [] emptyMetadata)
+    Failed -> pure (T.TransferInstructionResult T.TransferInstructionResult_Failed [] emptyMetadata)
+    _ -> do
+      let amount = if mode == ShortPayment then transfer.amount / 2.0 else transfer.amount
+      let account = if mode == WrongReceiver then H.Account (Some issuer) None "" else transfer.receiver
+      let instrument = if mode == WrongAsset then H.InstrumentId issuer "other" else transfer.instrumentId
+      let locked = if mode == LockedOutput then Some (H.Lock [issuer] None None (Some "test lock")) else None
+      received <- create TestHolding with issuer; account; instrument; amount; locked
+      let changeAmount = total - transfer.amount + (if mode == WrongChange then 1.0 else 0.0)
+      change <- if changeAmount == 0.0 then pure [] else do
+        cid <- create TestHolding with issuer; account = transfer.sender; instrument = transfer.instrumentId; amount = changeAmount; locked = None
+        pure [toInterfaceContractId @H.Holding cid]
+      let receivedCid = toInterfaceContractId @H.Holding received
+      let outputs = if mode == NoOutputs then [] else if mode == DuplicateOutput then [receivedCid, receivedCid] else [receivedCid]
+      pure (T.TransferInstructionResult (T.TransferInstructionResult_Completed outputs) change emptyMetadata)
