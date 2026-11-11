@@ -2,7 +2,7 @@
 
 The target is a working limit-order prediction market suitable for presentation.
 
-1. **Console Wallet gateway:** landing page, verified party/network connection,
+1. **Console Wallet gateway in the shared Outcomia UI:** landing page, verified party/network connection,
    gated Canton workspace, disconnect/account-change handling and responsive UI.
 2. **Binary market lifecycle:** creation, rules, deadlines, roles and opening.
 3. **Collateral and positions:** funding, complete-set issuance/merge and withdrawals.
@@ -23,8 +23,9 @@ Do not start a new feature branch before closing the current checkpoint.
 
 ## Checkpoint 1 boundary
 
-Connect Console Wallet, read its primary Canton party and network, and expose
-only the Canton workspace. No deployed market contracts or order settlement are
+In the original Outcomia app, the wallet selects Solana markets or the Canton
+prediction workspace. Console Wallet verifies its primary party and network.
+This repository owns Canton contracts and services; it does not host a second UI. No deployed market contracts or order settlement are
 claimed by this checkpoint. An unconfigured market deployment is shown explicitly.
 
 ## Settlement decisions to document before checkpoint 4

@@ -2,7 +2,8 @@
 
 - Deliver in small commits on feature branches; close each milestone with a PR and merge.
 - This repository targets Canton prediction markets only. No spot or Solana implementation.
-- Reuse Outcomia's visual design and financial invariants, not its Solana transaction builders.
+- The single frontend lives in `kunal171/outcomia/app`; add Canton UI there. Do not scaffold another app here.
+- Reuse financial invariants, not Solana transaction builders. This repository owns only Canton contracts, services and their documentation.
 - The connected Console Wallet party and network determine session identity.
 - Never treat a URL, localStorage value or remembered party as proof of a wallet connection.
 - Do not copy secrets, private keys or deployment credentials from sibling projects.
