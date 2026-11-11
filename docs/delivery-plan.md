@@ -25,8 +25,8 @@ Do not start a new feature branch before closing the current checkpoint.
 
 The shared wallet gateway, binary lifecycle and [approved asset transfers](collateral-transfers.md)
 are locally tested. Collateral support includes dedicated-vault asset balances
-and [complete-set split/merge](complete-set-positions.md). Limit-order placement
-and settlement are next. No public Canton deployment
+and [complete-set split/merge](complete-set-positions.md). [Resting orders](binary-limit-orders.md)
+add funded placement and cancellation. Atomic matching/settlement is next. No public Canton deployment
 or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
 
 The chosen [collateral custody model](collateral-custody.md) uses a dedicated
@@ -39,9 +39,10 @@ prediction workspace. Console Wallet verifies its primary party and network.
 This repository owns Canton contracts and services; it does not host a second UI. No deployed market contracts or order settlement are
 claimed by this checkpoint. An unconfigured market deployment is shown explicitly.
 
-## Settlement decisions to document before checkpoint 4
+## Settlement decisions before matching
 
-A backend proposing fills does not prove global price-time priority. Specify what
-Daml checks, which orders the matcher can see, how sequencing is committed, and
-how stale or competing fills fail. Keep the wallet adapter independent of these
-contracts so account changes cannot reuse a previous party's commands.
+The bounded order index commits acceptance sequence and price. Matching must
+enforce best-price/FIFO against that index, define self-trade and fee behavior,
+and update partial fills atomically. See the [order design](binary-limit-orders.md).
+Keep wallet identity independent of these contracts so account changes cannot
+reuse a previous party's commands.

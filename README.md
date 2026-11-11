@@ -24,7 +24,9 @@ Use small commits, a feature PR, and a merge before the next checkpoint. See
 [Token Standard transfers](docs/collateral-transfers.md) are locally tested. The
 [dedicated-vault balances](docs/collateral-custody.md) support deposits and withdrawals;
 [complete sets](docs/complete-set-positions.md) support YES/NO split and merge.
-Order matching, resolution and redemption remain. No Canton markets are deployed yet.
+[Resting limit orders](docs/binary-limit-orders.md) lock buys/sells and support
+owner cancellation. Matching, resolution and redemption remain.
+No Canton markets are deployed yet.
 
 ## Contracts
 
