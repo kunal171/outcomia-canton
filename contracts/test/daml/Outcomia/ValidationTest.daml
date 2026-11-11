@@ -1,0 +1,65 @@
+-- | Invalid inputs must roll back completely, including the market sequence.
+module Outcomia.ValidationTest where
+
+import DA.Foldable (forA_)
+import Daml.Script
+import DA.Time (addRelTime, seconds)
+import qualified DA.Text as T
+import Outcomia.Binary
+import Outcomia.LifecycleTest (setup, marketFor)
+import Outcomia.Types
+
+-- Each attempt uses the same still-live protocol. If any malformed input is
+-- accepted, submitMustFail fails; a later valid creation must still allocate #1.
+testInvalidTermsRollback : Script ()
+testInvalidTermsRollback = script do
+  (_, creator, outsider, protocol, (now, terms)) <- setup ()
+  let invalid =
+        [ (terms with question = "")
+        , (terms with question = " \n\t\r ")
+        , (terms with question = T.implode (replicate 501 "x"))
+        , (terms with collateral = terms.collateral with id = "")
+        , (terms with rules = terms.rules with yesCriteria = "")
+        , (terms with rules = terms.rules with noCriteria = "")
+        , (terms with rules = terms.rules with invalidCriteria = "")
+        , (terms with rules = terms.rules with evidenceRequirements = "")
+        , (terms with rules = terms.rules with documentUri = "file:///rules.json")
+        , (terms with rules = terms.rules with documentUri = "ar://")
+        , (terms with rules = terms.rules with documentSha256 = "abc")
+        , (terms with rules = terms.rules with documentSha256 = T.implode (replicate 64 "g"))
+        , (terms with closeAt = now)
+        , (terms with closeAt = addRelTime now (seconds (-1)))
+        , (terms with earliestResolutionAt = Some (addRelTime terms.closeAt (seconds (-1))))
+        , (terms with fallback = Some (FallbackPolicy creator terms.closeAt None))
+        , (terms with fallback = Some (FallbackPolicy outsider now None))
+        , (terms with fallback = Some (FallbackPolicy outsider terms.closeAt (Some terms.closeAt)))
+        , (terms with fallback = Some (FallbackPolicy outsider terms.closeAt (Some now)))
+        , (terms with resolutionDelaySeconds = 0)
+        , (terms with resolutionDelaySeconds = 604801)
+        , (terms with priceTick = 0.0)
+        , (terms with priceTick = -0.01)
+        , (terms with priceTick = 1.0)
+        , (terms with quantityLot = 0)
+        , (terms with quantityLot = -1)
+        ]
+  forA_ invalid (\bad -> submitMustFail creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms = bad)
+  (_, draft) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
+  accepted <- marketFor creator draft
+  assert (accepted.marketId == 1 && accepted.status == Draft)
+
+-- Integer exhaustion is rejected before incrementing; invalid roots and markets
+-- cannot bypass the factory's pure invariants even with joint authorization.
+testDirectInvariantsAndCounterLimit : Script ()
+testDirectInvariantsAndCounterLimit = script do
+  (operator, creator, _, _, (now, terms)) <- setup ()
+  submitMustFail operator do createCmd Protocol with operator; protocolName = " "; admins = [operator]; nextMarketId = 1
+  submitMustFail operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = []; nextMarketId = 1
+  submitMustFail operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator]; nextMarketId = 0
+  exhausted <- submit operator do createCmd Protocol with operator; protocolName = "limit"; admins = [operator, creator]; nextMarketId = 9223372036854775807
+  submitMustFail creator do exerciseCmd exhausted Protocol_CreateBinary with creator; terms
+  submitMustFail [operator, creator] do
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms = (terms with priceTick = 0.0); createdAt = now; status = Draft; closeReason = None
+  submitMustFail [operator, creator] do
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Closed; closeReason = None
+  submitMustFail [operator, creator] do
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Draft; closeReason = Some "not closed"
