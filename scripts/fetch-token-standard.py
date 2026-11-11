@@ -14,7 +14,7 @@ MAX_BYTES = 4 * 1024 * 1024
 
 def fetch_artifact(url, destination, expected_sha256, opener=urlopen):
     """Keep verified caches offline; reject bad downloads before replacing files."""
-    if destination.is_file() and hashlib.sha256(destination.read_bytes()).hexdigest() == expected_sha256:
+    if destination.is_file() and destination.stat().st_size <= MAX_BYTES and hashlib.sha256(destination.read_bytes()).hexdigest() == expected_sha256:
         return
     with opener(url, timeout=30) as response:
         data = response.read(MAX_BYTES + 1)

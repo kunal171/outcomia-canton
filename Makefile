@@ -1,3 +1,4 @@
+.DEFAULT_GOAL := build
 DPM ?= $(if $(wildcard $(HOME)/.dpm/bin/dpm),$(HOME)/.dpm/bin/dpm,dpm)
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 export XDG_CACHE_HOME := $(REPO_ROOT)/target/cache
