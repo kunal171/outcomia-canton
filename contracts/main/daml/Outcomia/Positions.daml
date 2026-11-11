@@ -1,0 +1,205 @@
+-- | Collateral-backed binary complete sets. One collateral unit creates one YES
+-- and one NO unit; a merge burns one of each and returns one collateral unit.
+-- Tokens and position state move in one ledger transaction, never via receipts.
+--
+-- This checkpoint has no final resolution or redemption. A later resolution
+-- transition must consume the reserve and define which merges remain valid.
+-- The dedicated vault and its approved registry remain custody trust boundaries.
+module Outcomia.Positions where
+
+import DA.List (unique)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Outcomia.Assets
+import Outcomia.Binary
+import Outcomia.Custody
+import Outcomia.Types
+import Outcomia.Validation (boundedText, termsErrors)
+
+-- | One configured reserve registry per vault/protocol lineage. This separate
+-- root avoids coupling account enrollment to reserve initialization. Consuming
+-- its bounded index prevents duplicate reserves in this lineage; joint vault
+-- and operator signers can still bootstrap another root and remain trusted.
+template PositionRegistry
+  with
+    operator : Party
+    vault : Party
+    protocolName : Text
+    marketIds : [Int]
+  where
+    signatory operator, vault
+    ensure operator /= vault && boundedText 64 protocolName &&
+      length marketIds <= 1024 && unique marketIds && all (> 0) marketIds
+
+    -- | Inputs: creator, current protocol/market and active asset admission.
+    -- Rejects: revoked/non-creator admin, wrong namespace/asset, Closed/expired
+    -- market, duplicate ID or full index. Result: one empty reserve and new index.
+    choice PositionRegistry_CreateReserve : (ContractId PositionRegistry, ContractId MarketReserve)
+      with
+        creator : Party
+        protocol : ContractId Protocol
+        market : ContractId BinaryMarket
+        admission : ContractId AssetAdmission
+      controller creator
+      do
+        current <- fetch market
+        assertMsg "Market does not belong to this registry/creator"
+          (current.operator == operator && current.protocolName == protocolName && current.creator == creator)
+        checkCreator protocol operator protocolName creator
+        now <- getTime
+        assertMsg "Reserve requires an unexpired Draft or Open market"
+          (current.status /= Closed && now < current.terms.closeAt)
+        assertMsg "Reserve already registered" (not (current.marketId `elem` marketIds))
+        assertMsg "Reserve registry is full" (length marketIds < 1024)
+        admitted <- fetch admission
+        assertMsg "Reserve admission does not match collateral"
+          (admitted.operator == operator && admitted.instrument == current.terms.collateral)
+        next <- create this with marketIds = current.marketId :: marketIds
+        reserve <- create MarketReserve with
+          key = MarketKey operator protocolName current.marketId
+          vault; creator
+          terms = current.terms
+          createdAt = current.createdAt
+          factory = admitted.factory
+          completeSets = 0
+          cash = None
+        pure (next, reserve)
+
+-- | Positions are ledger-native contract lots, not Token Standard assets yet.
+-- There may be several lots per owner. Bounded merge inputs combine them and
+-- retain any unburned YES/NO in a successor lot. No one-sided redemption exists.
+template PositionLot
+  with
+    key : MarketKey
+    vault : Party
+    owner : Party
+    yes : Int
+    no : Int
+  where
+    signatory vault, owner
+    observer key.operator
+    ensure vault /= key.operator && owner /= vault && key.marketId > 0 &&
+      boundedText 64 key.protocolName && yes >= 0 && no >= 0 && (yes > 0 || no > 0)
+
+data SplitResult = SplitResult with
+    reserve : ContractId MarketReserve
+    balance : ContractId AssetBalance
+    position : ContractId PositionLot
+  deriving (Eq, Show)
+
+data MergeResult = MergeResult with
+    reserve : ContractId MarketReserve
+    balance : ContractId AssetBalance
+    remainder : Optional (ContractId PositionLot)
+  deriving (Eq, Show)
+
+-- | Exactly completeSets collateral units back all outstanding lots for this
+-- market. Partial ownership transfers will not change that reserve. Each split
+-- or merge consumes this revision: simultaneous requests serialize and stale
+-- clients retry. This is a deliberate first-version contention point.
+template MarketReserve
+  with
+    key : MarketKey
+    vault : Party
+    creator : Party
+    terms : BinaryTerms
+    createdAt : Time
+    factory : ContractId T.TransferFactory
+    completeSets : Int
+    cash : Optional (ContractId H.Holding)
+  where
+    signatory key.operator, vault
+    observer creator
+    ensure key.operator /= vault && key.marketId > 0 && boundedText 64 key.protocolName &&
+      null (termsErrors creator createdAt terms) && completeSets >= 0 &&
+      ((completeSets == 0) == (cash == None))
+
+    -- | Inputs: owner, current market, enrolled asset balance, quantity and
+    -- registry context. Rejects: wrong/revised terms, non-Open/cutoff market,
+    -- off-lot/nonpositive quantity, mismatched account or insufficient backing.
+    -- Result: Q collateral reserved, Q YES + Q NO created, account debited by Q.
+    choice MarketReserve_Split : SplitResult
+      with
+        owner : Party
+        market : ContractId BinaryMarket
+        balance : ContractId AssetBalance
+        quantity : Int
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        current <- fetch market
+        assertMsg "Market identity or immutable terms do not match reserve"
+          (current.operator == key.operator && current.protocolName == key.protocolName &&
+           current.marketId == key.marketId && current.creator == creator &&
+           current.createdAt == createdAt && current.terms == terms)
+        now <- getTime
+        assertMsg "Splitting requires an open market before cutoff"
+          (current.status == Open && now < terms.closeAt)
+        checkQuantity terms.quantityLot quantity
+        assertMsg "Complete-set supply limit reached" (quantity <= 9223372036854775807 - completeSets)
+        checkBalance this owner balance
+        partition <- exercise balance AssetBalance_Repartition with
+          otherCash = cash
+          otherAmount = intToDecimal completeSets
+          delta = negate (intToDecimal quantity)
+          extraArgs
+        next <- create this with completeSets = completeSets + quantity; cash = partition.otherCash
+        position <- create PositionLot with key; vault; owner; yes = quantity; no = quantity
+        pure SplitResult with reserve = next; balance = partition.balance; position
+
+    -- | Inputs: owner, matching account, 1..16 unique lots and whole-lot quantity.
+    -- Rejects: wrong owner/vault/market, missing one outcome, stale lots or supply
+    -- mismatch. Result: Q of each outcome burned and Q collateral made available.
+    -- No Open/admin/admission check: closing or revocation cannot block this exit.
+    choice MarketReserve_Merge : MergeResult
+      with
+        owner : Party
+        balance : ContractId AssetBalance
+        positions : [ContractId PositionLot]
+        quantity : Int
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        checkQuantity terms.quantityLot quantity
+        assertMsg "Merge exceeds reserved complete sets" (quantity <= completeSets)
+        assertMsg "Merge requires 1 to 16 unique position lots"
+          (not (null positions) && length positions <= 16 && unique positions)
+        checkBalance this owner balance
+        lots <- mapA (\cid -> do
+          lot <- fetch cid
+          assertMsg "Position owner, vault or market does not match"
+            (lot.owner == owner && lot.vault == vault && lot.key == key)
+          exercise cid Archive
+          pure lot) positions
+        let totalYes = sum (map (\lot -> lot.yes) lots)
+        let totalNo = sum (map (\lot -> lot.no) lots)
+        assertMsg "Merge requires both YES and NO" (totalYes >= quantity && totalNo >= quantity)
+        partition <- exercise balance AssetBalance_Repartition with
+          otherCash = cash
+          otherAmount = intToDecimal completeSets
+          delta = intToDecimal quantity
+          extraArgs
+        next <- create this with completeSets = completeSets - quantity; cash = partition.otherCash
+        remainder <- if totalYes == quantity && totalNo == quantity then pure None else do
+          cid <- create PositionLot with key; vault; owner; yes = totalYes - quantity; no = totalNo - quantity
+          pure (Some cid)
+        pure MergeResult with reserve = next; balance = partition.balance; remainder
+
+-- | Inputs: reserve, caller and account ID. Rejects mismatched ownership, asset,
+-- factory, namespace or vault. Result: no mutation. No caller-selected factory or
+-- balance numbers can substitute for the signed, fetched account revision.
+checkBalance : MarketReserve -> Party -> ContractId AssetBalance -> Update ()
+checkBalance reserve owner cid = do
+  balance <- fetch cid
+  assertMsg "Balance does not belong to this reserve/owner/asset"
+    (balance.operator == reserve.key.operator && balance.vault == reserve.vault &&
+     balance.protocolName == reserve.key.protocolName && balance.owner == owner &&
+     balance.instrument == reserve.terms.collateral && balance.factory == reserve.factory)
+
+-- | Inputs: positive market lot and requested integer quantity. Rejects zero,
+-- negative or off-lot quantities. Result: exact whole contracts, without rounding.
+checkQuantity : Int -> Int -> Update ()
+checkQuantity lot quantity =
+  assertMsg "Quantity must be positive and a multiple of the market lot"
+    (quantity > 0 && quantity % lot == 0)

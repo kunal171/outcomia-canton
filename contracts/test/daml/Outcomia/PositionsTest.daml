@@ -1,0 +1,391 @@
+-- | Complete-set conservation uses actual registry holdings and the active lot
+-- supply. Tests cover both zero/nonzero backing branches and atomic rollback.
+module Outcomia.PositionsTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import Outcomia.Binary
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Fixtures (termsFor)
+import Outcomia.Positions
+import Outcomia.TokenHarness
+import Outcomia.Types
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+
+data Fixture = Fixture with
+    custody : C.Fixture
+    protocol : ContractId Protocol
+    draft : ContractId BinaryMarket
+    market : ContractId BinaryMarket
+    registry : ContractId PositionRegistry
+    reserve : ContractId MarketReserve
+    balance : ContractId AssetBalance
+  deriving (Eq, Show)
+
+setup : FactoryMode -> Int -> Script Fixture
+setup mode lot = script do
+  custody <- C.setup mode
+  let f = custody.asset
+  funded <- C.deposit custody custody.balance 5.0 [toInterfaceContractId @H.Holding f.input]
+  (protocol, draft) <- submit f.operator do
+    exerciseCmd f.protocol Protocol_CreateBinary with creator = f.operator; terms = ((termsFor f.issuer f.now) with quantityLot = lot)
+  root <- submit [f.operator, custody.vault] do
+    createCmd PositionRegistry with operator = f.operator; vault = custody.vault; protocolName = "outcomia"; marketIds = []
+  (registry, reserve) <- submit f.operator do
+    exerciseCmd root PositionRegistry_CreateReserve with creator = f.operator; protocol; market = draft; admission = f.admission
+  market <- submit f.operator do exerciseCmd draft Binary_Open with protocol
+  pure Fixture with custody; protocol; draft; market; registry; reserve; balance = funded.balance
+
+split : Fixture -> ContractId MarketReserve -> ContractId AssetBalance -> Int -> Script SplitResult
+split f reserve balance quantity = submit (actAs f.custody.asset.alice <> readAs [f.custody.asset.operator, f.custody.asset.issuer]) do
+  exerciseCmd reserve MarketReserve_Split with owner = f.custody.asset.alice; market = f.market; balance; quantity; extraArgs = C.registryContext
+
+merge : Fixture -> ContractId MarketReserve -> ContractId AssetBalance -> [ContractId PositionLot] -> Int -> Script MergeResult
+merge f reserve balance positions quantity = submit (actAs f.custody.asset.alice <> readAs [f.custody.asset.operator, f.custody.asset.issuer]) do
+  exerciseCmd reserve MarketReserve_Merge with owner = f.custody.asset.alice; balance; positions; quantity; extraArgs = C.registryContext
+
+loadReserve : Fixture -> ContractId MarketReserve -> Script MarketReserve
+loadReserve f cid = do
+  found <- queryContractId f.custody.vault cid
+  case found of Some value -> pure value; None -> abort "Expected a live reserve"
+
+loadLot : Fixture -> ContractId PositionLot -> Script PositionLot
+loadLot f cid = do
+  found <- queryContractId f.custody.vault cid
+  case found of Some value -> pure value; None -> abort "Expected a live position lot"
+
+-- Assert backing by contract ID, then independently sum all actual holdings and
+-- positions. This catches missing/doubled outputs and unintended extra minting.
+assertConserved : Fixture -> ContractId MarketReserve -> ContractId AssetBalance -> Decimal -> Int -> Script ()
+assertConserved f reserve balance available sets = do
+  pool <- loadReserve f reserve
+  account <- C.loadAccount f.custody balance
+  holdings <- query @TestHolding f.custody.asset.issuer
+  lots <- query @PositionLot f.custody.vault
+  let totalAt cid = sum [h.amount | (holdingCid, h) <- holdings, Some (toInterfaceContractId @H.Holding holdingCid) == cid]
+  assert (account.available == available && pool.completeSets == sets)
+  assert (totalAt account.cash == available && totalAt pool.cash == intToDecimal sets)
+  assert (account.cash == None || account.cash /= pool.cash)
+  assert (sum [h.amount | (_, h) <- holdings] == 5.0)
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some f.custody.vault] == 5.0)
+  assert (sum [lot.yes | (_, lot) <- lots] == sets && sum [lot.no | (_, lot) <- lots] == sets)
+
+testSplitPartialAndFullMerge : Script ()
+testSplitPartialAndFullMerge = script do
+  f <- setup Good 1
+  placed <- split f f.reserve f.balance 3
+  assertConserved f placed.reserve placed.balance 2.0 3
+  partial <- merge f placed.reserve placed.balance [placed.position] 1
+  assertConserved f partial.reserve partial.balance 3.0 2
+  cid <- case partial.remainder of Some cid -> pure cid; None -> abort "Expected remainder"
+  lot <- loadLot f cid
+  assert (lot.yes == 2 && lot.no == 2)
+  final <- merge f partial.reserve partial.balance [cid] 2
+  assert (final.remainder == None)
+  assertConserved f final.reserve final.balance 5.0 0
+
+testEmptyBalanceAndMultipleLots : Script ()
+testEmptyBalanceAndMultipleLots = script do
+  f <- setup Good 1
+  first <- split f f.reserve f.balance 2
+  second <- split f first.reserve first.balance 3
+  assertConserved f second.reserve second.balance 0.0 5
+  partial <- merge f second.reserve second.balance [first.position, second.position] 4
+  assertConserved f partial.reserve partial.balance 4.0 1
+  remaining <- case partial.remainder of Some cid -> pure cid; None -> abort "Expected one pair"
+  final <- merge f partial.reserve partial.balance [remaining] 1
+  assertConserved f final.reserve final.balance 5.0 0
+
+testSplitAuthorizationAndInternalPartition : Script ()
+testSplitAuthorizationAndInternalPartition = script do
+  f <- setup Good 1
+  let a = f.custody.asset
+  forA_ [a.bob, a.operator, f.custody.vault] (\caller -> do
+    submitMustFail (actAs caller <> readAs [a.alice, a.operator, a.issuer, f.custody.vault]) do
+      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 1; extraArgs = C.registryContext)
+  -- A trader cannot use the internal partition choice to bypass the reserve's
+  -- supply update; readAs vault is deliberately insufficient authority.
+  submitMustFail (actAs a.alice <> readAs [f.custody.vault, a.issuer]) do
+    exerciseCmd f.balance AssetBalance_Repartition with otherCash = None; otherAmount = 0.0; delta = -1.0; extraArgs = C.registryContext
+  assertConserved f f.reserve f.balance 5.0 0
+
+testMergeOwnerAuthorization : Script ()
+testMergeOwnerAuthorization = script do
+  f <- setup Good 1
+  placed <- split f f.reserve f.balance 3
+  let a = f.custody.asset
+  forA_ [a.bob, a.operator, f.custody.vault] (\caller -> do
+    submitMustFail (actAs caller <> readAs [a.alice, a.operator, a.issuer, f.custody.vault]) do
+      exerciseCmd placed.reserve MarketReserve_Merge with owner = a.alice; balance = placed.balance; positions = [placed.position]; quantity = 1; extraArgs = C.registryContext)
+  lot <- loadLot f placed.position
+  submitMustFail a.alice do createCmd lot
+  submitMustFail a.alice do archiveCmd placed.position
+  assertConserved f placed.reserve placed.balance 2.0 3
+
+testQuantityAndFundsChecks : Script ()
+testQuantityAndFundsChecks = script do
+  f <- setup Good 2
+  forA_ [0, -2, 1, 3, 6] (\quantity -> do
+    submitMustFail (actAs f.custody.asset.alice <> readAs [f.custody.asset.operator, f.custody.asset.issuer]) do
+      exerciseCmd f.reserve MarketReserve_Split with owner = f.custody.asset.alice; market = f.market; balance = f.balance; quantity; extraArgs = C.registryContext)
+  placed <- split f f.reserve f.balance 2
+  forA_ [0, -2, 1, 4] (\quantity -> do
+    submitMustFail (actAs f.custody.asset.alice <> readAs [f.custody.asset.operator, f.custody.asset.issuer]) do
+      exerciseCmd placed.reserve MarketReserve_Merge with owner = f.custody.asset.alice; balance = placed.balance; positions = [placed.position]; quantity; extraArgs = C.registryContext)
+  assertConserved f placed.reserve placed.balance 3.0 2
+
+testCutoffClosureAndRevocationExit : Script ()
+testCutoffClosureAndRevocationExit = script do
+  f <- setup Good 1
+  placed <- split f f.reserve f.balance 3
+  let a = f.custody.asset
+  closed <- submit a.operator do exerciseCmd f.market Binary_Close with protocol = f.protocol; reason = "Stopped"
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd placed.reserve MarketReserve_Split with owner = a.alice; market = closed; balance = placed.balance; quantity = 1; extraArgs = C.registryContext
+  pool <- loadReserve f placed.reserve
+  setTime pool.terms.closeAt
+  submit a.operator do archiveCmd a.admission
+  final <- merge f placed.reserve placed.balance [placed.position] 3
+  assertConserved f final.reserve final.balance 5.0 0
+  _ <- C.withdraw f.custody final.balance 5.0
+  holdings <- query @TestHolding a.issuer
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some a.alice] == 5.0)
+
+testExactCutoffAndWrongMarket : Script ()
+testExactCutoffAndWrongMarket = script do
+  f <- setup Good 1
+  let a = f.custody.asset
+  current <- queryContractId a.operator f.market
+  original <- case current of Some value -> pure value; None -> abort "Expected market"
+  -- The lifecycle signer can make a valid alternative contract with the same
+  -- numeric identity. The reserve must still reject changed immutable terms.
+  altered <- submit a.operator do createCmd (original with terms = (original.terms with question = "Different question"))
+  activeDraft <- submit a.operator do createCmd (original with status = Draft)
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = altered; balance = f.balance; quantity = 1; extraArgs = C.registryContext
+  forA_ [activeDraft, f.draft] (\market -> do
+    submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market; balance = f.balance; quantity = 1; extraArgs = C.registryContext)
+  setTime original.terms.closeAt
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 1; extraArgs = C.registryContext
+  assertConserved f f.reserve f.balance 5.0 0
+
+testReplayAndDuplicateLots : Script ()
+testReplayAndDuplicateLots = script do
+  f <- setup Good 1
+  placed <- split f f.reserve f.balance 3
+  let a = f.custody.asset
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = placed.balance; quantity = 1; extraArgs = C.registryContext
+  forA_ [[], [placed.position, placed.position]] (\positions -> do
+    submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+      exerciseCmd placed.reserve MarketReserve_Merge with owner = a.alice; balance = placed.balance; positions; quantity = 1; extraArgs = C.registryContext)
+  partial <- merge f placed.reserve placed.balance [placed.position] 1
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd partial.reserve MarketReserve_Merge with owner = a.alice; balance = partial.balance; positions = [placed.position]; quantity = 1; extraArgs = C.registryContext
+  assertConserved f partial.reserve partial.balance 3.0 2
+
+testRegistryFailureRollsBackSplitAndMerge : Script ()
+testRegistryFailureRollsBackSplitAndMerge = script do
+  f <- setup ShortPartition 1
+  let a = f.custody.asset
+  -- Deposit consolidation of 5 succeeds. A split of 3 requests a receiver
+  -- holding of 2; this factory underpays it after consuming the inputs.
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 3; extraArgs = C.registryContext
+  assertConserved f f.reserve f.balance 5.0 0
+  placed <- split f f.reserve f.balance 2
+  -- Merging 1 would create account backing of 4, the other deliberate fault.
+  -- The position archive must roll back together with registry consumption.
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd placed.reserve MarketReserve_Merge with owner = a.alice; balance = placed.balance; positions = [placed.position]; quantity = 1; extraArgs = C.registryContext
+  lot <- loadLot f placed.position
+  assert (lot.yes == 2 && lot.no == 2)
+  assertConserved f placed.reserve placed.balance 3.0 2
+
+testReserveUniquenessAndCreatorChecks : Script ()
+testReserveUniquenessAndCreatorChecks = script do
+  f <- setup Good 1
+  let a = f.custody.asset
+  submitMustFail a.operator do
+    exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.operator; protocol = f.protocol; market = f.market; admission = a.admission
+  submitMustFail (actAs a.bob <> readAs a.operator) do
+    exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.bob; protocol = f.protocol; market = f.market; admission = a.admission
+  enabled <- submit a.operator do exerciseCmd f.protocol Protocol_SetAdmins with replacementAdmins = [a.operator, a.alice]
+  (next, draft) <- submit (actAs a.alice <> readAs a.operator) do
+    exerciseCmd enabled Protocol_CreateBinary with creator = a.alice; terms = termsFor a.issuer a.now
+  revoked <- submit a.operator do exerciseCmd next Protocol_SetAdmins with replacementAdmins = [a.operator]
+  submitMustFail (actAs a.alice <> readAs a.operator) do
+    exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.alice; protocol = revoked; market = draft; admission = a.admission
+
+-- Deliberately privileged fixture construction isolates each binding guard. Such
+-- creation is not available to an ordinary trader, and must not be presented as
+-- evidence against colluding vault signers. Invalid inputs must remain active.
+testWrongLotsAndMissingOutcome : Script ()
+testWrongLotsAndMissingOutcome = script do
+  f <- setup Good 1
+  placed <- split f f.reserve f.balance 3
+  pool <- loadReserve f placed.reserve
+  let a = f.custody.asset
+  let candidates =
+        [ PositionLot pool.key f.custody.vault a.alice 3 0
+        , PositionLot pool.key f.custody.vault a.alice 0 3
+        , PositionLot (pool.key with marketId = 2) f.custody.vault a.alice 3 3
+        , PositionLot pool.key f.custody.vault a.bob 3 3
+        , PositionLot pool.key a.bob a.alice 3 3
+        ]
+  forA_ candidates (\value -> do
+    cid <- submit [value.vault, value.owner] do createCmd value
+    submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer, a.bob]) do
+      exerciseCmd placed.reserve MarketReserve_Merge with owner = a.alice; balance = placed.balance; positions = [cid]; quantity = 1; extraArgs = C.registryContext
+    active <- queryContractId value.owner cid
+    assert (active /= None))
+  poolAfter <- loadReserve f placed.reserve
+  assert (poolAfter == pool)
+
+testPositionInputLimit : Script ()
+testPositionInputLimit = script do
+  f <- setup Good 1
+  let a = f.custody.asset
+  extra <- submit a.issuer do
+    createCmd TestHolding with issuer = a.issuer; account = H.Account (Some a.alice) None ""; instrument = H.InstrumentId a.issuer "test-USD"; amount = 12.0; locked = None
+  funded <- C.deposit f.custody f.balance 12.0 [toInterfaceContractId @H.Holding extra]
+  (reserve, balance, lots) <- splitLots f f.reserve funded.balance 17
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd reserve MarketReserve_Merge with owner = a.alice; balance; positions = lots; quantity = 1; extraArgs = C.registryContext
+  -- All seventeen lots came from real funded splits. Sixteen are accepted,
+  -- leaving exactly one backed pair in the remaining, unconsumed lot.
+  result <- merge f reserve balance (take 16 lots) 16
+  assert (result.remainder == None)
+  pool <- loadReserve f result.reserve
+  account <- C.loadAccount f.custody result.balance
+  active <- query @PositionLot f.custody.vault
+  holdings <- query @TestHolding a.issuer
+  assert (pool.completeSets == 1 && account.available == 16.0)
+  assert (sum [lot.yes | (_, lot) <- active] == 1 && sum [lot.no | (_, lot) <- active] == 1)
+  assert (sum [h.amount | (_, h) <- holdings] == 17.0)
+
+-- | Inputs: live revisions and number of pairs. Result: genuine, independently
+-- issued lots. This is parameterized so the runner does not treat it as a test.
+splitLots : Fixture -> ContractId MarketReserve -> ContractId AssetBalance -> Int -> Script (ContractId MarketReserve, ContractId AssetBalance, [ContractId PositionLot])
+splitLots f reserve balance count = if count == 0 then pure (reserve, balance, []) else do
+  placed <- split f reserve balance 1
+  (nextReserve, nextBalance, rest) <- splitLots f placed.reserve placed.balance (count - 1)
+  pure (nextReserve, nextBalance, placed.position :: rest)
+
+testWrongBalanceBinding : Script ()
+testWrongBalanceBinding = script do
+  f <- setup Good 1
+  let a = f.custody.asset
+  original <- C.loadAccount f.custody f.balance
+  forA_ [(original with owner = a.bob), (original with protocolName = "other"),
+         (original with instrument = CollateralInstrument a.issuer "other"),
+         (original with operator = a.bob), (original with vault = a.bob)] (\value -> do
+    cid <- submit [value.vault, value.owner] do createCmd value
+    submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer, a.bob]) do
+      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = cid; quantity = 1; extraArgs = C.registryContext)
+  otherFactory <- submit a.issuer do createCmd TestRegistry with issuer = a.issuer; mode = Good
+  cid <- submit [f.custody.vault, a.alice] do createCmd (original with factory = toInterfaceContractId @T.TransferFactory otherFactory)
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = cid; quantity = 1; extraArgs = C.registryContext
+  assertConserved f f.reserve f.balance 5.0 0
+
+testSameAssetAcrossMarkets : Script ()
+testSameAssetAcrossMarkets = script do
+  f <- setup Good 1
+  let a = f.custody.asset
+  (protocol, draft) <- submit a.operator do
+    exerciseCmd f.protocol Protocol_CreateBinary with creator = a.operator; terms = termsFor a.issuer a.now
+  (_, otherReserve) <- submit a.operator do
+    exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.operator; protocol; market = draft; admission = a.admission
+  otherMarket <- submit a.operator do exerciseCmd draft Binary_Open with protocol
+  first <- split f f.reserve f.balance 2
+  second <- split (f with market = otherMarket) otherReserve first.balance 1
+  -- No second account enrollment/deposit is needed for the same collateral.
+  account <- C.loadAccount f.custody second.balance
+  assert (account.available == 2.0)
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd second.reserve MarketReserve_Merge with owner = a.alice; balance = second.balance; positions = [first.position]; quantity = 1; extraArgs = C.registryContext
+  exitedSecond <- merge f second.reserve second.balance [second.position] 1
+  exitedFirst <- merge f first.reserve exitedSecond.balance [first.position] 2
+  accountFinal <- C.loadAccount f.custody exitedFirst.balance
+  holdings <- query @TestHolding a.issuer
+  lots <- query @PositionLot f.custody.vault
+  assert (accountFinal.available == 5.0 && null lots)
+  assert (sum [h.amount | (_, h) <- holdings] == 5.0)
+
+testTwoTradersShareReserveWithoutSharingFunds : Script ()
+testTwoTradersShareReserveWithoutSharingFunds = script do
+  f <- setup Good 1
+  let a = f.custody.asset
+  (_, bobBalance) <- submit (actAs a.bob <> readAs a.operator) do
+    exerciseCmd f.custody.authority VaultAuthority_OpenBalance with owner = a.bob; admission = a.admission
+  input <- submit a.issuer do
+    createCmd TestHolding with issuer = a.issuer; account = H.Account (Some a.bob) None ""; instrument = H.InstrumentId a.issuer "test-USD"; amount = 5.0; locked = None
+  funded <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd bobBalance AssetBalance_Deposit with admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0; extraArgs = C.registryContext
+  alice <- split f f.reserve f.balance 3
+  bob <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd alice.reserve MarketReserve_Split with owner = a.bob; market = f.market; balance = funded.balance; quantity = 2; extraArgs = C.registryContext
+  submitMustFail (actAs a.bob <> readAs [a.operator, a.issuer, a.alice]) do
+    exerciseCmd bob.reserve MarketReserve_Merge with owner = a.bob; balance = bob.balance; positions = [alice.position]; quantity = 1; extraArgs = C.registryContext
+  bobExit <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd bob.reserve MarketReserve_Merge with owner = a.bob; balance = bob.balance; positions = [bob.position]; quantity = 2; extraArgs = C.registryContext
+  aliceExit <- merge f bobExit.reserve alice.balance [alice.position] 3
+  aliceAccount <- C.loadAccount f.custody aliceExit.balance
+  bobAccount <- queryContractId a.bob bobExit.balance
+  case bobAccount of Some value -> assert (value.available == 5.0); None -> abort "Missing Bob account"
+  holdings <- query @TestHolding a.issuer
+  lots <- query @PositionLot f.custody.vault
+  assert (aliceAccount.available == 5.0 && null lots)
+  assert (sum [h.amount | (_, h) <- holdings] == 10.0)
+
+testReserveBackingAndSupplyLimit : Script ()
+testReserveBackingAndSupplyLimit = script do
+  f <- setup Good 1
+  placed <- split f f.reserve f.balance 3
+  pool <- loadReserve f placed.reserve
+  let a = f.custody.asset
+  mismatched <- submit [a.operator, f.custody.vault] do createCmd (pool with completeSets = 2)
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd mismatched MarketReserve_Merge with owner = a.alice; balance = placed.balance; positions = [placed.position]; quantity = 1; extraArgs = C.registryContext
+  exhausted <- submit [a.operator, f.custody.vault] do createCmd (pool with completeSets = 9223372036854775807)
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd exhausted MarketReserve_Split with owner = a.alice; market = f.market; balance = placed.balance; quantity = 1; extraArgs = C.registryContext
+  -- Even with privileged malformed reserve fixtures, all genuine backing and
+  -- positions remain unchanged after each rejected operation.
+  assertConserved f placed.reserve placed.balance 2.0 3
+
+testReserveInitializationBoundaries : Script ()
+testReserveInitializationBoundaries = script do
+  f <- setup Good 1
+  let a = f.custody.asset
+  (protocol, draft) <- submit a.operator do
+    exerciseCmd f.protocol Protocol_CreateBinary with creator = a.operator; terms = termsFor a.issuer a.now
+  wrongAsset <- submit (actAs a.operator <> readAs a.issuer) do
+    exerciseCmd protocol Protocol_ApproveAsset with instrument = CollateralInstrument a.issuer "other"; factory = toInterfaceContractId @T.TransferFactory a.registry
+  submitMustFail a.operator do
+    exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.operator; protocol; market = draft; admission = wrongAsset
+  otherProtocol <- submit a.operator do
+    createCmd Protocol with operator = a.operator; protocolName = "other"; admins = [a.operator]; nextMarketId = 1
+  submitMustFail a.operator do
+    exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.operator; protocol = otherProtocol; market = draft; admission = a.admission
+  otherNamespace <- submit [a.operator, f.custody.vault] do
+    createCmd PositionRegistry with operator = a.operator; vault = f.custody.vault; protocolName = "other"; marketIds = []
+  submitMustFail a.operator do
+    exerciseCmd otherNamespace PositionRegistry_CreateReserve with creator = a.operator; protocol; market = draft; admission = a.admission
+  full <- submit [a.operator, f.custody.vault] do
+    createCmd PositionRegistry with operator = a.operator; vault = f.custody.vault; protocolName = "outcomia"; marketIds = [100..1123]
+  submitMustFail a.operator do
+    exerciseCmd full PositionRegistry_CreateReserve with creator = a.operator; protocol; market = draft; admission = a.admission
+  opened <- submit a.operator do exerciseCmd draft Binary_Open with protocol
+  closed <- submit a.operator do exerciseCmd opened Binary_Close with protocol; reason = "No reserve initialized"
+  submitMustFail a.operator do
+    exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.operator; protocol; market = closed; admission = a.admission
+  pool <- loadReserve f f.reserve
+  setTime pool.terms.closeAt
+  submitMustFail a.operator do
+    exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.operator; protocol; market = f.market; admission = a.admission

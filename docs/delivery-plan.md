@@ -24,9 +24,13 @@ Do not start a new feature branch before closing the current checkpoint.
 ## Current status
 
 The shared wallet gateway, binary lifecycle and [approved asset transfers](collateral-transfers.md)
-are locally tested. Collateral support is partial: custody-backed balances and
-complete-set positions are next. No public Canton deployment
+are locally tested. Collateral support includes dedicated-vault asset balances
+and [complete-set split/merge](complete-set-positions.md). Limit-order placement
+and settlement are next. No public Canton deployment
 or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
+
+The chosen [collateral custody model](collateral-custody.md) uses a dedicated
+vault party with explicit signer trust. Its public-network hosting is not configured.
 
 ## Checkpoint 1 boundary
 

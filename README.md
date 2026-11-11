@@ -21,8 +21,10 @@ See [the wallet boundary](docs/wallet-gateway.md) and
 Use small commits, a feature PR, and a merge before the next checkpoint. See
 [the plan](docs/delivery-plan.md). The shared wallet gateway,
 [binary lifecycle](docs/binary-market-lifecycle.md) and
-[Token Standard transfers](docs/collateral-transfers.md) are locally tested. Custody-backed balances, YES/NO positions,
-order matching and settlement remain. No Canton markets are deployed yet.
+[Token Standard transfers](docs/collateral-transfers.md) are locally tested. The
+[dedicated-vault balances](docs/collateral-custody.md) support deposits and withdrawals;
+[complete sets](docs/complete-set-positions.md) support YES/NO split and merge.
+Order matching, resolution and redemption remain. No Canton markets are deployed yet.
 
 ## Contracts
 

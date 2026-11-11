@@ -1,7 +1,9 @@
 # Binary market lifecycle
 
 This checkpoint added Daml contracts for draft creation, opening and administrative
-closure. Approved token transfers are now covered [separately](collateral-transfers.md). It does not add balances, orders, matching, resolution or payouts. The
+closure. [Transfers](collateral-transfers.md), [balances](collateral-custody.md)
+and [complete sets](complete-set-positions.md) are separate contract modules.
+Orders, matching, resolution and payouts remain unimplemented. The
 shared frontend must keep showing `Market deployment pending` until a deployment
 and wallet-to-ledger integration are verified.
 
@@ -72,7 +74,7 @@ The status does not change automatically when time passes. Future trade choices
 must check both `Open` and `now < closeAt`. Manual closure is terminal and may occur
 after the cutoff. Closing early stops trading but does not move the resolution
 schedule or decide a winner. Resolution, invalid-market handling and redemption
-need separate contracts and tests before taking collateral.
+need separate contracts and tests before public funding is enabled.
 
 ## Visibility and contention
 
@@ -91,7 +93,7 @@ its ID. Later trading must use stable market identity rather than a lifecycle ID
 ## Build and checks
 
 The packages pin DPM SDK 3.7.1 and target Daml-LF 2.1. Production code depends only
-on `daml-prim` and `daml-stdlib`. The separate test package imports the compiled
+on `daml-prim`, `daml-stdlib` and pinned Token Standard interface DARs. The separate test package imports the compiled
 production DAR and adds `daml-script`.
 
 ```bash
