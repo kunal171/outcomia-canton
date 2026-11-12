@@ -185,6 +185,11 @@ or empty it through an authorized withdrawal.
 6. Show the rate, reserve, maximum debit and refund in the shared UI only when
    deployment, registry compatibility and submission are verified.
 
+During this staged rollout, accept only zero-rate orders until the snapshot,
+full buy reserve, fee collection and cancellation paths are integrated together.
+Adding a configurable policy or snapshot field alone must not enable a nonzero-
+fee order backed only by the old trade-cost escrow. Keep public trading gated.
+
 Planned order state includes original/remaining quantity, snapshotted rate and
 precision, cumulative taker notional and paid fee. Reject inconsistent paid-fee
 or reserve values, negative quantities and arithmetic overflow. The original
