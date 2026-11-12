@@ -28,8 +28,8 @@ are locally tested. Collateral support includes dedicated-vault asset balances
 and [complete-set split/merge](complete-set-positions.md). [Resting orders](binary-limit-orders.md)
 add funded placement and cancellation. The [matching planner](binary-matching.md) defines selection, partial fills,
 maker-price execution and cancel-newer self-trade behavior. [Atomic settlement](binary-settlement.md) now applies one fill or self-trade
-cancellation, with signed-order delegation and actual token transfers. Fees,
-resolution and redemption remain. No public Canton deployment
+cancellation, with signed-order delegation and actual token transfers. The [fee rules](fee-accounting.md) are documented; fee contracts, resolution
+and redemption remain. No public Canton deployment
 or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
 
 The chosen [collateral custody model](collateral-custody.md) uses a dedicated
@@ -51,3 +51,11 @@ orders and backing atomically. The operator triggers one fill per command.
 See the [order design](binary-limit-orders.md).
 Keep wallet identity independent of these contracts so account changes cannot
 reuse a previous party's commands.
+
+## Clubs/private-market status
+
+[Clubs and private markets](clubs-private-markets.md) are planned, not implemented.
+The current contracts have no club membership or invitation gate. Existing
+matching and account-registry disclosure must be redesigned before promising
+private club activity. Member removal must preserve safe exits. The roadmap
+sequence remains fees, resolution/redemption, multi-outcome, clubs, then governance.
