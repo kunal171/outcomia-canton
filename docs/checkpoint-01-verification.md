@@ -47,3 +47,12 @@ The Canton workspace reports `Market deployment pending`. Market creation,
 collateral, orders, matching, resolution and redemption are subsequent feature
 PRs. The removed duplicate app remains available in Git history; the shared app
 is the single frontend source.
+
+## Loop follow-up: 12 November 2026
+
+The shared app now supports Loop alongside Console (Outcomia PR 43). Its deployed
+wallet picker and live devnet health request passed a public browser check. The
+user confirmed connection to a real Loop devnet wallet and access to the Canton
+pages. Funded balances and wallet-to-ledger market commands remain unverified;
+the funding request is pending. This does not replace the Console extension
+smoke check described above. No wallet secrets are kept in this repository.
