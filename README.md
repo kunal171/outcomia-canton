@@ -27,8 +27,8 @@ Use small commits, a feature PR, and a merge before the next checkpoint. See
 [Resting limit orders](docs/binary-limit-orders.md) lock buys/sells and support
 owner cancellation. The [matching planner](docs/binary-matching.md) selects
 price/FIFO pairs and computes partial fills and refunds. The [atomic settlement path](docs/binary-settlement.md) now applies one fill or
-cancel-newer self-trade action. The [fee rules](docs/fee-accounting.md) are documented; implementation, resolution
-and redemption remain. [Clubs/private markets](docs/clubs-private-markets.md)
+cancel-newer self-trade action. The [fee rules and pure arithmetic](docs/fee-accounting.md) are locally checked;
+policy/escrow integration, resolution and redemption remain. [Clubs/private markets](docs/clubs-private-markets.md)
 are planned and have no implementation yet.
 No Canton markets are deployed yet.
 

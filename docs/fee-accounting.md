@@ -1,8 +1,9 @@
 # Trading-fee rules
 
-Design for `feature/binary-fees`. These rules are not implemented yet: current
-contracts still charge zero. Complete the pure arithmetic checks before changing
-escrow or settlement. No public Canton trading is enabled by this document.
+The [pure arithmetic helpers](../contracts/main/daml/Outcomia/Fees.daml) are
+implemented and locally tested. Policy contracts, signed order snapshots and
+actual fee collection are not integrated: current settlement still charges zero.
+No public Canton trading is enabled by this work.
 
 ## Who pays
 
@@ -176,7 +177,7 @@ or empty it through an authorized withdrawal.
 
 ## Implementation sequence
 
-1. Add precision-aware, cumulative fee helpers and exact arithmetic tests.
+1. **Done:** precision-aware cumulative fee helpers and exact arithmetic tests.
 2. Add the pinned operator fee policy and immutable per-order snapshots.
 3. Fund buy reserves; extend cancellation and partial-order state.
 4. Collect one taker fee into a market pool within atomic settlement.
@@ -190,7 +191,7 @@ or reserve values, negative quantities and arithmetic overflow. The original
 quantity bounds accumulated notional, including when maker and taker fills mix.
 
 Do not first divide in `Decimal` and then round: `Decimal` has only ten fractional
-digits and could lose the fraction being accounted for. The planned calculation
+digits and could lose the fraction being accounted for. The implemented helper
 widens the bounded order notional to `Numeric 14` before multiplying by basis
 points and dividing by 10,000. Four extra fractional digits make that ratio exact.
 Round to asset precision by separating whole and fractional units; do not scale
@@ -203,3 +204,29 @@ maker/taker fills, asset precisions 0–10 and rates 0/1/25/1,000 bps. It checks
 nonnegative reserve release, cash conservation, bounded seller deductions and
 maximum-Int intermediate bounds. This checks the design equations; it is not a
 Daml implementation, registry test or public-deployment result.
+
+## Implemented arithmetic boundary
+
+`FeeTerms` is a pure input record, not proof of a configured rate or registry
+precision. `BuyFeeState` is a pure snapshot, not a signed resting order. Future
+placement and settlement choices must bind these values to actual contracts.
+Settlement must derive maker/taker role from verified acceptance IDs and bind
+gross amounts to the actual fill. A caller-supplied role flag is not authority.
+The existing order/settlement path does not call the fee helpers yet.
+
+The module validates rate/precision bounds, original and remaining quantities,
+transferable cash, cumulative paid-fee consistency and bounded taker history.
+Its outputs cover remaining buy funding, per-fill fee/refund breakdown, and sell
+net proceeds. It rejects invalid maker-buy prices and handles a zero-net seller
+fill without issuing any transfer. Only validated public functions are exported.
+
+Fourteen Daml fee scripts pass alongside all existing contract scripts: 110 Daml
+scripts and four Python dependency checks in total. The helper matches 308
+checked-in expected fees generated from the independent exact-Fraction reference.
+The Daml conservation grid covers 792 precision/rate/price/quantity/role cases.
+This is arithmetic validation, not evidence of fee-backed escrow or withdrawals.
+
+Regenerate expected vectors with `python3 scripts/generate-fee-vectors.py`;
+`python3 scripts/generate-fee-vectors.py --check` verifies the tracked fixture.
+Run `make DPM="$PWD/target/tools/dpm" test` for the Daml checks. Contract integration
+must still test policy changes, real backing, fee-pool conservation and rollback.
