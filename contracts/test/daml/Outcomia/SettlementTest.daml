@@ -1,0 +1,470 @@
+-- | Atomic settlement tests use actual Token Standard harness holdings. The
+-- matcher acts only as operator; readAs supplies visibility, never owner signing
+-- authority. Assertions reconcile live contracts, not just returned numbers.
+module Outcomia.SettlementTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import DA.List (unique)
+import DA.Time (addRelTime, seconds)
+import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.Binary
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Matching qualified as M
+import Outcomia.Orders
+import Outcomia.OrdersTest qualified as O
+import Outcomia.Positions
+import Outcomia.PositionsTest qualified as P
+import Outcomia.TokenHarness
+import Outcomia.Types
+
+data Fixture = Fixture with
+    orders : O.Fixture
+    buyerBalance : ContractId AssetBalance
+    sellerBalance : ContractId AssetBalance
+    reserve : ContractId MarketReserve
+    position : ContractId PositionLot
+  deriving (Eq, Show)
+
+data Crossed = Crossed with
+    book : ContractId OrderBook
+    buy : ContractId LimitOrder
+    sell : ContractId LimitOrder
+    buyerBalance : ContractId AssetBalance
+    sellerBalance : ContractId AssetBalance
+  deriving (Eq, Show)
+
+setup : FactoryMode -> Script Fixture
+setup mode = script do
+  orders <- O.setup mode 1
+  let c = orders.positions.custody
+  let a = c.asset
+  (_, bobAccount) <- submit (actAs a.bob <> readAs a.operator) do
+    exerciseCmd c.authority VaultAuthority_OpenBalance with owner = a.bob; admission = a.admission
+  input <- submit a.issuer do
+    createCmd TestHolding with
+      issuer = a.issuer; account = H.Account (Some a.bob) None ""
+      instrument = H.InstrumentId a.issuer "test-USD"; amount = 5.0; locked = None
+  funded <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd bobAccount AssetBalance_Deposit with
+      admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0; extraArgs = C.registryContext
+  split <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd orders.positions.reserve MarketReserve_Split with
+      owner = a.bob; market = orders.positions.market; balance = funded.balance; quantity = 3; extraArgs = C.registryContext
+  pure Fixture with orders; buyerBalance = orders.positions.balance
+                    sellerBalance = split.balance; reserve = split.reserve; position = split.position
+
+placeSell : Fixture -> ContractId OrderBook -> [ContractId PositionLot] -> Outcome -> Decimal -> Int -> Script PlacementResult
+placeSell f book positions outcome price quantity = do
+  let a = f.orders.positions.custody.asset
+  submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd book OrderBook_PlaceSell with owner = a.bob; market = f.orders.positions.market; positions; outcome; price; quantity
+
+cross : Fixture -> Bool -> Outcome -> Decimal -> Int -> Decimal -> Int -> Script Crossed
+cross f sellFirst outcome buyPrice buyQty sellPrice sellQty = do
+  if sellFirst then do
+    ask <- placeSell f f.orders.book [f.position] outcome sellPrice sellQty
+    bid <- O.buy f.orders ask.book f.buyerBalance outcome buyPrice buyQty
+    buyerBalance <- O.requireBalance bid
+    pure Crossed with book = bid.book; buy = bid.order; sell = ask.order; buyerBalance; sellerBalance = f.sellerBalance
+  else do
+    bid <- O.buy f.orders f.orders.book f.buyerBalance outcome buyPrice buyQty
+    ask <- placeSell f bid.book [f.position] outcome sellPrice sellQty
+    buyerBalance <- O.requireBalance bid
+    pure Crossed with book = ask.book; buy = bid.order; sell = ask.order; buyerBalance; sellerBalance = f.sellerBalance
+
+match : Fixture -> Crossed -> Outcome -> Script SettlementResult
+match f placed outcome = do
+  let c = f.orders.positions.custody
+  submit (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd placed.book OrderBook_MatchBest with
+      market = f.orders.positions.market; outcome; buyerBalance = placed.buyerBalance
+      sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+
+loadBalance : Fixture -> ContractId AssetBalance -> Script AssetBalance
+loadBalance f cid = do
+  found <- queryContractId f.orders.positions.custody.vault cid
+  case found of Some value -> pure value; None -> abort "Expected live balance"
+
+resultAccounts : SettlementResult -> Script (ContractId AssetBalance, ContractId AssetBalance)
+resultAccounts result = case result.balances of [buyer, seller] -> pure (buyer, seller); _ -> abort "Expected two revised accounts"
+
+-- Every genuine fixture has 10 collateral: 5 funded by each trader. Cash
+-- holdings are disjoint across free balances, the reserve and buy escrows.
+assertConserved : Fixture -> ContractId OrderBook -> Script ()
+assertConserved f book = do
+  let c = f.orders.positions.custody
+  holdings <- query @TestHolding c.asset.issuer
+  accounts <- query @AssetBalance c.vault
+  lots <- query @PositionLot c.vault
+  orders <- query @LimitOrder c.vault
+  pool <- P.loadReserve f.orders.positions f.reserve
+  index <- O.loadBook f.orders book
+  let amountAt cid = sum [h.amount | (holdingCid, h) <- holdings, Some (toInterfaceContractId @H.Holding holdingCid) == cid]
+  let cashOrders = [(value, cid) | (_, value) <- orders, CashEscrow cid <- [value.backing]]
+  let backing = [cid | (_, value) <- accounts, Some cid <- [value.cash]] ++
+                optionalHoldings pool.cash ++ [cid | (_, cid) <- cashOrders]
+  assert (unique backing)
+  assert (sum [h.amount | (_, h) <- holdings] == 10.0)
+  assert (all (\(_, value) -> amountAt value.cash == value.available) accounts)
+  assert (all (\(value, cid) -> amountAt (Some cid) == value.price * intToDecimal value.quantity) cashOrders)
+  assert (amountAt pool.cash == intToDecimal pool.completeSets)
+  assert (sum [value.available | (_, value) <- accounts] + intToDecimal pool.completeSets + sum [amountAt (Some cid) | (_, cid) <- cashOrders] == 10.0)
+  assert (length index.orders == length orders)
+  assert (all (\ref -> any (\(cid, value) -> ref.order == cid && ref.orderId == value.orderId && ref.price == value.price && ref.outcome == value.outcome && ref.side == value.side) orders) index.orders)
+  let escrow outcome = sum [value.quantity | (_, value) <- orders, value.side == Sell && value.outcome == outcome]
+  assert (sum [value.yes | (_, value) <- lots] + escrow Yes == pool.completeSets)
+  assert (sum [value.no | (_, value) <- lots] + escrow No == pool.completeSets)
+
+assertUnchanged : Fixture -> Crossed -> Script ()
+assertUnchanged f placed = do
+  _ <- O.loadBook f.orders placed.book
+  _ <- O.loadOrder f.orders placed.buy
+  _ <- O.loadOrder f.orders placed.sell
+  _ <- loadBalance f placed.buyerBalance
+  _ <- loadBalance f placed.sellerBalance
+  receipts <- query @TradeFill f.orders.positions.custody.vault
+  assert (null receipts)
+  assertConserved f placed.book
+
+testSellerMakerRefundAndPartialBuy : Script ()
+testSellerMakerRefundAndPartialBuy = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.60 5 0.40 3
+  before <- O.loadOrder f.orders placed.buy
+  result <- match f placed Yes
+  (buyer, seller) <- resultAccounts result
+  b <- loadBalance f buyer
+  s <- loadBalance f seller
+  assert (b.available == 2.60 && s.available == 3.20)
+  index <- O.loadBook f.orders result.book
+  assert (index.nextOrderId == 3 && length index.orders == 1)
+  ref <- case index.orders of [value] -> pure value; _ -> abort "Expected partial buy"
+  remaining <- O.loadOrder f.orders ref.order
+  assert (remaining.orderId == before.orderId && remaining.acceptedAt == before.acceptedAt && remaining.price == before.price && remaining.quantity == 2)
+  position <- O.requirePosition result.position
+  lot <- P.loadLot f.orders.positions position
+  assert (lot.owner == b.owner && lot.yes == 3 && lot.no == 0)
+  receipt <- case result.receipt of Some cid -> pure cid; None -> abort "Expected fill receipt"
+  record <- queryContractId b.owner receipt
+  case record of Some value -> assert (value.plan.price == 0.40 && value.plan.quantity == 3 && value.plan.buyerRefund == 0.60); None -> abort "Buyer cannot see receipt"
+  forA_ [placed.buy, placed.sell] (\cid -> do old <- queryContractId f.orders.positions.custody.vault cid; assert (old == None))
+  oldBook <- queryContractId f.orders.positions.custody.vault placed.book
+  assert (oldBook == None)
+  assertConserved f result.book
+  -- Partial order cancellation releases precisely its remaining limit escrow.
+  cancelled <- O.cancel f.orders result.book ref.order (Some buyer)
+  restored <- O.requireReleasedBalance cancelled
+  final <- loadBalance f restored
+  assert (final.available == 3.80)
+  assertConserved f cancelled.book
+
+testBuyerMakerNoRefundAndPartialSell : Script ()
+testBuyerMakerNoRefundAndPartialSell = script do
+  f <- setup Good
+  placed <- cross f False No 0.60 1 0.40 3
+  before <- O.loadOrder f.orders placed.sell
+  result <- match f placed No
+  (buyer, seller) <- resultAccounts result
+  assert (buyer == placed.buyerBalance)
+  b <- loadBalance f buyer
+  s <- loadBalance f seller
+  assert (b.available == 4.40 && s.available == 2.60)
+  index <- O.loadBook f.orders result.book
+  ref <- case index.orders of [value] -> pure value; _ -> abort "Expected partial sell"
+  remaining <- O.loadOrder f.orders ref.order
+  assert (remaining.orderId == before.orderId && remaining.acceptedAt == before.acceptedAt && remaining.quantity == 2)
+  case result.decision of M.Fill plan -> assert (plan.price == 0.60 && plan.buyerRefund == 0.0); _ -> abort "Expected fill"
+  assertConserved f result.book
+  let a = f.orders.positions.custody.asset
+  cancelled <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd result.book OrderBook_Cancel with owner = a.bob; order = ref.order; balance = None; extraArgs = C.registryContext
+  assertConserved f cancelled.book
+
+testEqualPriceFullFillAndReplay : Script ()
+testEqualPriceFullFillAndReplay = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.50 3 0.50 3
+  result <- match f placed Yes
+  index <- O.loadBook f.orders result.book
+  assert (null index.orders && index.nextOrderId == 3)
+  (buyer, seller) <- resultAccounts result
+  b <- loadBalance f buyer
+  s <- loadBalance f seller
+  assert (b.available == 3.50 && s.available == 3.50)
+  let c = f.orders.positions.custody
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+  assertConserved f result.book
+
+testWrongAccountsLeaveBackingLive : Script ()
+testWrongAccountsLeaveBackingLive = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.60 5 0.40 3
+  let c = f.orders.positions.custody
+  forA_ [(placed.sellerBalance, placed.sellerBalance), (placed.buyerBalance, placed.buyerBalance),
+         (f.buyerBalance, placed.sellerBalance)] (\(buyerBalance, sellerBalance) ->
+    submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance; sellerBalance; extraArgs = C.registryContext)
+  assertUnchanged f placed
+
+testNoCrossLeavesBackingLive : Script ()
+testNoCrossLeavesBackingLive = script do
+  g <- setup Good
+  unCrossed <- cross g True No 0.30 2 0.40 3
+  let d = g.orders.positions.custody
+  submitMustFail (actAs d.asset.operator <> readAs [d.vault, d.asset.issuer]) do
+    exerciseCmd unCrossed.book OrderBook_MatchBest with market = g.orders.positions.market; outcome = No; buyerBalance = unCrossed.buyerBalance; sellerBalance = unCrossed.sellerBalance; extraArgs = C.registryContext
+  assertUnchanged g unCrossed
+
+testInternalAndBookAuthorization : Script ()
+testInternalAndBookAuthorization = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.60 5 0.40 3
+  let c = f.orders.positions.custody
+  let a = c.asset
+  forA_ [a.alice, a.bob, c.vault] (\caller ->
+    submitMustFail (actAs caller <> readAs [a.operator, a.alice, a.bob, c.vault, a.issuer]) do
+      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext)
+  forA_ [a.operator, c.vault, a.alice, a.bob] (\caller -> do
+    submitMustFail (actAs caller <> readAs [a.operator, a.alice, a.bob, c.vault, a.issuer]) do
+      exerciseCmd placed.buy LimitOrder_SettleBuy with book = placed.book; market = f.orders.positions.market; sellOrder = placed.sell; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+    submitMustFail (actAs caller <> readAs [a.operator, a.alice, a.bob, c.vault, a.issuer]) do
+      exerciseCmd placed.sell LimitOrder_SettleSell with buyer = a.alice; buyOrder = placed.buy; book = placed.book; market = f.orders.positions.market; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext)
+  assertUnchanged f placed
+  -- The valid match acts only as operator, proving neither owner must re-sign.
+  result <- match f placed Yes
+  assertConserved f result.book
+
+testRegistryRollbackAtBothCreditStages : Script ()
+testRegistryRollbackAtBothCreditStages = script do
+  forA_ [ShortSettlementCredit, ShortSettlementRefund] (\mode -> do
+    f <- setup mode
+    placed <- cross f True Yes 0.60 5 0.40 3
+    let c = f.orders.positions.custody
+    before <- query @TestHolding c.asset.issuer
+    submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+    after <- query @TestHolding c.asset.issuer
+    assert (length before == length after && all (\value -> value `elem` before) after)
+    assertUnchanged f placed)
+
+testCutoffPreservesOwnerCancellation : Script ()
+testCutoffPreservesOwnerCancellation = runClosedMatch False
+
+testClosurePreservesOwnerCancellation : Script ()
+testClosurePreservesOwnerCancellation = runClosedMatch True
+
+runClosedMatch : Bool -> Script ()
+runClosedMatch close = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.60 5 0.40 3
+  let p = f.orders.positions
+  let c = p.custody
+  market <- if close then submit c.asset.operator do
+    exerciseCmd p.market Binary_Close with protocol = p.protocol; reason = "Settlement closure test"
+    else do
+      index <- O.loadBook f.orders placed.book
+      setTime index.terms.closeAt
+      pure p.market
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd placed.book OrderBook_MatchBest with market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+  assertUnchanged f placed
+  cancelled <- O.cancel f.orders placed.book placed.buy (Some placed.buyerBalance)
+  restored <- O.requireReleasedBalance cancelled
+  value <- loadBalance f restored
+  assert (value.available == 5.0)
+  assertConserved f cancelled.book
+
+testSelfTradeCancelsNewerBuy : Script ()
+testSelfTradeCancelsNewerBuy = runSelfTrade True
+
+testSelfTradeCancelsNewerSell : Script ()
+testSelfTradeCancelsNewerSell = runSelfTrade False
+
+runSelfTrade : Bool -> Script ()
+runSelfTrade sellFirst = script do
+  f <- setup Good
+  let a = f.orders.positions.custody.asset
+  let own = f.orders
+  -- Alice splits one complete set to fund her own sell. Bob's three sets
+  -- remain in the same reserve; this genuine setup now has four complete sets.
+  split <- P.split f.orders.positions f.reserve f.buyerBalance 1
+  let g = f with reserve = split.reserve
+  (book, buyId, sellId, balance) <- if sellFirst then do
+    ask <- O.sell own f.orders.book [split.position] Yes 0.40 1
+    bid <- O.buy own ask.book split.balance Yes 0.60 1
+    balance <- O.requireBalance bid
+    pure (bid.book, bid.order, ask.order, balance)
+    else do
+      bid <- O.buy own f.orders.book split.balance Yes 0.60 1
+      ask <- O.sell own bid.book [split.position] Yes 0.40 1
+      balance <- O.requireBalance bid
+      pure (ask.book, bid.order, ask.order, balance)
+  let c = f.orders.positions.custody
+  result <- submit (actAs a.operator <> readAs [c.vault, a.issuer]) do
+    exerciseCmd book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = balance; sellerBalance = balance; extraArgs = C.registryContext
+  assert (result.decision == M.CancelSelfTrade 2 && result.receipt == None)
+  index <- O.loadBook f.orders result.book
+  assert (length index.orders == 1 && index.nextOrderId == 3)
+  old <- queryContractId c.vault (if sellFirst then buyId else sellId)
+  kept <- queryContractId c.vault (if sellFirst then sellId else buyId)
+  assert (old == None && kept /= None)
+  assertConserved g result.book
+
+testFifoPartialContinuationAndNonBestRejection : Script ()
+testFifoPartialContinuationAndNonBestRejection = script do
+  f <- setup Good
+  first <- placeSell f f.orders.book [f.position] Yes 0.40 1
+  remaining <- O.requirePosition first.remainder
+  second <- placeSell f first.book [remaining] Yes 0.40 1
+  bid <- O.buy f.orders second.book f.buyerBalance Yes 0.60 2
+  balance <- O.requireBalance bid
+  let placed = Crossed bid.book bid.order first.order balance f.sellerBalance
+  let c = f.orders.positions.custody
+  -- Full visibility and BOTH internal controllers are supplied deliberately:
+  -- this must fail for priority, not because a party cannot read the contract.
+  submitMustFail (actAs [c.asset.operator, c.vault] <> readAs c.asset.issuer) do
+    exerciseCmd bid.order LimitOrder_SettleBuy with book = bid.book; market = f.orders.positions.market; sellOrder = second.order; buyerBalance = balance; sellerBalance = f.sellerBalance; extraArgs = C.registryContext
+  result <- match f placed Yes
+  case result.decision of M.Fill plan -> assert (plan.sellId == 1); _ -> abort "Expected first FIFO sell"
+  index <- O.loadBook f.orders result.book
+  nextBuy <- case bestOrderReference index.orders Yes Buy of Some ref -> pure ref; None -> abort "Missing partial buy"
+  (buyerBalance, sellerBalance) <- resultAccounts result
+  old <- queryContractId c.vault bid.order
+  assert (old == None)
+  assertConserved f result.book
+  partial <- O.loadOrder f.orders nextBuy.order
+  original <- O.loadOrder f.orders second.order
+  assert (partial.orderId == 3 && partial.quantity == 1 && original.orderId == 2)
+  setTime (addRelTime partial.acceptedAt (seconds 1))
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd result.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = balance; sellerBalance; extraArgs = C.registryContext
+  assertConserved f result.book
+  last <- match f (Crossed result.book nextBuy.order second.order buyerBalance sellerBalance) Yes
+  case last.decision of M.Fill plan -> assert (plan.sellId == 2 && plan.buyId == 3); _ -> abort "Expected second FIFO sell"
+  final <- O.loadBook f.orders last.book
+  assert (null final.orders && final.nextOrderId == 4)
+  assertConserved f last.book
+
+testFullBuyRefund : Script ()
+testFullBuyRefund = runBuyerRefund 1
+
+testEmptyBuyerBalanceReceivesRefund : Script ()
+testEmptyBuyerBalanceReceivesRefund = runBuyerRefund 10
+
+runBuyerRefund : Int -> Script ()
+runBuyerRefund buyQty = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.50 buyQty 0.40 3
+  result <- match f placed Yes
+  (buyer, _) <- resultAccounts result
+  value <- loadBalance f buyer
+  assert (value.available == (if buyQty == 1 then 4.60 else 0.30))
+  assert (value.cash /= None)
+  assertConserved f result.book
+
+testEmptySellerBalanceReceivesProceeds : Script ()
+testEmptySellerBalanceReceivesProceeds = script do
+  f <- setup Good
+  let a = f.orders.positions.custody.asset
+  zero <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.bob; market = f.orders.positions.market; balance = f.sellerBalance; quantity = 2; extraArgs = C.registryContext
+  let g = f with sellerBalance = zero.balance; reserve = zero.reserve
+  placed <- cross g True Yes 0.60 1 0.40 3
+  result <- match g placed Yes
+  (_, seller) <- resultAccounts result
+  value <- loadBalance g seller
+  assert (value.available == 0.40 && value.cash /= None)
+  assertConserved g result.book
+
+testRevocationAndCounterExhaustionDoNotFreezeRestingFill : Script ()
+testRevocationAndCounterExhaustionDoNotFreezeRestingFill = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.60 5 0.40 3
+  let c = f.orders.positions.custody
+  submit c.asset.operator do archiveCmd c.asset.admission
+  index <- O.loadBook f.orders placed.book
+  submit [c.asset.operator, c.vault] do archiveCmd placed.book
+  exhausted <- submit [c.asset.operator, c.vault] do
+    createCmd (index with nextOrderId = 9223372036854775807)
+  result <- match f (placed with book = exhausted) Yes
+  next <- O.loadBook f.orders result.book
+  assert (next.nextOrderId == 9223372036854775807)
+  assertConserved f result.book
+
+testFullBookCanStillMatch : Script ()
+testFullBookCanStillMatch = script do
+  f <- setup Good
+  ask <- placeSell f f.orders.book [f.position] Yes 0.40 1
+  (book, balance) <- placeSmallBuys f ask.book f.buyerBalance 126
+  bid <- O.buy f.orders book balance Yes 0.60 1
+  next <- O.requireBalance bid
+  full <- O.loadBook f.orders bid.book
+  assert (length full.orders == 128)
+  result <- match f (Crossed bid.book bid.order ask.order next f.sellerBalance) Yes
+  reduced <- O.loadBook f.orders result.book
+  assert (length reduced.orders == 126 && reduced.nextOrderId == 129)
+  assertConserved f result.book
+
+-- Bounded test setup: each iteration genuinely consumes and recreates the
+-- account and book. No fabricated references stand in for funded capacity.
+placeSmallBuys : Fixture -> ContractId OrderBook -> ContractId AssetBalance -> Int -> Script (ContractId OrderBook, ContractId AssetBalance)
+placeSmallBuys f book balance count = if count == 0 then pure (book, balance) else do
+  placed <- O.buy f.orders book balance No 0.01 1
+  next <- O.requireBalance placed
+  placeSmallBuys f placed.book next (count - 1)
+
+testEmptyWrongOutcomeAndForeignMarket : Script ()
+testEmptyWrongOutcomeAndForeignMarket = script do
+  f <- setup Good
+  let p = f.orders.positions
+  let c = p.custody
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd f.orders.book OrderBook_MatchBest with market = p.market; outcome = Yes; buyerBalance = f.buyerBalance; sellerBalance = f.sellerBalance; extraArgs = C.registryContext
+  placed <- cross f True Yes 0.60 5 0.40 3
+  current <- queryContractId c.asset.operator p.market
+  terms <- case current of Some value -> pure value.terms; None -> abort "Missing market"
+  (_, otherMarket) <- submit c.asset.operator do exerciseCmd p.protocol Protocol_CreateBinary with creator = c.asset.operator; terms
+  forA_ [(p.market, No), (otherMarket, Yes)] (\(market, outcome) ->
+    submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+      exerciseCmd placed.book OrderBook_MatchBest with market; outcome; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext)
+  assertUnchanged f placed
+
+testFalseBuyerAndForcedSelfCancelRejected : Script ()
+testFalseBuyerAndForcedSelfCancelRejected = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.60 5 0.40 3
+  let c = f.orders.positions.custody
+  -- Even a supplied actor cannot impersonate the owner of the fetched buy.
+  submitMustFail (actAs [c.asset.operator, c.vault, c.asset.bob] <> readAs c.asset.issuer) do
+    exerciseCmd placed.sell LimitOrder_SettleSell with buyer = c.asset.bob; buyOrder = placed.buy; book = placed.book; market = f.orders.positions.market; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+  submitMustFail (actAs [c.asset.operator, c.vault] <> readAs c.asset.issuer) do
+    exerciseCmd placed.buy LimitOrder_CancelSelfTrade with book = placed.book; market = f.orders.positions.market; outcome = Yes; balance = placed.buyerBalance; extraArgs = C.registryContext
+  assertUnchanged f placed
+
+testAlteredReferenceAndIncorrectEscrowRejected : Script ()
+testAlteredReferenceAndIncorrectEscrowRejected = script do
+  f <- setup Good
+  placed <- cross f True Yes 0.60 5 0.40 3
+  let c = f.orders.positions.custody
+  index <- O.loadBook f.orders placed.book
+  -- Deliberately privileged malformed fixtures test payload verification. They
+  -- are cleaned up so the genuine supply can still be reconciled afterwards.
+  wrongReference <- submit [c.asset.operator, c.vault] do
+    createCmd (index with orders = map (\r -> if r.order == placed.buy then r with price = 0.70 else r) index.orders)
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd wrongReference OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+  submit [c.asset.operator, c.vault] do archiveCmd wrongReference
+  buy <- O.loadOrder f.orders placed.buy
+  seller <- loadBalance f placed.sellerBalance
+  cash <- case seller.cash of Some cid -> pure cid; None -> abort "Expected seller cash"
+  badBuy <- submit [c.asset.alice, c.vault] do createCmd (buy with backing = CashEscrow cash)
+  wrongEscrow <- submit [c.asset.operator, c.vault] do
+    createCmd (index with orders = map (\r -> if r.order == placed.buy then r with order = badBuy else r) index.orders)
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd wrongEscrow OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+  submit [c.asset.alice, c.vault] do archiveCmd badBuy
+  submit [c.asset.operator, c.vault] do archiveCmd wrongEscrow
+  assertUnchanged f placed

@@ -7,7 +7,7 @@ import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Splice.Api.Token.MetadataV1
 
-data FactoryMode = Good | Pending | Failed | ShortPayment | WrongChange | WrongAsset | WrongReceiver | LockedOutput | DuplicateOutput | NoOutputs | FragmentedSelf | ShortPartition
+data FactoryMode = Good | Pending | Failed | ShortPayment | WrongChange | WrongAsset | WrongReceiver | LockedOutput | DuplicateOutput | NoOutputs | FragmentedSelf | ShortPartition | ShortSettlementCredit | ShortSettlementRefund
   deriving (Eq, Show)
 
 template TestHolding
@@ -64,7 +64,13 @@ registryTransfer issuer mode factory args = do
     Failed -> pure (T.TransferInstructionResult T.TransferInstructionResult_Failed [] emptyMetadata)
     _ -> do
       let fragmented = mode == FragmentedSelf && sender == receiver
-      let shortPartition = mode == ShortPartition && sender == receiver && transfer.amount `elem` [2.0, 4.0]
+      -- These two faults allow deposit/split/placement to succeed, then fail
+      -- the seller credit or the later buyer refund in the same match. The
+      -- latter proves rollback after the first transfer already consumed cash.
+      let shortPartition = sender == receiver &&
+            ((mode == ShortPartition && transfer.amount `elem` [2.0, 4.0]) ||
+             (mode == ShortSettlementCredit && transfer.amount == 3.2) ||
+             (mode == ShortSettlementRefund && transfer.amount == 2.6))
       let amount = if mode == ShortPayment || fragmented || shortPartition then transfer.amount / 2.0 else transfer.amount
       let account = if mode == WrongReceiver then H.Account (Some issuer) None "" else transfer.receiver
       let instrument = if mode == WrongAsset then H.InstrumentId issuer "other" else transfer.instrumentId
