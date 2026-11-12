@@ -180,7 +180,8 @@ or empty it through an authorized withdrawal.
 
 1. **Done:** precision-aware cumulative fee helpers and exact arithmetic tests.
 2. **Done:** operator policy, vetted book precision and immutable order snapshots.
-3. Fund buy reserves; extend cancellation and partial-order state.
+3. **Prepared, zero rates only:** signed fee history and helper-based buy funding,
+   refunds and cancellation. Nonzero activation waits for steps 4 and 5.
 4. Collect one taker fee into a market pool within atomic settlement.
 5. Add authorized fee withdrawal and conservation/rollback tests.
 6. Show the rate, reserve, maximum debit and refund in the shared UI only when
@@ -191,7 +192,7 @@ full buy reserve, fee collection and cancellation paths are integrated together.
 Adding a configurable policy or snapshot field alone must not enable a nonzero-
 fee order backed only by the old trade-cost escrow. Keep public trading gated.
 
-Planned order state includes original/remaining quantity, snapshotted rate and
+Signed order state now includes original/remaining quantity, snapshotted rate and
 precision, cumulative taker notional and paid fee. Reject inconsistent paid-fee
 or reserve values, negative quantities and arithmetic overflow. The original
 quantity bounds accumulated notional, including when maker and taker fills mix.
@@ -215,11 +216,12 @@ Daml implementation, registry test or public-deployment result.
 
 `FeeTerms` is a pure input record, not proof of a configured rate or registry
 precision. Placement now binds it to the live protocol and pinned book precision.
-`BuyFeeState` is still a pure snapshot, not persisted execution history. Settlement
-must bind its future accumulator to signed orders and actual backing.
+`BuyFeeState` is reconstructed from the signed order's original/remaining quantity,
+limit and cumulative history. Settlement binds it to actual backing.
 Settlement must derive maker/taker role from verified acceptance IDs and bind
 gross amounts to the actual fill. A caller-supplied role flag is not authority.
-The existing settlement path does not call the fee arithmetic helpers yet.
+Settlement now uses `buyFunding`, `buyFillFunding` and `sellFillFunding`, but
+explicitly rejects a nonzero fee movement until atomic collection is implemented.
 
 The module validates rate/precision bounds, original and remaining quantities,
 transferable cash, cumulative paid-fee consistency and bounded taker history.
@@ -227,11 +229,13 @@ Its outputs cover remaining buy funding, per-fill fee/refund breakdown, and sell
 net proceeds. It rejects invalid maker-buy prices and handles a zero-net seller
 fill without issuing any transfer. Only validated public functions are exported.
 
-Fourteen arithmetic scripts and twelve policy/quote scripts pass alongside all
-existing contract scripts: 122 Daml scripts and four Python dependency checks. The helper matches 308
+Fourteen arithmetic scripts, twelve policy scripts and six funding/history scripts
+pass alongside existing contracts: 128 Daml scripts and four Python dependency
+checks. The helper matches 308
 checked-in expected fees generated from the independent exact-Fraction reference.
 The Daml conservation grid covers 792 precision/rate/price/quantity/role cases.
-This is arithmetic validation, not evidence of fee-backed escrow or withdrawals.
+Nonzero rates are tested in pure arithmetic only; this is not evidence of
+nonzero-fee ledger settlement or fee withdrawals.
 
 Regenerate expected vectors with `python3 scripts/generate-fee-vectors.py`;
 `python3 scripts/generate-fee-vectors.py --check` verifies the tracked fixture.
@@ -274,6 +278,34 @@ registry compatibility and exact output checks still govern those paths.
 
 Both placement and the `LimitOrder` template enforce zero fees for now. Raising
 the configured rate is a configuration test, not activation of fee trading.
-No additional fee reserve, fee pool or fee withdrawal exists in this milestone.
+Funding paths use the full helper result, whose fee reserve is zero under the
+current gate. No fee pool or fee withdrawal exists yet.
 The production contract schema changed locally; no public upgrade or migration
 has been performed.
+
+## Signed funding and execution history
+
+`LimitOrder` stores `originalQuantity`, `takerNotional` and `paidFee` in addition
+to its remaining quantity and fee terms. Placement initializes history to zero.
+Partial successors preserve original quantity and acceptance ID. Only a verified
+taker fill increases that order's notional; becoming maker later does not reset
+or increase its previous taker total. Self-trade cancellation accrues nothing.
+
+Buy placement and cancellation use `buyFunding.totalEscrow`. Settlement uses
+`buyFillFunding` for the buyer's refund and remaining escrow, and
+`sellFillFunding` for seller proceeds/history. The actual remaining holding must
+match the helper result. Fees remain zero: policy, template and settlement
+movement guards all prevent accidental nonzero activation without collection.
+
+For example, a buy of 5 at 0.60 taking an older sell of 3 at 0.40 keeps original
+size 5, remaining size 2 and cumulative taker notional 1.20. Its 3.00 escrow pays
+1.20, refunds 0.60 and retains 1.20. Cancelling returns that remaining 1.20.
+If the same buy later executes as maker, its 1.20 taker history stays unchanged.
+A sell can execute above its own limit; its history bound is filled contracts
+at the maximum one-unit payout, rather than filled contracts at its sell limit.
+
+Six registry-backed scripts check initialization, partial buy/sell history,
+maker/taker continuation, cancellation and impossible signed-history rejection.
+Existing settlement tests still check wrong backing and registry failures after
+credits/refunds, now through these helper-based paths. Fee-pool transfers and
+nonzero-fee cancellation/refunds must be tested when collection is integrated.
