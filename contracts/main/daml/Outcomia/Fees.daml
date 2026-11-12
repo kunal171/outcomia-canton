@@ -1,0 +1,170 @@
+-- | Pure fee arithmetic, not a fee policy or spend authority. No contract below
+-- stores collateral, reads a wallet or changes a balance. Settlement must bind
+-- these inputs to the signed order's rate, asset precision and actual backing.
+-- Only checked entry points are exported; wider Numeric arithmetic stays private.
+module Outcomia.Fees
+  ( FeeTerms(..), FeeAccrual(..), BuyFeeState(..), BuyFunding(..)
+  , BuyFeeMovement(..), SellFeeMovement(..)
+  , cumulativeFee, accrueFee, buyFunding, buyFillFunding, sellFillFunding
+  ) where
+
+import DA.Numeric qualified as Numeric
+
+data FeeTerms = FeeTerms with
+    takerFeeBps : Int
+    assetDecimals : Int
+  deriving (Eq, Show)
+
+-- | The accumulator counts only fills where this order was taker. A maker fill
+-- does not advance it. paidFee always equals the rounded cumulative fee.
+data FeeAccrual = FeeAccrual with
+    takerNotional : Decimal
+    paidFee : Decimal
+    charge : Decimal
+  deriving (Eq, Show)
+
+data BuyFeeState = BuyFeeState with
+    originalQuantity : Int
+    remainingQuantity : Int
+    limitPrice : Decimal
+    takerNotional : Decimal
+    paidFee : Decimal
+  deriving (Eq, Show)
+
+data BuyFunding = BuyFunding with
+    tradeReserve : Decimal
+    feeReserve : Decimal
+    totalEscrow : Decimal
+  deriving (Eq, Show)
+
+data BuyFeeMovement = BuyFeeMovement with
+    nextState : BuyFeeState
+    funding : BuyFunding
+    tradeCost : Decimal
+    feeCharged : Decimal
+    priceImprovement : Decimal
+    feeBudgetReleased : Decimal
+    refund : Decimal
+  deriving (Eq, Show)
+
+data SellFeeMovement = SellFeeMovement with
+    accrual : FeeAccrual
+    netProceeds : Decimal
+  deriving (Eq, Show)
+
+-- | Inputs: rate 0..1000 bps, precision 0..10 and bounded nonnegative notional.
+-- Errors: invalid terms or notional beyond the maximum whole-contract order.
+-- Result: cumulative fee rounded DOWN to the asset quantum. This function does
+-- not assert the notional is transferable; fill/funding entries check that.
+-- Decimal division alone would lose fractions before rounding. Widen to 14
+-- digits first: a 10-digit notional times integer bps / 10000 is then exact.
+cumulativeFee : FeeTerms -> Decimal -> Either Text Decimal
+cumulativeFee terms notional = do
+  checkTerms terms
+  check (notional >= 0.0 && notional <= maxOrderNotional) "Fee notional is outside order bounds"
+  let wide = Numeric.cast @14 notional
+  let rate = Numeric.cast @14 (intToDecimal terms.takerFeeBps)
+  pure (floorAsset terms.assetDecimals (wide * rate / 10000.0))
+
+-- | Inputs: signed cumulative taker notional/paid fee, current gross fill and
+-- maker/taker role. Errors: inconsistent history, nonpositive/off-quantum gross,
+-- unsupported precision/rate or cumulative overflow. Result: updated history
+-- and this fill's incremental fee. Splitting the same taker notional into fills
+-- does not restart rounding; a maker never pays or advances the accumulator.
+accrueFee : FeeTerms -> Decimal -> Decimal -> Decimal -> Bool -> Either Text FeeAccrual
+accrueFee terms priorNotional priorPaid gross isTaker = do
+  priorFee <- cumulativeFee terms priorNotional
+  check (priorPaid == priorFee) "Paid fee does not match cumulative notional"
+  check (aligned terms priorNotional) "Prior taker notional is off quantum"
+  check (gross > 0.0 && gross <= maxOrderNotional && aligned terms gross) "Fill gross is invalid or off quantum"
+  let nextNotional = if isTaker then priorNotional + gross else priorNotional
+  nextFee <- cumulativeFee terms nextNotional
+  let delta = nextFee - priorPaid
+  check (delta >= 0.0 && delta <= gross) "Incremental fee exceeds gross proceeds"
+  pure FeeAccrual with takerNotional = nextNotional; paidFee = nextFee; charge = delta
+
+-- | Inputs: signed buy state and its snapshotted terms. Errors: invalid quantity,
+-- price, asset quantum, impossible prior taker spending or inconsistent paid fee.
+-- Result: limit trade reserve plus the maximum FUTURE cumulative fee delta.
+-- Never use F(limit*remaining) alone: an earlier fractional remainder can change
+-- what the next taker fill owes. A completed order needs zero remaining escrow.
+buyFunding : FeeTerms -> BuyFeeState -> Either Text BuyFunding
+buyFunding terms state = do
+  paid <- cumulativeFee terms state.takerNotional
+  check (state.paidFee == paid) "Paid fee does not match cumulative notional"
+  check (state.originalQuantity > 0 && state.remainingQuantity >= 0 && state.remainingQuantity <= state.originalQuantity) "Invalid buy quantities"
+  check (state.limitPrice > 0.0 && state.limitPrice < 1.0) "Invalid buy limit price"
+  let filled = state.originalQuantity - state.remainingQuantity
+  check (state.takerNotional <= state.limitPrice * intToDecimal filled) "Taker history exceeds filled buy limit"
+  let trade = state.limitPrice * intToDecimal state.remainingQuantity
+  check (aligned terms trade && aligned terms state.takerNotional &&
+    aligned terms (state.limitPrice * intToDecimal state.originalQuantity)) "Buy notional is off quantum"
+  maximumFee <- cumulativeFee terms (state.takerNotional + trade)
+  let reserved = maximumFee - paid
+  pure BuyFunding with tradeReserve = trade; feeReserve = reserved; totalEscrow = trade + reserved
+
+-- | Inputs: current signed buy state, execution price, positive filled quantity
+-- and role. Errors: bad state, excess quantity/price, maker price different from
+-- its own limit, off-quantum cash or broken conservation. Result: successor
+-- state, remaining escrow and exact refund. No wallet balance is consulted.
+-- Example at 25 bps/6 decimals: buy 5 at .60, take 3 at .40. Initial 3.0075
+-- becomes seller gross 1.20 + fee .003 + refund .6015 + remaining escrow 1.203.
+buyFillFunding : FeeTerms -> BuyFeeState -> Decimal -> Int -> Bool -> Either Text BuyFeeMovement
+buyFillFunding terms state price quantity isTaker = do
+  old <- buyFunding terms state
+  check (quantity > 0 && quantity <= state.remainingQuantity) "Invalid buy fill quantity"
+  check (price > 0.0 && price <= state.limitPrice) "Execution exceeds buy limit"
+  check (isTaker || price == state.limitPrice) "Maker buy must execute at its limit"
+  let gross = price * intToDecimal quantity
+  accrued <- accrueFee terms state.takerNotional state.paidFee gross isTaker
+  let next = state with
+        remainingQuantity = state.remainingQuantity - quantity
+        takerNotional = accrued.takerNotional
+        paidFee = accrued.paidFee
+  funded <- buyFunding terms next
+  let released = old.feeReserve - accrued.charge - funded.feeReserve
+  let improvement = (state.limitPrice - price) * intToDecimal quantity
+  let returned = improvement + released
+  check (released >= 0.0 && returned >= 0.0) "Buy refund or reserve release is negative"
+  check (old.totalEscrow == gross + accrued.charge + returned + funded.totalEscrow) "Buy fee conservation failed"
+  pure BuyFeeMovement with
+    nextState = next; funding = funded; tradeCost = gross
+    feeCharged = accrued.charge; priceImprovement = improvement
+    feeBudgetReleased = released; refund = returned
+
+-- | Inputs: signed sell fee history, gross proceeds and role. Errors: the same
+-- history/quantum bounds as accrueFee. Result: fee delta and nonnegative net.
+-- Net can be zero when this fill catches up an earlier fractional fee. The
+-- caller must skip a zero token transfer and bind quantities/price separately.
+sellFillFunding : FeeTerms -> Decimal -> Decimal -> Decimal -> Bool -> Either Text SellFeeMovement
+sellFillFunding terms priorNotional priorPaid gross isTaker = do
+  accrued <- accrueFee terms priorNotional priorPaid gross isTaker
+  pure SellFeeMovement with accrual = accrued; netProceeds = gross - accrued.charge
+
+maxOrderNotional : Decimal
+maxOrderNotional = intToDecimal 9223372036854775807
+
+checkTerms : FeeTerms -> Either Text ()
+checkTerms terms = do
+  check (terms.takerFeeBps >= 0 && terms.takerFeeBps <= 1000) "Fee rate must be 0 to 1000 bps"
+  check (terms.assetDecimals >= 0 && terms.assetDecimals <= 10) "Asset precision must be 0 to 10"
+
+check : Bool -> Text -> Either Text ()
+check valid message = if valid then Right () else Left message
+
+-- The input must already be nonnegative and bounded by maxOrderNotional.
+-- Whole units fit Int64; only the fraction is scaled by at most 10^10. Scaling
+-- the entire amount would overflow Int64 for ordinary large orders. Numeric 14
+-- also cannot hold a large notional after shifting it ten places to the left.
+floorAsset : Int -> Numeric 14 -> Decimal
+floorAsset decimals amount =
+  let scale = 10 ^ decimals
+      whole = truncate amount
+      fraction = amount - Numeric.cast @14 (intToDecimal whole)
+      ticks = truncate (fraction * Numeric.cast @14 (intToDecimal scale))
+  in intToDecimal whole + intToDecimal ticks / intToDecimal scale
+
+aligned : FeeTerms -> Decimal -> Bool
+aligned terms amount =
+  if amount < 0.0 || amount > maxOrderNotional then False
+  else floorAsset terms.assetDecimals (Numeric.cast @14 amount) == amount
