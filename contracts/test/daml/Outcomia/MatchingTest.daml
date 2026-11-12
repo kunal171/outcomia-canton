@@ -1,0 +1,140 @@
+-- | Planner tests, not settlement tests. No script below transfers collateral
+-- or claims that a FillPlan is a ledger receipt. Exact equations are checked
+-- independently of the implementation's intermediate calculations.
+module Outcomia.MatchingTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import Outcomia.Matching
+import Outcomia.Types
+
+order : Party -> Int -> Outcome -> OrderSide -> Decimal -> Int -> MatchOrder
+order owner orderId outcome side price quantity = MatchOrder with owner; orderId; outcome; side; price; quantity
+
+requireFill : Either Text MatchDecision -> Script FillPlan
+requireFill result = case result of
+  Right (Fill plan) -> pure plan
+  _ -> abort "Expected a valid fill plan"
+
+assertRejected : Either Text MatchDecision -> Script ()
+assertRejected result = case result of
+  Left _ -> pure ()
+  _ -> abort "Expected invalid snapshot rejection"
+
+testNoCrossAndOutcomeIsolation : Script ()
+testNoCrossAndOutcomeIsolation = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let buy = order alice 1 Yes Buy 0.40 5
+  let sell = order bob 2 Yes Sell 0.50 3
+  assert (planFill 0.01 1 Yes [] == Right NoMatch)
+  assert (planFill 0.01 1 Yes [buy] == Right NoMatch)
+  assert (planFill 0.01 1 Yes [sell] == Right NoMatch)
+  assert (planFill 0.01 1 Yes [buy, sell] == Right NoMatch)
+  assert (planFill 0.01 1 Yes [buy, (sell with outcome = No; price = 0.30)] == Right NoMatch)
+  assert (planFill 0.01 1 No [buy, sell] == Right NoMatch)
+
+testSellerMakerPriceImprovementAndPartialBuy : Script ()
+testSellerMakerPriceImprovementAndPartialBuy = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let buy = order alice 2 Yes Buy 0.60 5
+  let sell = order bob 1 Yes Sell 0.40 3
+  plan <- requireFill (planFill 0.01 1 Yes [buy, sell])
+  assert (plan.buyId == 2 && plan.sellId == 1 && plan.makerId == 1 && plan.takerId == 2)
+  assert (plan.outcome == Yes && plan.price == 0.40 && plan.quantity == 3)
+  assert (plan.sellerProceeds == 1.20 && plan.buyerRefund == 0.60)
+  assert (plan.buyerRemaining == 2 && plan.sellerRemaining == 0 && plan.buyerEscrowRemaining == 1.20)
+
+testBuyerMakerAndPartialSell : Script ()
+testBuyerMakerAndPartialSell = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  plan <- requireFill (planFill 0.01 1 No [order alice 1 No Buy 0.60 2, order bob 2 No Sell 0.40 5])
+  assert (plan.outcome == No && plan.price == 0.60 && plan.quantity == 2 && plan.makerId == 1)
+  assert (plan.sellerProceeds == 1.20 && plan.buyerRefund == 0.0)
+  assert (plan.buyerRemaining == 0 && plan.buyerEscrowRemaining == 0.0 && plan.sellerRemaining == 3)
+
+testBestPriceThenFifoIgnoresInputOrder : Script ()
+testBestPriceThenFifoIgnoresInputOrder = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let orders = [order alice 2 Yes Buy 0.70 2, order bob 4 Yes Sell 0.40 2,
+                order bob 1 Yes Sell 0.50 2, order alice 3 Yes Buy 0.80 2,
+                order bob 6 Yes Sell 0.40 2, order alice 5 Yes Buy 0.80 2,
+                order alice 7 No Buy 0.99 2, order bob 8 No Sell 0.01 2]
+  plan <- requireFill (planFill 0.01 1 Yes orders)
+  assert (plan.buyId == 3 && plan.sellId == 4 && plan.price == 0.80)
+  assert (planFill 0.01 1 Yes (reverse orders) == Right (Fill plan))
+  next <- requireFill (planFill 0.01 1 Yes (filter (\o -> o.orderId /= 3 && o.orderId /= 4) orders))
+  assert (next.buyId == 5 && next.sellId == 6)
+
+testSelfTradeCancelsNewerWithoutSkipping : Script ()
+testSelfTradeCancelsNewerWithoutSkipping = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let buy = order alice 1 Yes Buy 0.70 2
+  let sell = order alice 3 Yes Sell 0.40 2
+  let worse = order bob 2 Yes Sell 0.50 2
+  assert (planFill 0.01 1 Yes [buy, sell, worse] == Right (CancelSelfTrade 3))
+  assert (planFill 0.01 1 Yes [(buy with orderId = 4), sell, worse] == Right (CancelSelfTrade 4))
+  -- A self-owned pair that does not cross needs no cancellation.
+  assert (planFill 0.01 1 Yes [(buy with price = 0.30), sell] == Right NoMatch)
+
+testEqualPriceAndWholeLots : Script ()
+testEqualPriceAndWholeLots = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  plan <- requireFill (planFill 0.01 2 Yes [order alice 2 Yes Buy 0.50 6, order bob 1 Yes Sell 0.50 4])
+  assert (plan.price == 0.50 && plan.quantity == 4 && plan.buyerRefund == 0.0)
+  assert (plan.buyerRemaining == 2 && plan.sellerRemaining == 0)
+
+testInvalidInputsAndCapacity : Script ()
+testInvalidInputsAndCapacity = script do
+  alice <- allocateParty "Alice"
+  let good = order alice 1 Yes Buy 0.40 2
+  forA_ [(0.0, 1), (-0.01, 1), (1.0, 1), (0.01, 0), (0.01, -1)] (\(tick, lot) ->
+    assertRejected (planFill tick lot Yes []))
+  forA_ [(good with orderId = 0), (good with orderId = -1), (good with quantity = 0),
+         (good with quantity = -1), (good with quantity = 3), (good with price = 0.4000000001),
+         (good with price = 0.0), (good with price = 1.0), (good with price = -0.1)] (\bad ->
+    assertRejected (planFill 0.01 2 Yes [bad]))
+  assertRejected (planFill 0.01 1 Yes [good, (good with side = Sell)])
+  assertRejected (planFill 0.01 1 Yes [(good with outcome = No; price = 0.4000000001)])
+  assertRejected (planFill 0.01 1 Yes [(good with orderId = i) | i <- [1..129]])
+  assert (planFill 0.01 1 Yes [(good with orderId = i) | i <- [1..128]] == Right NoMatch)
+
+testExactSmallTickAndLargestQuantity : Script ()
+testExactSmallTickAndLargestQuantity = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let quantity = 9223372036854775807
+  let buy = order alice 2 Yes Buy 0.9999999999 quantity
+  let sell = order bob 1 Yes Sell 0.0000000001 quantity
+  plan <- requireFill (planFill 0.0000000001 1 Yes [buy, sell])
+  assert (plan.sellerProceeds == 922337203.6854775807)
+  assert (plan.buyerRefund == 9223372035010101399.6290448386)
+  assert (plan.buyerRemaining == 0 && plan.sellerRemaining == 0 && plan.buyerEscrowRemaining == 0.0)
+
+testCashAndQuantityConservationGrid : Script ()
+testCashAndQuantityConservationGrid = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  forA_ [Yes, No] (\outcome ->
+    forA_ [0.20, 0.50, 0.80] (\buyPrice ->
+      forA_ [0.20, 0.50, 0.80] (\sellPrice ->
+        forA_ [1, 2, 5] (\buyQty ->
+          forA_ [1, 2, 5] (\sellQty ->
+            forA_ [True, False] (\buyFirst -> do
+              let buy = order alice (if buyFirst then 1 else 2) outcome Buy buyPrice buyQty
+              let sell = order bob (if buyFirst then 2 else 1) outcome Sell sellPrice sellQty
+              let result = planFill 0.01 1 outcome [sell, buy]
+              if buyPrice < sellPrice then assert (result == Right NoMatch)
+              else do
+                plan <- requireFill result
+                assert (plan.price >= sellPrice && plan.price <= buyPrice)
+                assert (plan.quantity + plan.buyerRemaining == buyQty)
+                assert (plan.quantity + plan.sellerRemaining == sellQty)
+                assert (plan.buyerRefund >= 0.0 && plan.sellerProceeds > 0.0)
+                assert (buyPrice * intToDecimal buyQty == plan.sellerProceeds + plan.buyerRefund + plan.buyerEscrowRemaining)
+            ))))))
