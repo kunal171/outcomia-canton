@@ -1,155 +1,156 @@
-# Trading-fee rules
+# Trading fees
 
-The [pure arithmetic helpers](../contracts/main/daml/Outcomia/Fees.daml) are
-implemented and locally tested. The protocol now controls the rate, and orders
-store approved fee snapshots. Actual fee funding/collection is not integrated:
-placement accepts only zero-rate orders and settlement still charges zero.
-No public Canton trading is enabled by this work.
+Fee policy, funded orders, atomic collection and operator withdrawal are locally
+implemented. Canton contracts are not deployed. The shared UI must keep trading
+disabled until deployment, registry compatibility and wallet submission work.
 
-## Who pays
+## Policy and approval
 
-- Only an executed trade earns a protocol fee. Placement, cancellation,
-  self-trade prevention, deposits, withdrawals, split/merge and reward claims do
-  not earn trading fees. Canton network charges are separate.
-- The lower acceptance ID is maker; the newer order is taker. Maker fee is zero,
-  with no rebates. An order can be maker in one fill and taker in another.
-- The taker pays in the market's collateral asset, on execution price times
-  filled quantity. Do not calculate fees on the full remaining order or payout.
-- The protocol operator controls the default rate: initially 0, with a prototype
-  range of 0–1,000 basis points. One basis point is 0.01%; 25 bps is 0.25%.
-  An ordinary market creator or future club admin cannot change this rate.
-- Each order snapshots the active rate at placement. The taker's own snapshot
-  determines its charge. Updates affect new orders only. Placement must verify
-  the policy revision/rate in the signed quote; a stale quote fails for review.
+`Protocol` stores `takerFeeBps` and `feeRevision`. Bootstrap both at zero.
+Only the operator can call `Protocol_SetTakerFee`; the prototype range is 0–1,000
+bps. One basis point is 0.01%, so 25 bps means 0.25%. Ordinary market creators
+cannot change the rate. Every update consumes the old protocol and increments
+the revision, including updates to the same rate. Exhaustion rejects safely.
 
-## Asset precision and rounding
+New orders supply the live protocol ID, expected revision and expected
+`FeeTerms`. Placement checks operator, namespace, rate and pinned asset precision
+before moving cash or positions. Stale IDs or mismatched quotes reject the whole
+transaction. Each order stores the approved terms; updates affect new orders
+only. Partial fills preserve original quantity, acceptance ID and fee snapshot.
+Matching and cancellation do not fetch the current policy.
 
-The asset's vetted configuration must specify its settlement precision `d`, from
-0 to 10 decimal places. Its smallest transferable unit is `u = 10^-d`. Neither
-a ticker nor wallet-display metadata is proof of registry precision. Verify the
-configuration against the selected registry before admitting it.
+Policy shares the existing protocol contract. An admin update or market creation
+also changes that contract ID, so clients must refresh it even if fees did not
+change. This avoids another configuration root but couples those operations.
+Services must pin the configured lineage; a deliberately duplicated root signed
+by the operator is outside that trust boundary.
 
-Deposits, withdrawals and transfers must respect that unit. Require
-`priceTick × quantityLot` to be a multiple of `u`; every valid price times valid
-whole-contract quantity can then settle exactly. A fractional contract price is
-possible even for a whole-unit asset if its lot makes the cash amount integral.
-An unsupported precision or registry fee model is rejected, not silently rounded.
+## Who pays and how rounding works
 
-Round protocol fees **down** to `u`, in the trader's favor:
+Only an executed trade earns a trading fee. The older acceptance ID is maker;
+the newer ID is taker. Makers pay zero and receive no rebate. The taker's own
+snapshotted rate applies to execution price times filled quantity. An order can
+be taker in one fill and maker in a later fill.
+
+Placement, cancellation, self-trade prevention, deposits, withdrawals and
+complete-set split/merge do not earn trading fees. Network charges are separate.
+Resolution and redemption are not implemented yet.
+
+`Protocol_ApproveAsset` records vetted settlement precision `d`, from 0 to 10.
+The smallest transferable unit is `u = 10^-d`. Wallet symbols and display metadata
+are not proof of registry precision. Books pin the admitted operator, asset and
+factory, and require `priceTick × quantityLot` to be a multiple of `u`.
+A 0.001 tick with lot 1 cannot settle in a two-decimal asset; a 0.01 tick can.
+A whole-unit asset can use a 0.01 price tick with lot 100.
+This book-level check does not add precision gates to existing custody transfers;
+those still rely on registry compatibility and exact output validation.
+
+Fees round down to the asset unit:
 
 ```text
 F(n) = floor((n × rateBps / 10,000) / u) × u
+fee for this taker fill = F(previous taker notional + fill gross) - paidFee
 ```
 
-An order stores cumulative taker notional `T`. A taker fill with gross value `g`
-charges `F(T + g) − F(T)` and advances `T`. A maker fill charges zero and leaves
-`T` unchanged. Partial successors preserve this accumulator and the original
-rate; they must not restart rounding. Recorded paid fees must equal `F(T)`.
+Signed orders store `originalQuantity`, remaining `quantity`, `takerNotional`
+and `paidFee`. Before use, `paidFee` must equal `F(takerNotional)`. Only a taker
+fill advances that history. Maker fills neither reset nor increase it. Keeping
+cumulative history prevents a split fill from restarting rounding each time.
+Separate orders can still underpay by less than one quantum each. No minimum
+notional or anti-fragmentation rule is implemented; public nonzero-fee trading
+needs an explicit policy for that case.
 
-This makes the total independent of how a given taker execution is split into
-fills. For a six-decimal asset at 25 bps, two taker fills of 0.0002 charge 0 then
-0.000001, the same total as one fill of 0.0004. A later fill can catch up earlier
-rounding, but cannot charge more than that fill's quantum-aligned gross proceeds
-at these rates. Seller net proceeds may be zero; zero transfers must be skipped.
+Arithmetic widens Decimal notional to `Numeric 14` before multiplying by integer
+bps and dividing by 10,000. Decimal alone has only ten fractional digits and can
+lose the fraction needed for correct rounding. Whole and fractional amounts are
+handled separately instead of scaling a large notional into Int64 smallest units.
+See [Daml numeric types](https://archived.docs.digitalasset.com/build/3.5/reference/daml/stdlib/Prelude.html).
 
-Separate orders reset their own accumulators. The protocol can therefore collect
-less than one smallest unit below the exact fee per order, including a cancelled
-partial order. Tiny-order splitting can exploit that bounded undercollection.
-This is a deliberate rounding tradeoff, not a claim of split-proof economics;
-minimum-notional/lot policy is separate work before public nonzero-fee trading.
-There is no hidden minimum fee or upward rounding on cancellation.
+## Buy funding and refunds
 
-## Buy funding
-
-A buy reserves its limit notional plus the maximum remaining taker fee under its
-snapshot. Reserving trade cost alone would let a later fill need money that the
-trader has already withdrawn or used in another market.
-
-For limit price `L`, remaining quantity `Q`, cumulative taker notional `T`:
+For limit price `L`, remaining quantity `q`, cumulative taker notional `T` and
+already paid fee `P`:
 
 ```text
-feeReserve(T, Q) = F(T + L × Q) − F(T)
-buyEscrow       = L × Q + feeReserve(T, Q)
+trade reserve = L × q
+future fee reserve = F(T + L × q) - P
+required escrow = trade reserve + future fee reserve
 ```
 
-At placement `T = 0`. The check and transfer of the entire escrow must commit
-with the order and book update. Insufficient free collateral rejects placement.
-The reserve is user-owned escrow, not earned protocol revenue.
+Reserve the future cumulative fee delta, not just `F(L × q)`: past fractional
+rounding carry can make the next fill owe a fee that a fresh calculation misses.
+The original quantity bounds historical spending; rebuilding it from a partial
+remainder would lose that bound.
 
-After filling `q` at `P`, set `Q' = Q − q` and update `T` only if this buy is taker:
+`buyFunding` checks signed history and computes the escrow needed.
+`buyFillFunding` computes the fee, price improvement, released fee budget and
+new escrow. A maker buy releases unused fee budget even when its execution
+price equals its limit. Placement requires the full trade-and-fee reserve.
+Cancellation, including self-trade prevention, returns all remaining escrow.
+Already collected fees remain earned.
 
-```text
-feeThisFill     = F(T') − F(T)
-newFeeReserve   = F(T' + L × Q') − F(T')
-releasedBudget = oldFeeReserve − feeThisFill − newFeeReserve
-buyerRefund    = (L − P) × q + releasedBudget
-newBuyEscrow   = L × Q' + newFeeReserve
-```
+Example: at 25 bps and six decimals, a buy of 5 at 0.60 takes 3 at 0.40:
 
-Both refunds must be nonnegative. Reserve against the **cumulative** base, not
-`F(L × Q')` alone: earlier fractional rounding can affect the next charge.
-A maker buy also releases unused fee budget for its filled quantity, even though
-its trading fee is zero. Therefore a maker fill can revise the buyer's free
-account despite having no price improvement. At `Q' = 0`, no escrow remains.
-
-Example: six-decimal collateral, 25 bps, buy 5 at 0.60 against an older sell of
-3 at 0.40:
-
-| Cash use | Amount |
+| Cash movement | Amount |
 | --- | ---: |
-| Initial buy escrow | 3.0075 |
-| Seller's gross proceeds | 1.20 |
-| Earned buy-taker fee | 0.003 |
-| Buyer refund: price improvement + unused fee budget | 0.6015 |
-| Remaining buy escrow: 1.20 trade cost + 0.003 fee reserve | 1.203 |
+| Initial escrow | 3.0075 |
+| Seller gross proceeds | 1.20 |
+| Collected buyer fee | 0.003 |
+| Buyer refund | 0.6015 |
+| Remaining trade-and-fee escrow | 1.203 |
 
-The last four amounts sum to 3.0075. The refund is not just the 0.60 price
-improvement: it also returns 0.0015 of unneeded fee budget.
+The order retains original size 5, remaining size 2, taker notional 1.20 and paid
+fee 0.003. Cancelling returns 1.203. If it later fills as maker, prior taker
+history stays unchanged and unused fee budget is released.
 
-## Sell funding
+## Sell proceeds
 
-A sell locks only its outcome contracts. If it is taker, deduct its cumulative
-fee delta from gross proceeds before crediting its free collateral balance:
+A sell locks outcome contracts, without reserving extra cash. Its taker fee is
+deducted from gross proceeds. A sell can execute above its own limit, so its
+history bound is filled contracts times the maximum one-unit payout, rather
+than filled contracts times its sell limit. A quoted fee at the sell limit is
+an estimate, not a maximum.
 
-```text
-sellerNet = executionPrice × filledQuantity − sellerTakerFee
+A cumulative rounding carry can make the entire gross of a tiny fill become
+fee. Net proceeds are then zero. Settlement preserves the seller's account ID
+and skips its token transfer, because the transfer boundary rejects zero
+transfers. Outcome delivery, the fee transfer and all other state changes still
+commit together.
+
+## Backing and atomic collection
+
+`OrderBook.fees` embeds `FeePoolState`: earned amount and one optional canonical
+vault holding. Empty means amount zero and no holding. Positive fees require a
+real, unlocked holding of the pinned collateral asset. The prototype caps each
+pool at Int64 maximum units; withdraw before reaching that bound.
+
+Embedding the pool avoids an independently selectable pool contract. It adds no
+global asset bottleneck: matching already consumes the market book. Withdrawal
+contends with matching on that market, while other markets stay independent.
+
+```mermaid
+flowchart LR
+  Buy[Buy escrow] --> Net[Seller net proceeds]
+  Buy --> Fee[Earned fee holding]
+  Old[Previous fee holding] --> Fee
+  Buy --> Refund[Buyer refund]
+  Buy --> Remainder[Remaining trade and fee escrow]
+  Fee --> Book[Successor book commits pool]
+  Remainder --> Order[Partial buy]
 ```
 
-The buyer does not pay the seller's fee. A maker sell receives the full gross
-amount. For example, a newer sell fills 3 contracts against an older buy at 0.60:
-at 25 bps it receives 1.7955 and the protocol receives 0.0045 from the 1.80 gross.
-The maker buy pays no fee and receives any released buy-fee reserve.
+Settlement recomputes best-price/FIFO from signed orders and then:
 
-The fee delta must be between zero and gross proceeds. A negative net rejects
-settlement. A zero net leaves the seller account unchanged instead of submitting
-a zero transfer. No additional seller wallet funds may be debited.
+1. Validates the buy escrow against its checked funding state.
+2. Credits the seller's net proceeds, skipping a zero credit.
+3. Consolidates the fee with existing pool backing into one holding.
+4. Refunds price improvement and unused fee budget to the buyer.
+5. Validates remaining escrow, delivers outcomes and recreates partial orders.
+6. Commits the successor book and fill receipt.
 
-## What the trader signs
-
-The placement quote shows the policy revision, snapshotted rate, asset precision
-and exact collateral amounts. For a buy, show the maximum total debit
-`L × originalQuantity + F(L × originalQuantity)`, including its reserved fee.
-It must not depend on a later wallet top-up.
-
-For a sell, show gross and estimated net if fully filled at its limit. The fee
-amount at the sell limit is an estimate, not a maximum: a better execution price
-can increase both gross proceeds and the fee. A conservative whole-order fee
-bound is `F(originalQuantity)`, because each contract executes below one
-collateral unit. No cash is reserved by the sell, and a rounding catch-up can
-leave one tiny fill with zero net. The cumulative order fee still never exceeds
-the agreed rate times its cumulative taker notional.
-
-## Collection, exits and authority
-
-Use one backed fee pool per market, pinned to its market key, protocol, vault,
-asset and exact factory. This avoids a global same-asset fee account serializing
-otherwise independent markets. Each market already serializes on its book.
-The live pool revision is verified inside settlement; a name alone cannot prove
-its configured lineage. Zero-fee fills do not consume the pool unnecessarily.
-
-Fees, seller net proceeds, buyer refunds, residual escrow, outcome delivery and
-the new book/receipt must commit together. A later registry failure rolls back
-the fee too. Do not accumulate a numeric credit without an actual disjoint holding.
+Zero fees skip the fee transfer and preserve its holding, while still validating
+pool backing. A failure at any later registry call restores every earlier credit,
+fee holding, order and book revision. No unbacked numeric credit counts as revenue.
 
 ```text
 vault cash = available trader cash
@@ -158,154 +159,44 @@ vault cash = available trader cash
            + earned protocol fee pools
 ```
 
-Buy cancellation, including automated self-trade prevention, refunds its entire
-remaining trade-and-fee escrow. Sell cancellation returns only its remaining
-outcome contracts. Fees already earned on earlier fills remain earned. Cancelling
-an order and replacing it creates a new ID, priority and fee snapshot; a partial
-fill does not. A later invalid-market outcome does not automatically reverse
-executed trading fees. Any rebate would need a separate funded policy.
+`TradeFill` records the taker's terms and actual fee, refund and remaining buy
+escrow. Its `plan` retains the fee-free matching projection: gross price/quantity,
+price improvement and remaining trade reserve. Use the receipt's explicit cash
+fields for fee-inclusive amounts. Receipts are audit records, not backing.
 
-Only the protocol operator may withdraw earned fees. The initial destination is
-the operator's own wallet; the vault-signed pool supplies vault authority. A
-future different recipient needs explicit recipient authorization under the token
-adapter, not an arbitrary destination argument. Withdrawals must use exact
-transfers and canonical change, consume the current pool and respect its asset.
-They cannot access user balances, order escrows or outcome reserve backing.
-These are contract-choice rules, not protection from the raw vault signer, which
-remains trusted as described in [custody](collateral-custody.md).
-Market closure does not delete a nonempty pool; terminal cleanup must retain it
-or empty it through an authorized withdrawal.
+## Withdrawal and trust
 
-## Implementation sequence
+Only the protocol operator can exercise `OrderBook_WithdrawFees`. The destination
+is fixed to that operator's wallet. It accepts a positive, precision-aligned
+amount no larger than the validated pool and returns actual wallet holdings.
+A partial withdrawal keeps canonical pool change; a full withdrawal clears it.
+No trader balance or complete-set reserve is an input.
 
-1. **Done:** precision-aware cumulative fee helpers and exact arithmetic tests.
-2. **Done:** operator policy, vetted book precision and immutable order snapshots.
-3. **Prepared, zero rates only:** signed fee history and helper-based buy funding,
-   refunds and cancellation. Nonzero activation waits for steps 4 and 5.
-4. Collect one taker fee into a market pool within atomic settlement.
-5. Add authorized fee withdrawal and conservation/rollback tests.
-6. Show the rate, reserve, maximum debit and refund in the shared UI only when
-   deployment, registry compatibility and submission are verified.
+Withdrawal works after market closure or cutoff. It consumes the current book,
+so stale withdrawal IDs cannot replay. Failed registry output restores the pool
+and its holding. A future arbitrary recipient would require explicit recipient
+authorization under the token adapter. Terminal cleanup must preserve a nonempty
+pool or empty it through authorized withdrawal.
 
-During this staged rollout, accept only zero-rate orders until the snapshot,
-full buy reserve, fee collection and cancellation paths are integrated together.
-Adding a configurable policy or snapshot field alone must not enable a nonzero-
-fee order backed only by the old trade-cost escrow. Keep public trading gated.
+These are contract-choice guarantees. Raw vault signing authority remains
+trusted and can bypass application accounting, as described in
+[custody](collateral-custody.md). No public upgrade or migration has occurred.
 
-Signed order state now includes original/remaining quantity, snapshotted rate and
-precision, cumulative taker notional and paid fee. Reject inconsistent paid-fee
-or reserve values, negative quantities and arithmetic overflow. The original
-quantity bounds accumulated notional, including when maker and taker fills mix.
+## Verification
 
-Do not first divide in `Decimal` and then round: `Decimal` has only ten fractional
-digits and could lose the fraction being accounted for. The implemented helper
-widens the bounded order notional to `Numeric 14` before multiplying by basis
-points and dividing by 10,000. Four extra fractional digits make that ratio exact.
-Round to asset precision by separating whole and fractional units; do not scale
-an entire large notional into Int64 smallest units. That can overflow.
-See [Daml numeric types](https://archived.docs.digitalasset.com/build/3.5/reference/daml/stdlib/Prelude.html).
+The full suite passes 143 Daml scripts, including 15 collection/withdrawal
+scripts, plus four Python checks. Production DAR validation passes with 38
+packages. Run `make DPM="$PWD/target/tools/dpm" test` for the ledger suite and independent
+arithmetic checks. The production DAR excludes the test registry and daml-script.
+Tests cover funded placement, both taker directions, partial-fill accumulation,
+changed policy snapshots, cancellation, self-trade prevention, zero-net sellers,
+canonical pool backing, operator withdrawal, replay and registry rollback.
 
-Run `python3 scripts/check-fee-policy.py` for the exact-rational reference check.
-It exercises 4,400 buy-order lifecycles and 57,510 buy/sell fill checks, mixed
-maker/taker fills, asset precisions 0–10 and rates 0/1/25/1,000 bps. It checks
-nonnegative reserve release, cash conservation, bounded seller deductions and
-maximum-Int intermediate bounds. This checks the design equations; it is not a
-Daml implementation, registry test or public-deployment result.
+The independent Fraction reference checks 4,400 buy lifecycles and 57,510 fill
+invariants. Its 308 checked-in fee vectors are verified by
+`python3 scripts/generate-fee-vectors.py --check`; the Daml arithmetic grid covers
+792 precision/rate/price/quantity/role cases. These do not substitute for the
+registry-backed collection and withdrawal tests.
 
-## Implemented arithmetic boundary
-
-`FeeTerms` is a pure input record, not proof of a configured rate or registry
-precision. Placement now binds it to the live protocol and pinned book precision.
-`BuyFeeState` is reconstructed from the signed order's original/remaining quantity,
-limit and cumulative history. Settlement binds it to actual backing.
-Settlement must derive maker/taker role from verified acceptance IDs and bind
-gross amounts to the actual fill. A caller-supplied role flag is not authority.
-Settlement now uses `buyFunding`, `buyFillFunding` and `sellFillFunding`, but
-explicitly rejects a nonzero fee movement until atomic collection is implemented.
-
-The module validates rate/precision bounds, original and remaining quantities,
-transferable cash, cumulative paid-fee consistency and bounded taker history.
-Its outputs cover remaining buy funding, per-fill fee/refund breakdown, and sell
-net proceeds. It rejects invalid maker-buy prices and handles a zero-net seller
-fill without issuing any transfer. Only validated public functions are exported.
-
-Fourteen arithmetic scripts, twelve policy scripts and six funding/history scripts
-pass alongside existing contracts: 128 Daml scripts and four Python dependency
-checks. The helper matches 308
-checked-in expected fees generated from the independent exact-Fraction reference.
-The Daml conservation grid covers 792 precision/rate/price/quantity/role cases.
-Nonzero rates are tested in pure arithmetic only; this is not evidence of
-nonzero-fee ledger settlement or fee withdrawals.
-
-Regenerate expected vectors with `python3 scripts/generate-fee-vectors.py`;
-`python3 scripts/generate-fee-vectors.py --check` verifies the tracked fixture.
-Run `make DPM="$PWD/target/tools/dpm" test` for the Daml checks. Contract integration
-must still test fee-backed escrow, fee-pool conservation and registry rollback.
-
-## Implemented policy and quote boundary
-
-The configured `Protocol` lineage carries `takerFeeBps` and `feeRevision`.
-Bootstrap it with both fields zero. Only the operator can exercise
-`Protocol_SetTakerFee`, with a rate from 0 through 1,000 bps. Every successful
-update consumes the old protocol and increments the revision, including an
-update to the same rate. Revision exhaustion rejects without changing state.
-Admin and market-ID fields are preserved.
-
-Placement supplies the live protocol ID, expected fee revision and expected
-`FeeTerms`. The book checks operator/namespace and compares that quote against
-the active rate and its own pinned precision before touching cash or positions.
-A revoked ID, changed revision/rate/precision or another namespace rejects the
-whole placement. The accepted order stores `feeTerms` and `feeRevision`; partial
-successors preserve them. Matching and cancellation do not fetch current policy.
-Existing zero-fee orders can therefore settle or exit after an operator raises
-the rate, while new orders at that nonzero rate are blocked.
-
-This reuses the existing protocol root rather than introducing a second global
-configuration contract. The cost is that an admin update or market creation also
-changes the protocol ID and requires clients to refresh it. Rate revisions alone
-do not identify that full contract revision. Services must pin the configured
-lineage, as they already do for creator authorization: an operator deliberately
-creating a second root is outside the trust boundary.
-
-`Protocol_ApproveAsset` now records vetted `assetDecimals` (0..10). Book creation
-checks the admission against the reserve's operator, instrument and factory,
-requires `priceTick × quantityLot` to align to that precision, and stores it.
-Changing or archiving admission cannot reinterpret an existing book's units.
-For example, a 0.001 tick with a one-contract lot is rejected for a two-decimal
-asset. A 0.01 tick is accepted. Matching checks each order's precision against
-the book. This does not yet add precision validation to deposits/withdrawals;
-registry compatibility and exact output checks still govern those paths.
-
-Both placement and the `LimitOrder` template enforce zero fees for now. Raising
-the configured rate is a configuration test, not activation of fee trading.
-Funding paths use the full helper result, whose fee reserve is zero under the
-current gate. No fee pool or fee withdrawal exists yet.
-The production contract schema changed locally; no public upgrade or migration
-has been performed.
-
-## Signed funding and execution history
-
-`LimitOrder` stores `originalQuantity`, `takerNotional` and `paidFee` in addition
-to its remaining quantity and fee terms. Placement initializes history to zero.
-Partial successors preserve original quantity and acceptance ID. Only a verified
-taker fill increases that order's notional; becoming maker later does not reset
-or increase its previous taker total. Self-trade cancellation accrues nothing.
-
-Buy placement and cancellation use `buyFunding.totalEscrow`. Settlement uses
-`buyFillFunding` for the buyer's refund and remaining escrow, and
-`sellFillFunding` for seller proceeds/history. The actual remaining holding must
-match the helper result. Fees remain zero: policy, template and settlement
-movement guards all prevent accidental nonzero activation without collection.
-
-For example, a buy of 5 at 0.60 taking an older sell of 3 at 0.40 keeps original
-size 5, remaining size 2 and cumulative taker notional 1.20. Its 3.00 escrow pays
-1.20, refunds 0.60 and retains 1.20. Cancelling returns that remaining 1.20.
-If the same buy later executes as maker, its 1.20 taker history stays unchanged.
-A sell can execute above its own limit; its history bound is filled contracts
-at the maximum one-unit payout, rather than filled contracts at its sell limit.
-
-Six registry-backed scripts check initialization, partial buy/sell history,
-maker/taker continuation, cancellation and impossible signed-history rejection.
-Existing settlement tests still check wrong backing and registry failures after
-credits/refunds, now through these helper-based paths. Fee-pool transfers and
-nonzero-fee cancellation/refunds must be tested when collection is integrated.
+Deployment, actual registry compatibility and wallet-to-ledger submission remain
+separate work. Local test success must not enable unconfigured public trading.

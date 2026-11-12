@@ -21,7 +21,7 @@ sequenceDiagram
   Book->>Buy: SettleBuy with selected sell
   Buy->>Sell: SettleSell with actual buyer as controller
   Sell->>Book: Fetch full index; verify orders; recompute plan
-  Sell->>Cash: Credit seller; refund buyer's improvement
+  Sell->>Cash: Credit seller net; collect fee; refund buyer
   Sell->>Sell: Deliver buyer's outcome lot; recreate partial orders
   Sell->>Buy: Archive old buy
   Sell->>Book: Archive old book; create successor references
@@ -36,28 +36,32 @@ market, vault, asset and factory. The planner then recomputes best-price/FIFO;
 the caller cannot submit a price or fill quantity to override it.
 
 The selected buy's actual holding must equal `buyFunding.totalEscrow` from its
-signed original/remaining quantity and taker history. With the current zero-rate
-gate this equals limit price times remaining quantity. Both accounts must belong to the correct traders and the same
+signed original/remaining quantity and taker history. This includes remaining trade
+cost and the maximum future fee delta at that order's approved rate. Both accounts must belong to the correct traders and the same
 operator, vault, asset, protocol and pinned factory.
 
 ## Cash and position changes
 
-For a buy of 5 at 0.60 matching an older sell of 3 at 0.40:
+For a buy of 5 at 0.60 and 25 bps matching an older sell of 3 at 0.40:
 
 | State | Before | After |
 | --- | ---: | ---: |
-| Buy escrow | 3.00 | 1.20 |
+| Buy trade-and-fee escrow | 3.0075 | 1.203 |
+| Market fee pool | 0 | 0.003 |
 | Seller's available balance | unchanged baseline | baseline + 1.20 |
-| Buyer's available balance | unchanged baseline | baseline + 0.60 |
+| Buyer's available balance | unchanged baseline | baseline + 0.6015 |
 | Remaining buy quantity | 5 | 2 |
 | Remaining sell quantity | 3 | 0 |
 | Buyer's delivered YES or NO | 0 | 3 |
 
 The seller credit consumes the buy escrow and the seller account's old backing.
-Its change still belongs to the buy. The buyer refund then consumes that change
-and the buyer account's backing, leaving exactly the partial buy's limit escrow.
+Its change still belongs to the buy. Settlement collects the taker fee from
+that change into separate canonical pool backing. The buyer refund then consumes
+the residual cash and the buyer account's backing, leaving exactly the partial
+buy's required trade-and-fee escrow.
 A zero refund leaves the buyer account ID unchanged and skips the zero transfer.
-Empty accounts are supported. Fees remain zero.
+Empty accounts are supported. A zero-net seller credit also preserves its
+account ID and skips the transfer. See [fee accounting](fee-accounting.md).
 
 The sell's escrowed outcome quantity is removed by consuming its order. Exactly
 the filled quantity becomes the buyer's position lot. Any partial buy/sell keeps
@@ -66,7 +70,7 @@ Complete-set reserves and total YES/NO supply do not change.
 
 If any registry transfer, exact-output check, account check or contract creation
 fails, the entire transaction rolls back. This includes the case where the seller
-credit has executed but the later buyer refund fails. No partial credit, delivered
+credit or fee collection has executed but the later buyer refund fails. No partial credit, delivered
 position, receipt or revised book remains.
 
 ## Why the nested choices matter
@@ -135,13 +139,13 @@ book/order data. This version does not promise per-order privacy from other
 matching participants. Private clubs will need an explicit disclosure design.
 
 Public-network deployment, actual registry compatibility, read/submission
-services, fees, cross-outcome matching, resolution and redemption remain separate
+services, cross-outcome matching, resolution and redemption remain separate
 milestones. Only the production DAR is deployable; the test DAR includes the
 fault-injecting registry and `daml-script`.
 
 ## Verification
 
-`make DPM="$PWD/target/tools/dpm" test` passes 128 Daml scripts, including 20
+`make DPM="$PWD/target/tools/dpm" test` passes 143 Daml scripts, including 20
 settlement scripts, plus four Python dependency checks. Production DAR validation
 passes with 38 packages.
 
