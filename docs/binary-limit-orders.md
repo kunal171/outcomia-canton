@@ -1,8 +1,10 @@
 # Binary limit orders
 
 This checkpoint adds fully funded resting buys/sells and owner cancellation.
-It does not execute trades. Crossed orders may coexist until matching is added;
-the shared UI must keep Canton trading disabled.
+The [settlement path](binary-settlement.md) now executes one fill or cancels a
+newer self-cross. Crossed orders can coexist until the operator submits matching.
+The shared UI must keep Canton trading disabled until public deployment and
+wallet submission are verified.
 
 ```mermaid
 flowchart LR
@@ -103,14 +105,12 @@ markets have separate books, while the same trader account remains a shared
 spending dependency. The bounds simplify the first implementation but limit
 throughput and depth; measure both before choosing a larger structure.
 
-The [pure matching planner](binary-matching.md) now defines maker-price execution,
-partial-fill amounts and cancel-newer self-trade behavior. It executes nothing.
-Settlement must fetch the current book and validate its best reference in the
-settlement transaction. An off-chain matcher supplying a candidate is not proof
-of FIFO. Partial fills must update the order and its reference together, preserve
-the original acceptance ID, transfer outcome ownership, settle cash and return
-price improvement. Fees, bounded fill batches and cross-outcome matching remain separate work.
-The selected same-outcome plan still needs atomic escrow updates and tests.
+The [pure matching planner](binary-matching.md) defines maker-price execution,
+partial-fill amounts and cancel-newer self-trade behavior. The
+[atomic settlement path](binary-settlement.md) now recomputes that plan from the
+current book and fetched orders, then updates cash, outcome ownership, partial
+orders and references together. Partial orders retain their original priority.
+Fees, bounded fill batches and cross-outcome matching remain separate work.
 
 ## Verification and deployment limits
 

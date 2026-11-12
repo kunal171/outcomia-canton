@@ -26,8 +26,8 @@ Use small commits, a feature PR, and a merge before the next checkpoint. See
 [complete sets](docs/complete-set-positions.md) support YES/NO split and merge.
 [Resting limit orders](docs/binary-limit-orders.md) lock buys/sells and support
 owner cancellation. The [matching planner](docs/binary-matching.md) selects
-price/FIFO pairs and computes partial fills and refunds. Atomic settlement,
-resolution and redemption remain.
+price/FIFO pairs and computes partial fills and refunds. The [atomic settlement path](docs/binary-settlement.md) now applies one fill or
+cancel-newer self-trade action. Fees, resolution and redemption remain.
 No Canton markets are deployed yet.
 
 ## Contracts
