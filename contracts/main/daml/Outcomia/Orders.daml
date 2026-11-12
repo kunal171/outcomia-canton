@@ -1,11 +1,11 @@
--- | Fully funded resting orders and owner cancellation. No matching or fills
--- occur in this checkpoint: crossed orders can coexist until settlement exists.
+-- | Fully funded orders, owner cancellation and one-pair atomic settlement.
+-- An operator submits matching; signed orders delegate only the checked trade.
 -- A buy owns separate cash backing; a sell owns outcome quantities removed from
 -- position lots. Neither can also be spent through the owner's available state.
 --
--- The bounded market index commits acceptance sequence and references. A future
--- matcher must validate best-price/FIFO against it inside settlement, not trust
--- an off-ledger candidate. Vault/registry custody assumptions still apply.
+-- The bounded market index commits acceptance sequence and references. The
+-- matcher recomputes best-price/FIFO from fetched contracts inside settlement;
+-- an off-ledger candidate never authorizes a fill. Vault/registry custody assumptions still apply.
 module Outcomia.Orders where
 
 import DA.List (unique, sortOn)
@@ -50,6 +50,42 @@ data CancellationResult = CancellationResult with
     book : ContractId OrderBook
     released : ReleasedBacking
   deriving (Eq, Show)
+
+-- | A successful match returns all revised IDs. For a fill, balances are buyer
+-- then seller and position belongs to the buyer. For self-trade cancellation,
+-- balances contains the one owner's account and position is any restored sell
+-- quantity. The decision distinguishes these cases; only fills have a receipt.
+data SettlementResult = SettlementResult with
+    book : ContractId OrderBook
+    decision : Matching.MatchDecision
+    balances : [ContractId AssetBalance]
+    position : Optional (ContractId PositionLot)
+    receipt : Optional (ContractId TradeFill)
+  deriving (Eq, Show)
+
+-- | An audit record, never spendable backing. Contract ID identifies the fill;
+-- partial fills may share acceptance IDs. Operators can archive receipts, but
+-- archival does not reverse a trade. History/indexing must retain ledger events.
+template TradeFill
+  with
+    key : MarketKey
+    vault : Party
+    buyer : Party
+    seller : Party
+    instrument : CollateralInstrument
+    plan : Matching.FillPlan
+    executedAt : Time
+  where
+    signatory key.operator, vault
+    observer buyer, seller
+    ensure key.operator /= vault && buyer /= seller && buyer /= vault && seller /= vault &&
+      key.marketId > 0 && boundedText 64 key.protocolName && boundedText 128 instrument.id &&
+      plan.buyId > 0 && plan.sellId > 0 && plan.buyId /= plan.sellId &&
+      plan.makerId == min plan.buyId plan.sellId && plan.takerId == max plan.buyId plan.sellId &&
+      plan.quantity > 0 && plan.price > 0.0 && plan.price < 1.0 &&
+      plan.sellerProceeds == plan.price * intToDecimal plan.quantity &&
+      plan.buyerRefund >= 0.0 && plan.buyerEscrowRemaining >= 0.0 &&
+      plan.buyerRemaining >= 0 && plan.sellerRemaining >= 0
 
 -- | One configured order-registry lineage, separate from account/reserve roots.
 -- Joint operator/vault signers can bootstrap another root, so services must pin
@@ -202,6 +238,34 @@ template OrderBook
           orders = orders ++ [OrderReference nextOrderId order outcome Sell price]
         pure PlacementResult with book = next; order; balance = None; remainder
 
+    -- | Inputs: current market, selected outcome, both current owner accounts
+    -- and registry context. Rejects closed/cutoff markets, absent crossings,
+    -- stale contracts, wrong accounts or registry failure. Result: exactly one
+    -- fill or cancel-newer self-trade action and the successor book. No fresh
+    -- trader signatures are needed; nested signed orders supply their authority.
+    -- This is nonconsuming only at the entry: the inner settlement MUST archive
+    -- this exact book. This lets inner checks fetch its committed references.
+    nonconsuming choice OrderBook_MatchBest : SettlementResult
+      with
+        market : ContractId BinaryMarket
+        outcome : Outcome
+        buyerBalance : ContractId AssetBalance
+        sellerBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator
+      do
+        checkTrading this market
+        buyRef <- requireBest orders outcome Buy
+        sellRef <- requireBest orders outcome Sell
+        buy <- fetch buyRef.order
+        sell <- fetch sellRef.order
+        if buy.owner == sell.owner then do
+          assertMsg "Self-trade cancellation uses one owner account" (buyerBalance == sellerBalance)
+          let newer = if buyRef.orderId > sellRef.orderId then buyRef.order else sellRef.order
+          exercise newer LimitOrder_CancelSelfTrade with book = self; market; outcome; balance = buyerBalance; extraArgs
+        else exercise buyRef.order LimitOrder_SettleBuy with
+          book = self; market; sellOrder = sellRef.order; buyerBalance; sellerBalance; extraArgs
+
     -- | Inputs: owner, exact active order reference, optional buy refund account
     -- and registry context. Rejects: foreign/unindexed order, another owner or
     -- wrong refund account. Result: order archived, index entry removed, backing
@@ -223,9 +287,10 @@ template OrderBook
         next <- create this with orders = filter (\r -> r.order /= order) orders
         pure CancellationResult with book = next; released
 
--- | Active order and its exclusive escrow. No fill or amendment choice exists
--- yet. Cancellation goes through the book to remove the committed reference;
--- the internal release choice requires both owner and vault authorization.
+-- | Active order and exclusive escrow. Settlement choices require operator
+-- and vault authority obtained through the book, then the signed buy delegates
+-- its buyer into the signed sell. Neither trader can execute these internals
+-- alone. Every successful settlement consumes the book and affected orders.
 template LimitOrder
   with
     key : MarketKey
@@ -248,6 +313,128 @@ template LimitOrder
       price > 0.0 && price < 1.0 && quantity > 0 && orderId > 0 &&
       (case (side, backing) of (Buy, CashEscrow _) -> True; (Sell, OutcomeEscrow) -> True; _ -> False)
 
+    -- | Inputs: current book/market, selected sell and owner account IDs.
+    -- Rejects a non-buy or invalid settlement downstream. Result: the complete
+    -- atomic trade. Nonconsuming keeps this buy fetchable during the sell's
+    -- verification; the sell's body explicitly archives it. Its owner becomes
+    -- an explicit controller of the nested sell, not an arbitrary free signer.
+    nonconsuming choice LimitOrder_SettleBuy : SettlementResult
+      with
+        book : ContractId OrderBook
+        market : ContractId BinaryMarket
+        sellOrder : ContractId LimitOrder
+        buyerBalance : ContractId AssetBalance
+        sellerBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault
+      do
+        assertMsg "Settlement entry requires a buy" (side == Buy)
+        exercise sellOrder LimitOrder_SettleSell with
+          buyer = owner; buyOrder = self; book; market; buyerBalance; sellerBalance; extraArgs
+
+    -- | Inputs: buyer identity delegated by the signed buy, live buy/book/market
+    -- and both accounts. Rejects non-best/foreign/self pairs, wrong backing,
+    -- bad account bindings or registry outputs. Result: both orders and the old
+    -- book consumed, exact credits, buyer position, partial-order successors and
+    -- a fill receipt. Postconsuming keeps this sell visible in the full snapshot
+    -- until its body finishes. All failures roll back ALL nested transfers.
+    postconsuming choice LimitOrder_SettleSell : SettlementResult
+      with
+        buyer : Party
+        buyOrder : ContractId LimitOrder
+        book : ContractId OrderBook
+        market : ContractId BinaryMarket
+        buyerBalance : ContractId AssetBalance
+        sellerBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault, buyer
+      do
+        index <- fetch book
+        checkTrading index market
+        snapshot <- matchingSnapshot index
+        buy <- fetch buyOrder
+        assertMsg "Settlement buyer identity does not match its signed order" (buy.owner == buyer)
+        plan <- case Matching.planFill index.terms.priceTick index.terms.quantityLot outcome snapshot of
+          Right (Matching.Fill value) -> pure value
+          _ -> abort "No eligible crossed pair for settlement"
+        buyRef <- requireBest index.orders outcome Buy
+        sellRef <- requireBest index.orders outcome Sell
+        assertMsg "Settlement must use the best indexed buy and sell"
+          (buyRef.order == buyOrder && sellRef.order == self && side == Sell &&
+           buy.side == Buy && buy.orderId == plan.buyId && orderId == plan.sellId &&
+           key == index.key && vault == index.vault && buyer /= owner)
+        checkOrderAccount key vault instrument factory buyer buyerBalance
+        checkOrderAccount key vault instrument factory owner sellerBalance
+        cash <- case buy.backing of CashEscrow cid -> pure cid; _ -> abort "Buy must have cash escrow"
+        let originalCash = buy.price * intToDecimal buy.quantity
+        total <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") [cash]
+        assertMsg "Buy escrow amount is incorrect" (total == originalCash)
+        -- Seller's account consumes the buy escrow AND its own backing. Its
+        -- available credit rises only by proceeds; all change still belongs to
+        -- this buy. Example: 3.00 escrow minus 1.20 proceeds leaves 1.80.
+        paid <- exercise sellerBalance AssetBalance_Repartition with
+          otherCash = Some cash; otherAmount = originalCash; delta = plan.sellerProceeds; extraArgs
+        let afterPayment = originalCash - plan.sellerProceeds
+        (nextBuyerBalance, remainingCash) <- if plan.buyerRefund > 0.0 then do
+          refunded <- exercise buyerBalance AssetBalance_Repartition with
+            otherCash = paid.otherCash; otherAmount = afterPayment; delta = plan.buyerRefund; extraArgs
+          pure (refunded.balance, refunded.otherCash)
+          else pure (buyerBalance, paid.otherCash)
+        left <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") (optionalHoldings remainingCash)
+        assertMsg "Remaining buy escrow is incorrect" (left == plan.buyerEscrowRemaining)
+        -- The inner sell has buyer authority as an explicit controller and
+        -- seller authority from this signed contract. Free balances are only
+        -- credited. Both outcome delivery and partial orders use those owners.
+        position <- createRemainder key vault buyer
+          (if outcome == Yes then plan.quantity else 0) (if outcome == No then plan.quantity else 0)
+        exercise buyOrder Archive
+        buyRemainder <- if plan.buyerRemaining == 0 then do
+          assertMsg "Completed buy must have no remaining escrow" (remainingCash == None)
+          pure None
+          else do
+            backingCash <- case remainingCash of Some cid -> pure cid; None -> abort "Partial buy requires escrow"
+            cid <- create buy with quantity = plan.buyerRemaining; backing = CashEscrow backingCash
+            pure (Some cid)
+        sellRemainder <- if plan.sellerRemaining == 0 then pure None else do
+          cid <- create this with quantity = plan.sellerRemaining
+          pure (Some cid)
+        refs <- mapA referenceFor (optionalHoldings buyRemainder ++ optionalHoldings sellRemainder)
+        exercise book Archive
+        next <- create index with orders = filter (\r -> r.order /= buyOrder && r.order /= self) index.orders ++ refs
+        now <- getTime
+        receipt <- create TradeFill with key; vault; buyer; instrument; plan; executedAt = now; seller = owner
+        pure SettlementResult with
+          book = next; decision = Matching.Fill plan
+          balances = [nextBuyerBalance, paid.balance]; position; receipt = Some receipt
+
+    -- | Inputs: live book/market, outcome and the one owner's refund account.
+    -- Rejects anything except the recomputed newer self-cross. Result: escrow
+    -- fully restored and that reference removed, with no fill receipt. Keeping
+    -- the order live until the end allows validation against the whole index.
+    postconsuming choice LimitOrder_CancelSelfTrade : SettlementResult
+      with
+        book : ContractId OrderBook
+        market : ContractId BinaryMarket
+        outcome : Outcome
+        balance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault
+      do
+        index <- fetch book
+        checkTrading index market
+        snapshot <- matchingSnapshot index
+        decision <- case Matching.planFill index.terms.priceTick index.terms.quantityLot outcome snapshot of
+          Right value@(Matching.CancelSelfTrade newer) | newer == orderId -> pure value
+          _ -> abort "Only the newer best self-cross may be cancelled"
+        assertMsg "Self-trade order must be indexed" (any (\r -> r.order == self) index.orders)
+        checkOrderAccount key vault instrument factory owner balance
+        released <- releaseBacking this (if side == Buy then Some balance else None) extraArgs
+        exercise book Archive
+        next <- create index with orders = filter (\r -> r.order /= self) index.orders
+        pure SettlementResult with
+          book = next; decision; position = released.position; receipt = None
+          balances = [case released.balance of Some cid -> cid; None -> balance]
+
     -- | Inputs: buy refund account (None for a sell), registry context.
     -- Rejects: missing/wrong account, unexpected sell account, invalid backing
     -- or missing owner/vault authority. Result: exact collateral refund or a
@@ -258,28 +445,46 @@ template LimitOrder
         extraArgs : ExtraArgs
       controller owner, vault
       do
-        case backing of
-          CashEscrow cash -> do
-            account <- case balance of Some cid -> pure cid; None -> abort "Buy cancellation requires its owner's account"
-            checkOrderAccount key vault instrument factory owner account
-            let amount = price * intToDecimal quantity
-            total <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") [cash]
-            assertMsg "Buy escrow amount is incorrect" (total == amount)
-            partition <- exercise account AssetBalance_Repartition with
-              otherCash = Some cash; otherAmount = amount; delta = amount; extraArgs
-            assertMsg "Cancelled buy must release all escrow" (partition.otherCash == None)
-            pure ReleasedBacking with balance = Some partition.balance; position = None
-          OutcomeEscrow -> do
-            assertMsg "Sell cancellation does not take a cash account" (balance == None)
-            position <- createRemainder key vault owner
-              (if outcome == Yes then quantity else 0) (if outcome == No then quantity else 0)
-            pure ReleasedBacking with balance = None; position
+        releaseBacking this balance extraArgs
+
+-- | Inputs: signed order state, optional owner refund account and registry
+-- context. Rejects invalid backing or refund account. Result: exact release;
+-- caller MUST also consume the order and update the committed book atomically.
+releaseBacking : LimitOrder -> Optional (ContractId AssetBalance) -> ExtraArgs -> Update ReleasedBacking
+releaseBacking order balance extraArgs = do
+  case order.backing of
+    CashEscrow cash -> do
+      account <- case balance of Some cid -> pure cid; None -> abort "Buy cancellation requires its owner's account"
+      checkOrderAccount order.key order.vault order.instrument order.factory order.owner account
+      let amount = order.price * intToDecimal order.quantity
+      total <- holdingTotal (H.InstrumentId order.instrument.admin order.instrument.id) (H.Account (Some order.vault) None "") [cash]
+      assertMsg "Buy escrow amount is incorrect" (total == amount)
+      partition <- exercise account AssetBalance_Repartition with
+        otherCash = Some cash; otherAmount = amount; delta = amount; extraArgs
+      assertMsg "Cancelled buy must release all escrow" (partition.otherCash == None)
+      pure ReleasedBacking with balance = Some partition.balance; position = None
+    OutcomeEscrow -> do
+      assertMsg "Sell cancellation does not take a cash account" (balance == None)
+      position <- createRemainder order.key order.vault order.owner
+        (if order.outcome == Yes then order.quantity else 0) (if order.outcome == No then order.quantity else 0)
+      pure ReleasedBacking with balance = None; position
+
 
 -- | Inputs: signed book, current market and proposed order terms. Rejects stale
 -- lifecycle IDs, altered terms, closed/cutoff markets, off-tick/lot values or
 -- exhausted bounds. Result: validated placement; no assets moved by this helper.
 checkPlacement : OrderBook -> ContractId BinaryMarket -> Decimal -> Int -> Update ()
 checkPlacement book market price quantity = do
+  checkTrading book market
+  assertMsg "Price must lie strictly between 0 and 1 and follow the market tick" (validPrice book.terms.priceTick price)
+  checkQuantity book.terms.quantityLot quantity
+  assertMsg "Market active-order limit reached" (length book.orders < 128)
+  assertMsg "Order sequence limit reached" (book.nextOrderId < 9223372036854775807)
+
+-- | Inputs: signed book and current market revision. Rejects changed identity,
+-- terms, closed state or cutoff. No acceptance/capacity bound applies to fills.
+checkTrading : OrderBook -> ContractId BinaryMarket -> Update ()
+checkTrading book market = do
   current <- fetch market
   assertMsg "Market identity or terms do not match order book"
     (current.operator == book.key.operator && current.protocolName == book.key.protocolName &&
@@ -287,10 +492,34 @@ checkPlacement book market price quantity = do
      current.createdAt == book.marketCreatedAt && current.terms == book.terms)
   now <- getTime
   assertMsg "Orders require an Open market before cutoff" (current.status == Open && now < book.terms.closeAt)
-  assertMsg "Price must lie strictly between 0 and 1 and follow the market tick" (validPrice book.terms.priceTick price)
-  checkQuantity book.terms.quantityLot quantity
-  assertMsg "Market active-order limit reached" (length book.orders < 128)
-  assertMsg "Order sequence limit reached" (book.nextOrderId < 9223372036854775807)
+
+-- | Inputs: a live book. Result: all <=128 fetched, indexed order projections.
+-- Rejects stale references, changed market/vault/asset/factory, invalid terms or
+-- altered acceptance IDs. Only selected buy backing is spent and checked later.
+matchingSnapshot : OrderBook -> Update [Matching.MatchOrder]
+matchingSnapshot book = mapA (\ref -> do
+  current <- fetch ref.order
+  assertMsg "Indexed order does not match its committed reference"
+    (current.key == book.key && current.vault == book.vault && current.instrument == book.terms.collateral &&
+     current.factory == book.factory && current.orderId == ref.orderId && current.outcome == ref.outcome &&
+     current.side == ref.side && current.price == ref.price)
+  pure Matching.MatchOrder with
+    orderId = current.orderId; owner = current.owner; outcome = current.outcome
+    side = current.side; price = current.price; quantity = current.quantity) book.orders
+
+-- | Inputs: a newly created partial order. Result: successor index reference;
+-- its original acceptance ID and price are retained, never reallocated.
+referenceFor : ContractId LimitOrder -> Update OrderReference
+referenceFor cid = do
+  value <- fetch cid
+  pure (OrderReference value.orderId cid value.outcome value.side value.price)
+
+-- | Inputs: committed references and an outcome/side. Rejects a missing side;
+-- result is the best-price/FIFO reference, with no caller-selected order IDs.
+requireBest : [OrderReference] -> Outcome -> OrderSide -> Update OrderReference
+requireBest orders outcome side = case bestOrderReference orders outcome side of
+  Some ref -> pure ref
+  None -> abort "Both sides are required for matching"
 
 -- | Inputs: admitted decimal tick and candidate price. Result: exact tick
 -- alignment. Decimal has 10 fractional digits, so scaling sub-unit prices by

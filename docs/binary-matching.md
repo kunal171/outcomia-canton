@@ -1,7 +1,8 @@
 # Binary matching
 
-The first matching checkpoint is a pure planner. It selects one pair and
-calculates the amounts. It does not execute, cancel or settle orders.
+The pure planner selects one pair and calculates the amounts. It does not move
+assets. The [atomic settlement path](binary-settlement.md) now applies its result
+inside a ledger transaction; public deployment remains unverified.
 
 ```mermaid
 flowchart LR
@@ -10,8 +11,8 @@ flowchart LR
   Planner --> NoMatch[No crossing: no action]
   Planner --> Self[Same owner: cancel newer order]
   Planner --> Fill[One fill at the older order's price]
-  Self -. next checkpoint .-> Settlement[Atomic contract and backing updates]
-  Fill -. next checkpoint .-> Settlement
+  Self --> Settlement[Atomic contract and backing updates]
+  Fill --> Settlement
 ```
 
 ## Selection
@@ -27,9 +28,8 @@ current model, which can contain crossed resting orders because execution has
 not been implemented. It is not an immediate-or-cancel or market-order API.
 
 If the best pair has the same owner, return a request to cancel its newer order.
-Do not skip that pair to execute a lower-priority order. The next checkpoint must
-actually release that order's backing and remove its book reference atomically;
-until then this result is only a plan. Cancellation preserves the older order's
+Do not skip that pair to execute a lower-priority order. The settlement path releases that order's backing and removes its book reference
+atomically. Calling this pure function alone still performs no cancellation. Cancellation preserves the older order's
 priority and prevents a self-cross from becoming a trade or fee-generating fill.
 
 ## Amounts
@@ -70,8 +70,7 @@ promise a multi-fill transaction or high-throughput price-level indexing.
 
 ## Settlement boundary
 
-The snapshot is not proof of ownership, funding or contract liveness. Before
-using a plan, a ledger choice must:
+The snapshot is not proof of ownership, funding or contract liveness. The ledger path verifies these requirements before applying a plan:
 
 1. Fetch the current Open market before cutoff and its committed book lineage.
 2. Fetch the indexed orders and verify their IDs, terms, owners, factory, asset,
@@ -84,10 +83,9 @@ using a plan, a ledger choice must:
 6. Record the fill and return successor account/book/position IDs. Any failure
    must leave the previous orders, balances and backing unchanged.
 
-Authorization needs particular care: the existing internal balance choice needs
-owner and vault authority. A plan grants neither. The implementation must compose
-signed order choices without requiring both traders to approve every later fill
-and without granting an arbitrary caller authority to move their other funds.
+The internal balance choice needs owner and vault authority. A plan grants
+neither. Settlement composes signed order choices to obtain those owners'
+authority without fresh signatures, and only credits their free accounts.
 The vault and admitted registry remain the custody trust boundaries.
 
 ## Checks

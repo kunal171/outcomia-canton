@@ -27,7 +27,9 @@ The shared wallet gateway, binary lifecycle and [approved asset transfers](colla
 are locally tested. Collateral support includes dedicated-vault asset balances
 and [complete-set split/merge](complete-set-positions.md). [Resting orders](binary-limit-orders.md)
 add funded placement and cancellation. The [matching planner](binary-matching.md) defines selection, partial fills,
-maker-price execution and cancel-newer self-trade behavior. Atomic settlement is next. No public Canton deployment
+maker-price execution and cancel-newer self-trade behavior. [Atomic settlement](binary-settlement.md) now applies one fill or self-trade
+cancellation, with signed-order delegation and actual token transfers. Fees,
+resolution and redemption remain. No public Canton deployment
 or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
 
 The chosen [collateral custody model](collateral-custody.md) uses a dedicated
@@ -44,8 +46,8 @@ claimed by this checkpoint. An unconfigured market deployment is shown explicitl
 
 The bounded order index commits acceptance sequence and price. The pure planner
 selects best-price/FIFO and requests cancellation of the newer
-self-crossing order. Fees are zero at this stage. Settlement must recompute the
-plan from verified contracts and update partial orders and backing atomically.
+self-crossing order. Fees are zero at this stage. Settlement recomputes the plan from verified contracts and updates partial
+orders and backing atomically. The operator triggers one fill per command.
 See the [order design](binary-limit-orders.md).
 Keep wallet identity independent of these contracts so account changes cannot
 reuse a previous party's commands.
