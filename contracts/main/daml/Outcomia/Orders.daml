@@ -16,10 +16,9 @@ import Outcomia.Assets (holdingTotal)
 import Outcomia.Binary
 import Outcomia.Custody
 import Outcomia.Positions
+import Outcomia.Matching qualified as Matching
 import Outcomia.Types
 import Outcomia.Validation (boundedText, termsErrors)
-
-data OrderSide = Buy | Sell deriving (Eq, Show)
 
 -- | A buy's exact price*quantity holding or a sell's quantity of its selected
 -- outcome. Sell backing is represented directly in the signed order, not by a
@@ -298,9 +297,7 @@ checkPlacement book market price quantity = do
 -- 10^10 gives exact Int values below 10^10. Integer remainder avoids division
 -- rounding accidentally accepting a near-tick price such as 0.4000000001.
 validPrice : Decimal -> Decimal -> Bool
-validPrice tick price =
-  if tick <= 0.0 || tick >= 1.0 || price <= 0.0 || price >= 1.0 then False
-  else truncate (price * 10000000000.0) % truncate (tick * 10000000000.0) == 0
+validPrice = Matching.validMatchPrice
 
 -- | Inputs: pinned deployment/asset/factory, caller and account. Rejects any
 -- mismatch. Result: no mutation; only a fetched signed revision can fund/refund.
@@ -323,7 +320,7 @@ createRemainder key vault owner yes no = if yes == 0 && no == 0 then pure None e
 -- not tie priority. This helper defines selection but does not yet settle trades.
 bestOrderReference : [OrderReference] -> Outcome -> OrderSide -> Optional OrderReference
 bestOrderReference references outcome side =
-  case sortOn (\r -> (if side == Buy then negate r.price else r.price, r.orderId))
+  case sortOn (\r -> Matching.priorityKey side r.price r.orderId)
        (filter (\r -> r.outcome == outcome && r.side == side) references) of
     [] -> None
     first :: _ -> Some first
