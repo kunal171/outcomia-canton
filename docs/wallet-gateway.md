@@ -46,3 +46,13 @@ to the Canton pages. The deployed app's public browser check also reached Loop's
 healthy devnet status endpoint. This confirms connection, not funded balance
 reads, registry transfers or contract submission. A test-funding request is
 pending. There is no public Loop devnet faucet.
+
+## Current network: testnet
+
+Loop support supplied presentation funds on testnet, so the shared app now uses
+`NEXT_PUBLIC_CANTON_NETWORK_ID=canton:testnet`. Open
+[Loop Testnet Wallet](https://wallet.testnet.looptech.io) and reconnect; devnet
+accounts and balances are separate. Console uses the same configured Canton
+target. Solana remains on devnet. The earlier devnet checks above are historical.
+Funding was reported by the user; a funded testnet balance read is not yet
+verified by this repository. Contract deployment and trading remain gated.

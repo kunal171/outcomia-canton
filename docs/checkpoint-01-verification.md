@@ -56,3 +56,7 @@ user confirmed connection to a real Loop devnet wallet and access to the Canton
 pages. Funded balances and wallet-to-ledger market commands remain unverified;
 the funding request is pending. This does not replace the Console extension
 smoke check described above. No wallet secrets are kept in this repository.
+
+Loop support subsequently provided funds on testnet. The shared app target is
+now `canton:testnet`; reconnect using the testnet wallet before checking balances.
+This configuration change does not deploy Canton contracts or verify a transfer.

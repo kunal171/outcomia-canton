@@ -10,7 +10,7 @@ exactly one winner. Canton spot trading is outside the current scope.
 The UI lives in [`kunal171/outcomia/app`](https://github.com/kunal171/outcomia/tree/master/app).
 There is no separate Canton frontend. That app uses the selected wallet to open
 Solana markets or the Canton prediction workspace. Loop or Console Wallet verifies its primary party on the configured network
-(`canton:devnet` by default).
+(`canton:testnet` by default).
 
 Run the shared app using [its setup guide](https://github.com/kunal171/outcomia/blob/master/app/README.md).
 See [the wallet boundary](docs/wallet-gateway.md) and
