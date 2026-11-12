@@ -52,10 +52,10 @@ testInvalidTermsRollback = script do
 testDirectInvariantsAndCounterLimit : Script ()
 testDirectInvariantsAndCounterLimit = script do
   (operator, creator, _, _, (now, terms)) <- setup ()
-  submitMustFail operator do createCmd Protocol with operator; protocolName = " "; admins = [operator]; nextMarketId = 1
-  submitMustFail operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = []; nextMarketId = 1
-  submitMustFail operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator]; nextMarketId = 0
-  exhausted <- submit operator do createCmd Protocol with operator; protocolName = "limit"; admins = [operator, creator]; nextMarketId = 9223372036854775807
+  submitMustFail operator do createCmd Protocol with operator; protocolName = " "; admins = [operator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  submitMustFail operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = []; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  submitMustFail operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator]; nextMarketId = 0; takerFeeBps = 0; feeRevision = 0
+  exhausted <- submit operator do createCmd Protocol with operator; protocolName = "limit"; admins = [operator, creator]; nextMarketId = 9223372036854775807; takerFeeBps = 0; feeRevision = 0
   submitMustFail creator do exerciseCmd exhausted Protocol_CreateBinary with creator; terms
   submitMustFail [operator, creator] do
     createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms = (terms with priceTick = 0.0); createdAt = now; status = Draft; closeReason = None

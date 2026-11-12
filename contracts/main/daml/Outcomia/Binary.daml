@@ -24,10 +24,13 @@ template Protocol
     protocolName : Text
     admins : [Party]
     nextMarketId : Int
+    takerFeeBps : Int
+    feeRevision : Int
   where
     signatory operator
     observer admins
-    ensure boundedText 64 protocolName && validAdmins operator admins && nextMarketId > 0
+    ensure boundedText 64 protocolName && validAdmins operator admins && nextMarketId > 0 &&
+      takerFeeBps >= 0 && takerFeeBps <= 1000 && feeRevision >= 0
 
     -- | Inputs: replacement admin list, including the operator.
     -- Rejects: non-operator authorization, duplicates, empty/oversized lists or
@@ -40,20 +43,35 @@ template Protocol
           (validAdmins operator replacementAdmins)
         create this with admins = replacementAdmins
 
-    -- | Inputs: asset identity and the exact factory verified by the operator.
-    -- Rejects: another caller, blank asset ID or a mismatched factory admin.
+    -- | Inputs: replacement rate in 0..1000 basis points, operator authorization.
+    -- Errors: rate outside bounds, unauthorized caller or revision exhaustion.
+    -- Result: a consuming successor; old approval quotes cannot use this ID.
+    -- Existing orders retain their signed snapshot. Nonzero placement stays
+    -- disabled until cash reserves, collection and refunds support those fees.
+    choice Protocol_SetTakerFee : ContractId Protocol
+      with replacementFeeBps : Int
+      controller operator
+      do
+        assertMsg "Taker fee must be between 0 and 1000 bps"
+          (replacementFeeBps >= 0 && replacementFeeBps <= 1000)
+        assertMsg "Fee revision limit reached" (feeRevision < 9223372036854775807)
+        create this with takerFeeBps = replacementFeeBps; feeRevision = feeRevision + 1
+
+    -- | Inputs: asset identity, vetted settlement precision 0..10 and exact factory.
+    -- Rejects: another caller, invalid precision/asset ID or mismatched factory admin.
     -- Result: revocable admission for new transfers, not a token balance.
     -- The view comparison is a consistency check; the operator must authenticate
     -- the registry's factory contract and vetted code before approving it.
     nonconsuming choice Protocol_ApproveAsset : ContractId AssetAdmission
       with
         instrument : CollateralInstrument
+        assetDecimals : Int
         factory : ContractId T.TransferFactory
       controller operator
       do
         factoryView <- exercise factory T.TransferFactory_PublicFetch with actors = [operator]
         assertMsg "Registry factory has the wrong instrument admin" (factoryView.admin == instrument.admin)
-        create AssetAdmission with operator; instrument; factory
+        create AssetAdmission with operator; instrument; factory; assetDecimals
 
     -- | Inputs: creator and immutable binary terms. The creator must authorize
     -- this choice; this protocol's signatory supplies the operator authorization.

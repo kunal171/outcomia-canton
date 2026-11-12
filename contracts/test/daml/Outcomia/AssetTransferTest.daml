@@ -33,11 +33,11 @@ setup mode = script do
   alice <- allocatePartyByHint (PartyIdHint ("Alice-" <> show mode))
   bob <- allocatePartyByHint (PartyIdHint ("Bob-" <> show mode))
   now <- getTime
-  protocol <- submit operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator]; nextMarketId = 1
+  protocol <- submit operator do createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
   registry <- submit issuer do createCmd TestRegistry with issuer; mode
   let instrument = CollateralInstrument issuer "test-USD"
   admission <- submit (actAs operator <> readAs issuer) do
-    exerciseCmd protocol Protocol_ApproveAsset with instrument; factory = toInterfaceContractId @T.TransferFactory registry
+    exerciseCmd protocol Protocol_ApproveAsset with instrument; factory = toInterfaceContractId @T.TransferFactory registry; assetDecimals = 6
   input <- submit issuer do
     createCmd TestHolding with issuer; account = H.Account (Some alice) None ""; instrument = H.InstrumentId issuer "test-USD"; amount = 5.0; locked = None
   pure Fixture with operator; issuer; alice; bob; protocol; admission; registry; input; now; instrument
@@ -91,7 +91,7 @@ testExactSpendAndSmallestAmount = script do
   -- Use a separate honest factory for the fractional transfer.
   registry <- submit g.issuer do createCmd TestRegistry with issuer = g.issuer; mode = Good
   admission <- submit (actAs g.operator <> readAs g.issuer) do
-    exerciseCmd g.protocol Protocol_ApproveAsset with instrument = g.instrument; factory = toInterfaceContractId @T.TransferFactory registry
+    exerciseCmd g.protocol Protocol_ApproveAsset with instrument = g.instrument; factory = toInterfaceContractId @T.TransferFactory registry; assetDecimals = 6
   _ <- move (g with admission) ((intentFor g) with amount = 0.0000000001)
   holdings <- query @TestHolding g.issuer
   assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some g.bob] == 0.0000000001)
@@ -114,9 +114,9 @@ testAdmissionBindingAndRevocation = script do
   f <- setup Good
   let intent = intentFor f
   submitMustFail (actAs f.alice <> readAs [f.operator, f.issuer]) do
-    exerciseCmd f.protocol Protocol_ApproveAsset with instrument = f.instrument; factory = toInterfaceContractId @T.TransferFactory f.registry
+    exerciseCmd f.protocol Protocol_ApproveAsset with instrument = f.instrument; factory = toInterfaceContractId @T.TransferFactory f.registry; assetDecimals = 6
   submitMustFail (actAs f.operator <> readAs f.issuer) do
-    exerciseCmd f.protocol Protocol_ApproveAsset with instrument = CollateralInstrument f.bob "test-USD"; factory = toInterfaceContractId @T.TransferFactory f.registry
+    exerciseCmd f.protocol Protocol_ApproveAsset with instrument = CollateralInstrument f.bob "test-USD"; factory = toInterfaceContractId @T.TransferFactory f.registry; assetDecimals = 6
   submitMustFail (actAs [f.alice, f.bob] <> readAs [f.operator, f.issuer]) do
     exerciseCmd f.admission AssetAdmission_Transfer with expectedOperator = f.alice; expectedInstrument = f.instrument; intent
   submitMustFail (actAs [f.alice, f.bob] <> readAs [f.operator, f.issuer]) do

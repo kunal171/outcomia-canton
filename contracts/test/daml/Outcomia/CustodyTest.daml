@@ -136,12 +136,12 @@ testWrongAdmissionAndAssetIsolation : Script ()
 testWrongAdmissionAndAssetIsolation = script do
   f <- setup Good
   otherAsset <- submit (actAs f.asset.operator <> readAs f.asset.issuer) do
-    exerciseCmd f.asset.protocol Protocol_ApproveAsset with instrument = CollateralInstrument f.asset.issuer "other"; factory = toInterfaceContractId @T.TransferFactory f.asset.registry
+    exerciseCmd f.asset.protocol Protocol_ApproveAsset with instrument = CollateralInstrument f.asset.issuer "other"; factory = toInterfaceContractId @T.TransferFactory f.asset.registry; assetDecimals = 6
   otherRegistry <- submit f.asset.issuer do createCmd TestRegistry with issuer = f.asset.issuer; mode = Good
   otherFactory <- submit (actAs f.asset.operator <> readAs f.asset.issuer) do
-    exerciseCmd f.asset.protocol Protocol_ApproveAsset with instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory otherRegistry
+    exerciseCmd f.asset.protocol Protocol_ApproveAsset with instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory otherRegistry; assetDecimals = 6
   otherOperator <- submit f.asset.bob do
-    createCmd AssetAdmission with operator = f.asset.bob; instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory f.asset.registry
+    createCmd AssetAdmission with operator = f.asset.bob; instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory f.asset.registry; assetDecimals = 6
   forA_ [otherAsset, otherFactory, otherOperator] (\admission -> do
     submitMustFail (actAs f.asset.alice <> readAs [f.asset.operator, f.asset.bob, f.asset.issuer]) do
       exerciseCmd f.balance AssetBalance_Deposit with admission; inputs = [toInterfaceContractId @H.Holding f.asset.input]; amount = 3.0; extraArgs = registryContext)
@@ -178,7 +178,7 @@ testEnrollmentBoundaries = script do
   submitMustFail (actAs f.vault <> readAs f.asset.operator) do
     exerciseCmd f.authority VaultAuthority_OpenBalance with owner = f.vault; admission = f.asset.admission
   wrong <- submit f.asset.bob do
-    createCmd AssetAdmission with operator = f.asset.bob; instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory f.asset.registry
+    createCmd AssetAdmission with operator = f.asset.bob; instrument = f.asset.instrument; factory = toInterfaceContractId @T.TransferFactory f.asset.registry; assetDecimals = 6
   submitMustFail (actAs f.asset.alice <> readAs f.asset.bob) do
     exerciseCmd f.authority VaultAuthority_OpenBalance with owner = f.asset.alice; admission = wrong
   -- A full index uses distinct real keys so duplicate detection cannot be the
