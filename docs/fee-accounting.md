@@ -1,8 +1,9 @@
 # Trading-fee rules
 
 The [pure arithmetic helpers](../contracts/main/daml/Outcomia/Fees.daml) are
-implemented and locally tested. Policy contracts, signed order snapshots and
-actual fee collection are not integrated: current settlement still charges zero.
+implemented and locally tested. The protocol now controls the rate, and orders
+store approved fee snapshots. Actual fee funding/collection is not integrated:
+placement accepts only zero-rate orders and settlement still charges zero.
 No public Canton trading is enabled by this work.
 
 ## Who pays
@@ -178,7 +179,7 @@ or empty it through an authorized withdrawal.
 ## Implementation sequence
 
 1. **Done:** precision-aware cumulative fee helpers and exact arithmetic tests.
-2. Add the pinned operator fee policy and immutable per-order snapshots.
+2. **Done:** operator policy, vetted book precision and immutable order snapshots.
 3. Fund buy reserves; extend cancellation and partial-order state.
 4. Collect one taker fee into a market pool within atomic settlement.
 5. Add authorized fee withdrawal and conservation/rollback tests.
@@ -213,11 +214,12 @@ Daml implementation, registry test or public-deployment result.
 ## Implemented arithmetic boundary
 
 `FeeTerms` is a pure input record, not proof of a configured rate or registry
-precision. `BuyFeeState` is a pure snapshot, not a signed resting order. Future
-placement and settlement choices must bind these values to actual contracts.
+precision. Placement now binds it to the live protocol and pinned book precision.
+`BuyFeeState` is still a pure snapshot, not persisted execution history. Settlement
+must bind its future accumulator to signed orders and actual backing.
 Settlement must derive maker/taker role from verified acceptance IDs and bind
 gross amounts to the actual fill. A caller-supplied role flag is not authority.
-The existing order/settlement path does not call the fee helpers yet.
+The existing settlement path does not call the fee arithmetic helpers yet.
 
 The module validates rate/precision bounds, original and remaining quantities,
 transferable cash, cumulative paid-fee consistency and bounded taker history.
@@ -225,8 +227,8 @@ Its outputs cover remaining buy funding, per-fill fee/refund breakdown, and sell
 net proceeds. It rejects invalid maker-buy prices and handles a zero-net seller
 fill without issuing any transfer. Only validated public functions are exported.
 
-Fourteen Daml fee scripts pass alongside all existing contract scripts: 110 Daml
-scripts and four Python dependency checks in total. The helper matches 308
+Fourteen arithmetic scripts and twelve policy/quote scripts pass alongside all
+existing contract scripts: 122 Daml scripts and four Python dependency checks. The helper matches 308
 checked-in expected fees generated from the independent exact-Fraction reference.
 The Daml conservation grid covers 792 precision/rate/price/quantity/role cases.
 This is arithmetic validation, not evidence of fee-backed escrow or withdrawals.
@@ -234,4 +236,44 @@ This is arithmetic validation, not evidence of fee-backed escrow or withdrawals.
 Regenerate expected vectors with `python3 scripts/generate-fee-vectors.py`;
 `python3 scripts/generate-fee-vectors.py --check` verifies the tracked fixture.
 Run `make DPM="$PWD/target/tools/dpm" test` for the Daml checks. Contract integration
-must still test policy changes, real backing, fee-pool conservation and rollback.
+must still test fee-backed escrow, fee-pool conservation and registry rollback.
+
+## Implemented policy and quote boundary
+
+The configured `Protocol` lineage carries `takerFeeBps` and `feeRevision`.
+Bootstrap it with both fields zero. Only the operator can exercise
+`Protocol_SetTakerFee`, with a rate from 0 through 1,000 bps. Every successful
+update consumes the old protocol and increments the revision, including an
+update to the same rate. Revision exhaustion rejects without changing state.
+Admin and market-ID fields are preserved.
+
+Placement supplies the live protocol ID, expected fee revision and expected
+`FeeTerms`. The book checks operator/namespace and compares that quote against
+the active rate and its own pinned precision before touching cash or positions.
+A revoked ID, changed revision/rate/precision or another namespace rejects the
+whole placement. The accepted order stores `feeTerms` and `feeRevision`; partial
+successors preserve them. Matching and cancellation do not fetch current policy.
+Existing zero-fee orders can therefore settle or exit after an operator raises
+the rate, while new orders at that nonzero rate are blocked.
+
+This reuses the existing protocol root rather than introducing a second global
+configuration contract. The cost is that an admin update or market creation also
+changes the protocol ID and requires clients to refresh it. Rate revisions alone
+do not identify that full contract revision. Services must pin the configured
+lineage, as they already do for creator authorization: an operator deliberately
+creating a second root is outside the trust boundary.
+
+`Protocol_ApproveAsset` now records vetted `assetDecimals` (0..10). Book creation
+checks the admission against the reserve's operator, instrument and factory,
+requires `priceTick × quantityLot` to align to that precision, and stores it.
+Changing or archiving admission cannot reinterpret an existing book's units.
+For example, a 0.001 tick with a one-contract lot is rejected for a two-decimal
+asset. A 0.01 tick is accepted. Matching checks each order's precision against
+the book. This does not yet add precision validation to deposits/withdrawals;
+registry compatibility and exact output checks still govern those paths.
+
+Both placement and the `LimitOrder` template enforce zero fees for now. Raising
+the configured rate is a configuration test, not activation of fee trading.
+No additional fee reserve, fee pool or fee withdrawal exists in this milestone.
+The production contract schema changed locally; no public upgrade or migration
+has been performed.

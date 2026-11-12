@@ -140,7 +140,7 @@ fault-injecting registry and `daml-script`.
 
 ## Verification
 
-`make DPM="$PWD/target/tools/dpm" test` passes 96 Daml scripts, including 20
+`make DPM="$PWD/target/tools/dpm" test` passes 122 Daml scripts, including 20
 settlement scripts, plus four Python dependency checks. Production DAR validation
 passes with 38 packages.
 

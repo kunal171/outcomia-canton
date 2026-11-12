@@ -20,7 +20,11 @@ flowchart LR
 
 ## Admission
 
-Only the protocol operator can call `Protocol_ApproveAsset`. Admission binds the
+Only the protocol operator can call `Protocol_ApproveAsset`. It also supplies
+vetted settlement precision (`assetDecimals`, 0..10), which new order books pin.
+Transfers still rely on the selected registry and exact output checks; this
+milestone does not add precision gates to existing balance transfers.
+Admission binds the
 operator, instrument admin/ID and exact transfer-factory contract. Its reported
 admin must match the instrument. Only the operator can archive the admission.
 The same admission can serve multiple markets using that asset.

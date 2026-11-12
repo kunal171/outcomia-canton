@@ -29,7 +29,7 @@ and [complete-set split/merge](complete-set-positions.md). [Resting orders](bina
 add funded placement and cancellation. The [matching planner](binary-matching.md) defines selection, partial fills,
 maker-price execution and cancel-newer self-trade behavior. [Atomic settlement](binary-settlement.md) now applies one fill or self-trade
 cancellation, with signed-order delegation and actual token transfers. The [fee rules and pure arithmetic](fee-accounting.md) are locally tested; fee
-policy/escrow integration, resolution and redemption remain. No public Canton deployment
+policy and immutable order snapshots are also checked. Fee-backed escrow/collection, resolution and redemption remain. No public Canton deployment
 or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
 
 The chosen [collateral custody model](collateral-custody.md) uses a dedicated
