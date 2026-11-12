@@ -78,7 +78,9 @@ new placement without blocking cancellation.
 Each buy/sell supplies the current protocol ID and expected fee revision, rate
 and asset precision. A changed or archived approval rejects before escrow.
 Only the operator changes the rate; orders and partial successors retain their
-original snapshot. New nonzero-rate orders are blocked. See [fee accounting](fee-accounting.md).
+original snapshot. Orders also retain original size and cumulative taker spending;
+funding/refund helpers validate that history against actual escrow. New nonzero-rate
+orders are blocked. See [fee accounting](fee-accounting.md).
 
 ## Cancellation
 

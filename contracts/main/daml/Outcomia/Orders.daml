@@ -199,14 +199,15 @@ template OrderBook
         checkPlacement this market price quantity
         feeTerms <- checkFeeQuote this feePolicy expectedFeeRevision expectedFeeTerms
         checkOrderAccount key vault terms.collateral factory owner balance
-        let notional = price * intToDecimal quantity
+        funding <- checkedFee (Fees.buyFunding feeTerms (Fees.BuyFeeState quantity quantity price 0.0 0.0))
         partition <- exercise balance AssetBalance_Repartition with
-          otherCash = None; otherAmount = 0.0; delta = negate notional; extraArgs
+          otherCash = None; otherAmount = 0.0; delta = negate funding.totalEscrow; extraArgs
         cash <- case partition.otherCash of Some cid -> pure cid; None -> abort "Buy order must have cash backing"
         now <- getTime
         order <- create LimitOrder with
           key; vault; owner; factory; outcome; price; quantity
           feeTerms; feeRevision = expectedFeeRevision
+          originalQuantity = quantity; takerNotional = 0.0; paidFee = 0.0
           instrument = terms.collateral
           side = Buy
           orderId = nextOrderId
@@ -256,6 +257,7 @@ template OrderBook
         order <- create LimitOrder with
           key; vault; owner; factory; outcome; price; quantity
           feeTerms; feeRevision = expectedFeeRevision
+          originalQuantity = quantity; takerNotional = 0.0; paidFee = 0.0
           instrument = terms.collateral
           side = Sell
           orderId = nextOrderId
@@ -332,6 +334,9 @@ template LimitOrder
     quantity : Int
     feeTerms : Fees.FeeTerms
     feeRevision : Int
+    originalQuantity : Int
+    takerNotional : Decimal
+    paidFee : Decimal
     orderId : Int
     acceptedAt : Time
     backing : OrderBacking
@@ -343,6 +348,7 @@ template LimitOrder
       price > 0.0 && price < 1.0 && quantity > 0 && orderId > 0 &&
       feeRevision >= 0 && feeTerms.takerFeeBps == 0 &&
       feeTerms.assetDecimals >= 0 && feeTerms.assetDecimals <= 10 &&
+      validOrderFeeHistory this &&
       (case (side, backing) of (Buy, CashEscrow _) -> True; (Sell, OutcomeEscrow) -> True; _ -> False)
 
     -- | Inputs: current book/market, selected sell and owner account IDs.
@@ -398,22 +404,34 @@ template LimitOrder
         checkOrderAccount key vault instrument factory buyer buyerBalance
         checkOrderAccount key vault instrument factory owner sellerBalance
         cash <- case buy.backing of CashEscrow cid -> pure cid; _ -> abort "Buy must have cash escrow"
-        let originalCash = buy.price * intToDecimal buy.quantity
+        funding <- checkedFee (Fees.buyFunding buy.feeTerms (buyFeeState buy))
+        buyMovement <- checkedFee (Fees.buyFillFunding buy.feeTerms (buyFeeState buy)
+          plan.price plan.quantity (plan.takerId == buy.orderId))
+        sellMovement <- checkedFee (Fees.sellFillFunding feeTerms takerNotional paidFee
+          plan.sellerProceeds (plan.takerId == orderId))
+        -- Policy and template guards already restrict orders to zero bps. Keep
+        -- settlement fail-closed too: removing a placement guard alone must not
+        -- debit a fee before a separately backed collection pool exists.
+        assertMsg "Nonzero settlement fees require atomic collection support"
+          (buyMovement.feeCharged == 0.0 && sellMovement.accrual.charge == 0.0)
+        assertMsg "Fee movement must agree with the verified fill gross"
+          (buyMovement.tradeCost == plan.sellerProceeds && sellMovement.netProceeds == plan.sellerProceeds)
+        let originalCash = funding.totalEscrow
         total <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") [cash]
         assertMsg "Buy escrow amount is incorrect" (total == originalCash)
         -- Seller's account consumes the buy escrow AND its own backing. Its
         -- available credit rises only by proceeds; all change still belongs to
         -- this buy. Example: 3.00 escrow minus 1.20 proceeds leaves 1.80.
         paid <- exercise sellerBalance AssetBalance_Repartition with
-          otherCash = Some cash; otherAmount = originalCash; delta = plan.sellerProceeds; extraArgs
-        let afterPayment = originalCash - plan.sellerProceeds
-        (nextBuyerBalance, remainingCash) <- if plan.buyerRefund > 0.0 then do
+          otherCash = Some cash; otherAmount = originalCash; delta = sellMovement.netProceeds; extraArgs
+        let afterPayment = originalCash - sellMovement.netProceeds
+        (nextBuyerBalance, remainingCash) <- if buyMovement.refund > 0.0 then do
           refunded <- exercise buyerBalance AssetBalance_Repartition with
-            otherCash = paid.otherCash; otherAmount = afterPayment; delta = plan.buyerRefund; extraArgs
+            otherCash = paid.otherCash; otherAmount = afterPayment; delta = buyMovement.refund; extraArgs
           pure (refunded.balance, refunded.otherCash)
           else pure (buyerBalance, paid.otherCash)
         left <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") (optionalHoldings remainingCash)
-        assertMsg "Remaining buy escrow is incorrect" (left == plan.buyerEscrowRemaining)
+        assertMsg "Remaining buy escrow is incorrect" (left == buyMovement.funding.totalEscrow)
         -- The inner sell has buyer authority as an explicit controller and
         -- seller authority from this signed contract. Free balances are only
         -- credited. Both outcome delivery and partial orders use those owners.
@@ -425,10 +443,16 @@ template LimitOrder
           pure None
           else do
             backingCash <- case remainingCash of Some cid -> pure cid; None -> abort "Partial buy requires escrow"
-            cid <- create buy with quantity = plan.buyerRemaining; backing = CashEscrow backingCash
+            cid <- create buy with
+              quantity = plan.buyerRemaining; backing = CashEscrow backingCash
+              takerNotional = buyMovement.nextState.takerNotional
+              paidFee = buyMovement.nextState.paidFee
             pure (Some cid)
         sellRemainder <- if plan.sellerRemaining == 0 then pure None else do
-          cid <- create this with quantity = plan.sellerRemaining
+          cid <- create this with
+            quantity = plan.sellerRemaining
+            takerNotional = sellMovement.accrual.takerNotional
+            paidFee = sellMovement.accrual.paidFee
           pure (Some cid)
         refs <- mapA referenceFor (optionalHoldings buyRemainder ++ optionalHoldings sellRemainder)
         exercise book Archive
@@ -488,7 +512,8 @@ releaseBacking order balance extraArgs = do
     CashEscrow cash -> do
       account <- case balance of Some cid -> pure cid; None -> abort "Buy cancellation requires its owner's account"
       checkOrderAccount order.key order.vault order.instrument order.factory order.owner account
-      let amount = order.price * intToDecimal order.quantity
+      funding <- checkedFee (Fees.buyFunding order.feeTerms (buyFeeState order))
+      let amount = funding.totalEscrow
       total <- holdingTotal (H.InstrumentId order.instrument.admin order.instrument.id) (H.Account (Some order.vault) None "") [cash]
       assertMsg "Buy escrow amount is incorrect" (total == amount)
       partition <- exercise account AssetBalance_Repartition with
@@ -604,3 +629,29 @@ checkFeeQuote book policy expectedRevision expectedTerms = do
   assertMsg "Nonzero fees require funded escrow and collection support"
     (actual.takerFeeBps == 0)
   pure actual
+
+-- | Inputs: signed buy order. Result: the arithmetic view of its immutable
+-- original size, current size/limit and cumulative taker history. Never rebuild
+-- originalQuantity from a partial remainder: that loses the bound on past fills.
+buyFeeState : LimitOrder -> Fees.BuyFeeState
+buyFeeState order = Fees.BuyFeeState order.originalQuantity order.quantity order.price order.takerNotional order.paidFee
+
+-- | Inputs: proposed signed order state. Result: whether its bounded history is
+-- possible. Sellers can execute above their own limit, so their bound is filled
+-- contracts times the maximum one-unit payout, not their sell limit. Buys have
+-- the stricter limit-price bound enforced by buyFunding. History must respect
+-- asset precision. paidFee remains zero under this milestone's zero-rate guard.
+validOrderFeeHistory : LimitOrder -> Bool
+validOrderFeeHistory order =
+  order.originalQuantity >= order.quantity && order.takerNotional >= 0.0 &&
+  order.takerNotional <= intToDecimal (order.originalQuantity - order.quantity) &&
+  order.paidFee == 0.0 &&
+  Numeric.roundNumeric order.feeTerms.assetDecimals Numeric.RoundingDown order.takerNotional == order.takerNotional &&
+  (case order.side of
+    Sell -> True
+    Buy -> case Fees.buyFunding order.feeTerms (buyFeeState order) of Right _ -> True; Left _ -> False)
+
+-- | Inputs: a checked fee-helper result. Errors: propagate its validation error
+-- as a transaction abort. Result: validated funding/movement; no ledger effect.
+checkedFee : Either Text a -> Update a
+checkedFee value = case value of Right result -> pure result; Left message -> abort message

@@ -35,8 +35,9 @@ terms. Every indexed contract is fetched and checked against its reference,
 market, vault, asset and factory. The planner then recomputes best-price/FIFO;
 the caller cannot submit a price or fill quantity to override it.
 
-The selected buy's actual holding must equal its limit price times remaining
-quantity. Both accounts must belong to the correct traders and the same
+The selected buy's actual holding must equal `buyFunding.totalEscrow` from its
+signed original/remaining quantity and taker history. With the current zero-rate
+gate this equals limit price times remaining quantity. Both accounts must belong to the correct traders and the same
 operator, vault, asset, protocol and pinned factory.
 
 ## Cash and position changes
@@ -140,7 +141,7 @@ fault-injecting registry and `daml-script`.
 
 ## Verification
 
-`make DPM="$PWD/target/tools/dpm" test` passes 122 Daml scripts, including 20
+`make DPM="$PWD/target/tools/dpm" test` passes 128 Daml scripts, including 20
 settlement scripts, plus four Python dependency checks. Production DAR validation
 passes with 38 packages.
 

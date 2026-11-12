@@ -1,0 +1,116 @@
+-- | Signed order history and funding integration, using actual registry cash.
+-- All ledger orders still have zero bps. Nonzero budgets/rounding remain covered
+-- by FeesTest; these scripts do not claim fee collection is deployed or enabled.
+module Outcomia.FeeEscrowTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import Outcomia.Orders
+import Outcomia.OrdersTest qualified as O
+import Outcomia.Positions
+import Outcomia.SettlementTest qualified as S
+import Outcomia.TokenHarness
+import Outcomia.Types
+
+-- | Inputs: fixture and successor book. Errors: anything except one remainder.
+-- Result: its live reference and signed order, for history/backing assertions.
+remainingOrder : S.Fixture -> ContractId OrderBook -> Script (OrderReference, LimitOrder)
+remainingOrder f book = do
+  index <- O.loadBook f.orders book
+  case index.orders of
+    [ref] -> do
+      value <- O.loadOrder f.orders ref.order
+      pure (ref, value)
+    _ -> abort "Expected exactly one partial order"
+
+testNewOrdersInitializeImmutableSizeAndZeroHistory : Script ()
+testNewOrdersInitializeImmutableSizeAndZeroHistory = script do
+  f <- S.setup Good
+  placed <- S.cross f True Yes 0.6 5 0.4 3
+  buy <- O.loadOrder f.orders placed.buy
+  sell <- O.loadOrder f.orders placed.sell
+  assert (buy.originalQuantity == 5 && buy.quantity == 5 && buy.takerNotional == 0.0 && buy.paidFee == 0.0)
+  assert (sell.originalQuantity == 3 && sell.quantity == 3 && sell.takerNotional == 0.0 && sell.paidFee == 0.0)
+  S.assertConserved f placed.book
+
+testBuyTakerHistoryAndCancellationRefund : Script ()
+testBuyTakerHistoryAndCancellationRefund = script do
+  f <- S.setup Good
+  placed <- S.cross f True Yes 0.6 5 0.4 3
+  result <- S.match f placed Yes
+  (ref, remaining) <- remainingOrder f result.book
+  assert (remaining.side == Buy && remaining.originalQuantity == 5 && remaining.quantity == 2 &&
+    remaining.takerNotional == 1.2 && remaining.paidFee == 0.0)
+  (buyer, _) <- S.resultAccounts result
+  account <- S.loadBalance f buyer
+  assert (account.available == 2.6)
+  -- 3.00 locked = 1.20 trade + 0.60 improvement + 1.20 remaining escrow.
+  cancelled <- O.cancel f.orders result.book ref.order (Some buyer)
+  restored <- O.requireReleasedBalance cancelled
+  final <- S.loadBalance f restored
+  assert (final.available == 3.8)
+  S.assertConserved f cancelled.book
+
+testSellTakerUsesExecutionPriceAboveItsOwnLimit : Script ()
+testSellTakerUsesExecutionPriceAboveItsOwnLimit = script do
+  f <- S.setup Good
+  placed <- S.cross f False No 0.6 1 0.4 3
+  result <- S.match f placed No
+  (_, remaining) <- remainingOrder f result.book
+  -- The older buy executes at .60; a .40 sell limit is not a bound on earned
+  -- taker notional. A buy-style history bound would incorrectly reject this.
+  assert (remaining.side == Sell && remaining.originalQuantity == 3 && remaining.quantity == 2 &&
+    remaining.price == 0.4 && remaining.takerNotional == 0.6 && remaining.paidFee == 0.0)
+  (_, seller) <- S.resultAccounts result
+  account <- S.loadBalance f seller
+  assert (account.available == 2.6)
+  S.assertConserved f result.book
+
+testBuyChangingFromTakerToMakerKeepsCumulativeHistory : Script ()
+testBuyChangingFromTakerToMakerKeepsCumulativeHistory = script do
+  f <- S.setup Good
+  placed <- S.cross f True Yes 0.6 5 0.4 1
+  first <- S.match f placed Yes
+  (buyRef, afterTaker) <- remainingOrder f first.book
+  assert (afterTaker.takerNotional == 0.4 && afterTaker.quantity == 4)
+  let c = f.orders.positions.custody
+  lots <- query @PositionLot c.vault
+  available <- case [cid | (cid, lot) <- lots, lot.owner == c.asset.bob] of
+    [cid] -> pure cid
+    _ -> abort "Expected seller's available outcome lot"
+  ask <- S.placeSell f first.book [available] Yes 0.5 1
+  (buyer, seller) <- S.resultAccounts first
+  second <- S.match f (S.Crossed ask.book buyRef.order ask.order buyer seller) Yes
+  (_, afterMaker) <- remainingOrder f second.book
+  assert (afterMaker.originalQuantity == 5 && afterMaker.quantity == 3 &&
+    afterMaker.takerNotional == 0.4 && afterMaker.paidFee == 0.0 &&
+    afterMaker.orderId == afterTaker.orderId && afterMaker.feeTerms == afterTaker.feeTerms)
+  S.assertConserved f second.book
+
+testMalformedBuyHistoryCannotBecomeSignedOrder : Script ()
+testMalformedBuyHistoryCannotBecomeSignedOrder = script do
+  f <- S.setup Good
+  placed <- S.cross f True Yes 0.6 5 0.4 3
+  result <- S.match f placed Yes
+  (_, remaining) <- remainingOrder f result.book
+  let c = f.orders.positions.custody
+  -- Grant both signers deliberately: rejection must come from state validation,
+  -- not missing authority. None of these creates consumes the valid order.
+  forA_ [(remaining with originalQuantity = 2), (remaining with quantity = 6),
+         (remaining with takerNotional = -0.1), (remaining with takerNotional = 1.9),
+         (remaining with takerNotional = 1.2000001), (remaining with paidFee = 0.1)] (\bad ->
+    submitMustFail [c.asset.alice, c.vault] do createCmd bad)
+  S.assertConserved f result.book
+
+testMalformedSellHistoryCannotBecomeSignedOrder : Script ()
+testMalformedSellHistoryCannotBecomeSignedOrder = script do
+  f <- S.setup Good
+  placed <- S.cross f False Yes 0.6 1 0.4 3
+  result <- S.match f placed Yes
+  (_, remaining) <- remainingOrder f result.book
+  let c = f.orders.positions.custody
+  forA_ [(remaining with originalQuantity = 2), (remaining with quantity = 4),
+         (remaining with takerNotional = -0.1), (remaining with takerNotional = 1.1),
+         (remaining with takerNotional = 0.6000001), (remaining with paidFee = -0.1)] (\bad ->
+    submitMustFail [c.asset.bob, c.vault] do createCmd bad)
+  S.assertConserved f result.book
