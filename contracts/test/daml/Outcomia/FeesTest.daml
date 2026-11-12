@@ -1,0 +1,149 @@
+-- | Pure fee-helper tests. Fraction-generated vectors are independent expected
+-- values; conservation grids do not stand in for real escrow/registry tests.
+-- Existing settlement tests still exercise the unchanged zero-fee ledger path.
+module Outcomia.FeesTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import Outcomia.Fees qualified as F
+import Outcomia.FeeVectors (feeVectors)
+
+terms : F.FeeTerms
+terms = F.FeeTerms 25 6
+
+initial : F.BuyFeeState
+initial = F.BuyFeeState 5 5 0.60 0.0 0.0
+
+require : Either Text a -> Script a
+require value = case value of Right result -> pure result; Left message -> abort message
+
+reject : Either Text a -> Script ()
+reject value = case value of Left _ -> pure (); Right _ -> abort "Expected invalid fee state rejection"
+
+testExactRationalVectors : Script ()
+testExactRationalVectors = script do
+  assert (length feeVectors == 308)
+  forA_ feeVectors (\(decimals, bps, notional, expected) ->
+    assert (F.cumulativeFee (F.FeeTerms bps decimals) notional == Right expected))
+
+testBuyWorkedExample : Script ()
+testBuyWorkedExample = script do
+  old <- require (F.buyFunding terms initial)
+  assert (old.tradeReserve == 3.0 && old.feeReserve == 0.0075 && old.totalEscrow == 3.0075)
+  filled <- require (F.buyFillFunding terms initial 0.40 3 True)
+  assert (filled.tradeCost == 1.20 && filled.feeCharged == 0.003)
+  assert (filled.priceImprovement == 0.60 && filled.feeBudgetReleased == 0.0015 && filled.refund == 0.6015)
+  assert (filled.funding.tradeReserve == 1.20 && filled.funding.feeReserve == 0.003 && filled.funding.totalEscrow == 1.203)
+  assert (filled.nextState.originalQuantity == 5 && filled.nextState.remainingQuantity == 2 && filled.nextState.takerNotional == 1.20 && filled.nextState.paidFee == 0.003)
+
+testPriorRoundingCarryRemainsFunded : Script ()
+testPriorRoundingCarryRemainsFunded = script do
+  let partial = F.BuyFeeState 2 1 0.0002 0.0002 0.0
+  budget <- require (F.buyFunding terms partial)
+  -- F(remaining trade cost) is zero, but the next fill owes one quantum.
+  naive <- require (F.cumulativeFee terms 0.0002)
+  assert (naive == 0.0 && budget.feeReserve == 0.000001)
+  filled <- require (F.buyFillFunding terms partial 0.0002 1 True)
+  assert (filled.feeCharged == 0.000001 && filled.refund == 0.0 && filled.funding.totalEscrow == 0.0)
+
+testMakerReleasesBudgetWithoutChangingHistory : Script ()
+testMakerReleasesBudgetWithoutChangingHistory = script do
+  let partial = F.BuyFeeState 2 1 0.0002 0.0002 0.0
+  filled <- require (F.buyFillFunding terms partial 0.0002 1 False)
+  assert (filled.feeCharged == 0.0 && filled.priceImprovement == 0.0 && filled.refund == 0.000001)
+  assert (filled.nextState.takerNotional == partial.takerNotional && filled.nextState.paidFee == partial.paidFee)
+
+testMixedMakerTakerContinuation : Script ()
+testMixedMakerTakerContinuation = script do
+  first <- require (F.buyFillFunding terms initial 0.40 3 True)
+  maker <- require (F.buyFillFunding terms first.nextState 0.60 1 False)
+  assert (maker.feeCharged == 0.0 && maker.refund == 0.0015 && maker.funding.feeReserve == 0.0015)
+  last <- require (F.buyFillFunding terms maker.nextState 0.50 1 True)
+  assert (last.feeCharged == 0.00125 && last.refund == 0.10025)
+  assert (last.nextState.takerNotional == 1.70 && last.nextState.paidFee == 0.00425 && last.funding.totalEscrow == 0.0)
+
+testSplitTakerFillsUseCumulativeRounding : Script ()
+testSplitTakerFillsUseCumulativeRounding = script do
+  first <- require (F.accrueFee terms 0.0 0.0 0.0002 True)
+  second <- require (F.accrueFee terms first.takerNotional first.paidFee 0.0002 True)
+  whole <- require (F.accrueFee terms 0.0 0.0 0.0004 True)
+  assert (first.charge == 0.0 && second.charge == 0.000001 && first.charge + second.charge == whole.charge)
+  maker <- require (F.accrueFee terms second.takerNotional second.paidFee 0.20 False)
+  assert (maker.charge == 0.0 && maker.takerNotional == second.takerNotional && maker.paidFee == second.paidFee)
+
+testSellerNetAndZeroNetCatchup : Script ()
+testSellerNetAndZeroNetCatchup = script do
+  taker <- require (F.sellFillFunding terms 0.0 0.0 1.80 True)
+  maker <- require (F.sellFillFunding terms 0.0 0.0 1.80 False)
+  assert (taker.accrual.charge == 0.0045 && taker.netProceeds == 1.7955)
+  assert (maker.accrual.charge == 0.0 && maker.netProceeds == 1.80)
+  catchup <- require (F.sellFillFunding (F.FeeTerms 1000 2) 0.09 0.0 0.01 True)
+  assert (catchup.accrual.charge == 0.01 && catchup.netProceeds == 0.0)
+
+testZeroFeesStillValidateAndReturnImprovement : Script ()
+testZeroFeesStillValidateAndReturnImprovement = script do
+  filled <- require (F.buyFillFunding (F.FeeTerms 0 6) initial 0.40 3 True)
+  assert (filled.feeCharged == 0.0 && filled.funding.feeReserve == 0.0 && filled.refund == 0.60 && filled.funding.totalEscrow == 1.20)
+  reject (F.buyFillFunding (F.FeeTerms 0 6) initial 0.4000000001 1 True)
+
+testInvalidTermsAndNotionalBounds : Script ()
+testInvalidTermsAndNotionalBounds = script do
+  forA_ [F.FeeTerms (-1) 6, F.FeeTerms 1001 6, F.FeeTerms 25 (-1), F.FeeTerms 25 11, F.FeeTerms 25 37] (\bad -> reject (F.cumulativeFee bad 1.0))
+  forA_ [-0.0000000001, 9223372036854775807.0000000001, 9999999999999999999999999999.9999999999] (\bad -> reject (F.cumulativeFee terms bad))
+  reject (F.accrueFee terms 9223372036854775807.0 23058430092136939.5175 1.0 True)
+
+testInvalidAccrualStateAndQuantum : Script ()
+testInvalidAccrualStateAndQuantum = script do
+  reject (F.accrueFee terms 0.0002 0.000001 0.0002 True)
+  reject (F.accrueFee terms 0.0 (-0.000001) 0.20 True)
+  reject (F.accrueFee terms 0.0000001 0.0 0.20 True)
+  forA_ [0.0, -1.0, 0.0000001, 9223372036854775808.0, 9999999999999999999999999999.9999999999] (\bad -> reject (F.accrueFee terms 0.0 0.0 bad True))
+
+testInvalidBuyStateAndFill : Script ()
+testInvalidBuyStateAndFill = script do
+  forA_ [(initial with originalQuantity = 0), (initial with remainingQuantity = -1),
+         (initial with remainingQuantity = 6), (initial with limitPrice = 0.0),
+         (initial with limitPrice = 1.0), (initial with takerNotional = 0.20),
+         (initial with paidFee = 0.001),
+         (F.BuyFeeState 1 0 0.1234567891 0.0 0.0)] (\bad -> reject (F.buyFunding terms bad))
+  forA_ [0, -1, 6] (\quantity -> reject (F.buyFillFunding terms initial 0.40 quantity True))
+  forA_ [0.0, -0.1, 0.70, 0.4000000001] (\price -> reject (F.buyFillFunding terms initial price 1 True))
+  reject (F.buyFillFunding terms initial 0.40 1 False)
+
+testWholeUnitAssetRequiresTransferableLots : Script ()
+testWholeUnitAssetRequiresTransferableLots = script do
+  let coarse = F.FeeTerms 1000 0
+  budget <- require (F.buyFunding coarse (F.BuyFeeState 100 100 0.01 0.0 0.0))
+  assert (budget.tradeReserve == 1.0 && budget.totalEscrow == 1.0)
+  reject (F.buyFunding coarse (F.BuyFeeState 1 1 0.01 0.0 0.0))
+
+testMaximumQuantityDoesNotScaleIntoInt64 : Script ()
+testMaximumQuantityDoesNotScaleIntoInt64 = script do
+  let largest = F.BuyFeeState 9223372036854775807 9223372036854775807 0.9999999999 0.0 0.0
+  let precise = F.FeeTerms 1000 10
+  budget <- require (F.buyFunding precise largest)
+  assert (budget.totalEscrow > 9223372036854775807.0)
+  filled <- require (F.buyFillFunding precise largest 0.0000000001 9223372036854775807 True)
+  assert (filled.funding.totalEscrow == 0.0 && filled.nextState.remainingQuantity == 0)
+  assert (filled.tradeCost == 922337203.6854775807 && filled.feeCharged == 92233720.3685477580)
+
+testConservationGridAndCancellationBudget : Script ()
+testConservationGridAndCancellationBudget = script do
+  forA_ [0..10] (\decimals ->
+    forA_ [0, 1, 25, 1000] (\bps ->
+      forA_ [0.20, 0.50, 0.80] (\limit ->
+        forA_ [1, 2, 5] (\lots ->
+          forA_ [True, False] (\isTaker -> do
+            let lot = 10 ^ max 0 (2 - decimals)
+            let quantity = lots * lot
+            let state = F.BuyFeeState quantity quantity limit 0.0 0.0
+            let config = F.FeeTerms bps decimals
+            old <- require (F.buyFunding config state)
+            filled <- require (F.buyFillFunding config state (if isTaker then limit / 2.0 else limit) lot isTaker)
+            assert (filled.refund >= 0.0 && filled.feeBudgetReleased >= 0.0)
+            -- If cancelled now, the whole successor escrow is returned. The
+            -- equation includes earned fees once and leaves no hidden balance.
+            assert (old.totalEscrow == filled.tradeCost + filled.feeCharged + filled.refund + filled.funding.totalEscrow)
+            assert (filled.nextState.remainingQuantity == quantity - lot)
+            assert (isTaker || filled.feeCharged == 0.0)
+          )))))

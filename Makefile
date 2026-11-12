@@ -14,4 +14,6 @@ build: deps
 
 test: build
 	python3 -m unittest discover -s scripts -p '*_test.py'
+	python3 scripts/check-fee-policy.py
+	python3 scripts/generate-fee-vectors.py --check
 	cd contracts/test && "$(DPM)" test --show-coverage --junit "$(REPO_ROOT)/target/contracts-junit.xml"
