@@ -3,8 +3,9 @@
 This checkpoint added Daml contracts for draft creation, opening and administrative
 closure. [Transfers](collateral-transfers.md), [balances](collateral-custody.md)
 and [complete sets](complete-set-positions.md) are separate contract modules.
-[Resting orders](binary-limit-orders.md) add funding/cancellation; matching,
-resolution and payouts remain unimplemented. The
+[Resting orders](binary-limit-orders.md) add funding/cancellation and
+[atomic matching](binary-settlement.md) settles one pair. Resolution and payouts
+remain unimplemented. The
 shared frontend must keep showing `Market deployment pending` until a deployment
 and wallet-to-ledger integration are verified.
 
@@ -20,7 +21,8 @@ flowchart LR
 
 `Protocol` is signed by the operator and observed by its admins. Only the operator
 can replace the admin list. The operator must remain an admin. Lists are limited
-to 64 unique parties.
+to 64 unique parties. The protocol also carries the operator-controlled taker
+rate and fee revision; see [fee accounting](fee-accounting.md).
 
 An active admin exercises `Protocol_CreateBinary` as the creator. The transaction
 consumes the old protocol revision, advances its market counter and creates a

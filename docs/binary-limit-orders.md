@@ -23,7 +23,8 @@ flowchart LR
 A buy for 3 YES at 0.40 locks exactly 1.20 collateral in a separate vault holding.
 The available balance falls by 1.20. Both old backing and account revisions are
 consumed in that transaction. An empty account has no holding; it can still
-receive a cancellation refund. Fees are not implemented in this checkpoint.
+receive a cancellation refund. Orders snapshot the approved fee terms, but only
+zero-rate placement is enabled until fee funding and collection are complete.
 
 A sell for 3 YES consumes the supplied position lots and records 3 YES inside
 the signed order. Remaining YES and all NO return in one available lot. The
@@ -57,6 +58,9 @@ division rounding accepting a price just off tick, such as 0.4000000001 on a
 still be an active admin to initialize its book. The supplied reserve and market
 must agree on vault, namespace, ID, creator and immutable terms. Initialization
 is allowed before cutoff in Draft or Open state; placement requires Open.
+The creator also supplies an operator-approved asset admission matching the
+reserve asset/factory. The book pins its settlement precision and rejects
+`priceTick × quantityLot` that cannot settle in those units.
 
 The configured registry lineage creates one book per market ID. Its index is
 limited to 1,024 IDs. Deployments must pin this root alongside the account and
@@ -68,6 +72,13 @@ Each accepted order gets a monotonically increasing ID. Cancellation removes a
 reference but does not reset that counter. IDs are unique within this configured
 book lineage, not across all markets or deployments. Sequence exhaustion blocks
 new placement without blocking cancellation.
+
+## Fee approval
+
+Each buy/sell supplies the current protocol ID and expected fee revision, rate
+and asset precision. A changed or archived approval rejects before escrow.
+Only the operator changes the rate; orders and partial successors retain their
+original snapshot. New nonzero-rate orders are blocked. See [fee accounting](fee-accounting.md).
 
 ## Cancellation
 

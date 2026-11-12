@@ -1,0 +1,231 @@
+-- | Policy tests use real harness holdings. Negative placement must leave the
+-- book sequence, free cash and outcome lots intact, not merely return an error.
+module Outcomia.FeePolicyTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import Outcomia.Binary
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Fees qualified as Fees
+import Outcomia.Orders
+import Outcomia.OrdersTest qualified as O
+import Outcomia.PositionsTest qualified as P
+import Outcomia.SettlementTest qualified as S
+import Outcomia.TokenHarness
+import Outcomia.Types
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+
+-- | Inputs: operator fixture and current protocol revision. Result: revised ID.
+-- No trader or vault authority participates in a rate change.
+setRate : O.Fixture -> ContractId Protocol -> Int -> Script (ContractId Protocol)
+setRate f policy rate = submit f.positions.custody.asset.operator do
+  exerciseCmd policy Protocol_SetTakerFee with replacementFeeBps = rate
+
+-- | Inputs: live account/book and the exact quote the owner approved. Result:
+-- buy placement, or a failed submission before escrow if that quote is stale.
+quotedBuy : O.Fixture -> ContractId Protocol -> Int -> Fees.FeeTerms -> Script PlacementResult
+quotedBuy f policy revision terms = do
+  let a = f.positions.custody.asset
+  submit (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.book OrderBook_PlaceBuy with
+      owner = a.alice; market = f.positions.market; balance = f.positions.balance
+      outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
+      feePolicy = policy; expectedFeeRevision = revision; expectedFeeTerms = terms
+
+testPolicyDefaultsAndOperatorOnlyUpdates : Script ()
+testPolicyDefaultsAndOperatorOnlyUpdates = script do
+  f <- O.setup Good 1
+  let a = f.positions.custody.asset
+  initial <- queryContractId a.operator f.positions.protocol
+  value <- case initial of Some p -> pure p; None -> abort "Missing protocol"
+  assert (value.takerFeeBps == 0 && value.feeRevision == 0)
+  forA_ [a.alice, a.bob, f.positions.custody.vault] (\caller ->
+    submitMustFail (actAs caller <> readAs a.operator) do
+      exerciseCmd f.positions.protocol Protocol_SetTakerFee with replacementFeeBps = 25)
+  forA_ [-1, 1001] (\rate -> submitMustFail a.operator do
+    exerciseCmd f.positions.protocol Protocol_SetTakerFee with replacementFeeBps = rate)
+  high <- setRate f f.positions.protocol 1000
+  current <- queryContractId a.operator high
+  changed <- case current of Some p -> pure p; None -> abort "Missing updated policy"
+  assert (changed.takerFeeBps == 1000 && changed.feeRevision == 1 &&
+    changed.admins == value.admins && changed.nextMarketId == value.nextMarketId)
+  zero <- setRate f high 0
+  final <- queryContractId a.operator zero
+  assert (fmap (\p -> (p.takerFeeBps, p.feeRevision)) final == Some (0, 2))
+
+testPolicyRevisionExhaustion : Script ()
+testPolicyRevisionExhaustion = script do
+  f <- O.setup Good 1
+  let a = f.positions.custody.asset
+  found <- queryContractId a.operator f.positions.protocol
+  current <- case found of Some p -> pure p; None -> abort "Missing protocol"
+  exhausted <- submit a.operator do createCmd (current with feeRevision = 9223372036854775807)
+  submitMustFail a.operator do exerciseCmd exhausted Protocol_SetTakerFee with replacementFeeBps = 0
+
+testStaleRevisionAndChangedQuoteRejectWithoutSpending : Script ()
+testStaleRevisionAndChangedQuoteRejectWithoutSpending = script do
+  f <- O.setup Good 1
+  let a = f.positions.custody.asset
+  next <- setRate f f.positions.protocol 0
+  -- The old CID is archived even though the numerical rate stayed zero.
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.book OrderBook_PlaceBuy with
+      owner = a.alice; market = f.positions.market; balance = f.positions.balance
+      outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
+      feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
+  forA_ [(0, Fees.FeeTerms 0 6), (1, Fees.FeeTerms 25 6), (1, Fees.FeeTerms 0 10)] (\(revision, terms) ->
+    submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+      exerciseCmd f.book OrderBook_PlaceBuy with
+        owner = a.alice; market = f.positions.market; balance = f.positions.balance
+        outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
+        feePolicy = next; expectedFeeRevision = revision; expectedFeeTerms = terms)
+  O.assertConserved f f.book f.positions.reserve f.positions.balance
+  accepted <- quotedBuy f next 1 (Fees.FeeTerms 0 6)
+  order <- O.loadOrder f accepted.order
+  assert (order.orderId == 1 && order.feeRevision == 1 && order.feeTerms == Fees.FeeTerms 0 6)
+
+testForeignPoliciesReject : Script ()
+testForeignPoliciesReject = script do
+  f <- O.setup Good 1
+  let a = f.positions.custody.asset
+  wrongName <- submit a.operator do
+    createCmd Protocol with operator = a.operator; protocolName = "other"; admins = [a.operator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  wrongOperator <- submit a.bob do
+    createCmd Protocol with operator = a.bob; protocolName = "outcomia"; admins = [a.bob, a.alice]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  forA_ [wrongName, wrongOperator] (\policy ->
+    submitMustFail (actAs a.alice <> readAs [a.operator, a.bob, a.issuer]) do
+      exerciseCmd f.book OrderBook_PlaceBuy with
+        owner = a.alice; market = f.positions.market; balance = f.positions.balance
+        outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
+        feePolicy = policy; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)
+  O.assertConserved f f.book f.positions.reserve f.positions.balance
+
+testNonzeroRateBlocksBothSidesAndPreservesBacking : Script ()
+testNonzeroRateBlocksBothSidesAndPreservesBacking = script do
+  f <- O.setup Good 1
+  let a = f.positions.custody.asset
+  split <- P.split f.positions f.positions.reserve f.positions.balance 2
+  high <- setRate f f.positions.protocol 25
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.book OrderBook_PlaceBuy with
+      owner = a.alice; market = f.positions.market; balance = split.balance
+      outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
+      feePolicy = high; expectedFeeRevision = 1; expectedFeeTerms = Fees.FeeTerms 25 6
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.book OrderBook_PlaceSell with
+      owner = a.alice; market = f.positions.market; positions = [split.position]
+      outcome = Yes; price = 0.4; quantity = 1
+      feePolicy = high; expectedFeeRevision = 1; expectedFeeTerms = Fees.FeeTerms 25 6
+  O.assertConserved f f.book split.reserve split.balance
+  index <- O.loadBook f f.book
+  lot <- P.loadLot f.positions split.position
+  assert (index.nextOrderId == 1 && null index.orders && lot.yes == 2 && lot.no == 2)
+
+testExistingOrdersSettleAndPartialSnapshotsSurviveUpdate : Script ()
+testExistingOrdersSettleAndPartialSnapshotsSurviveUpdate = script do
+  f <- S.setup Good
+  placed <- S.cross f True Yes 0.6 5 0.4 3
+  _ <- setRate f.orders f.orders.positions.protocol 25
+  result <- S.match f placed Yes
+  index <- O.loadBook f.orders result.book
+  case index.orders of
+    [ref] -> do
+      remaining <- O.loadOrder f.orders ref.order
+      assert (remaining.quantity == 2 && remaining.feeRevision == 0 && remaining.feeTerms == Fees.FeeTerms 0 6)
+    _ -> abort "Expected one partial buy"
+  S.assertConserved f result.book
+
+testCancellationStillWorksAfterRateUpdate : Script ()
+testCancellationStillWorksAfterRateUpdate = script do
+  f <- O.setup Good 1
+  placed <- O.buy f f.book f.positions.balance Yes 0.4 3
+  balance <- O.requireBalance placed
+  _ <- setRate f f.positions.protocol 25
+  result <- O.cancel f placed.book placed.order (Some balance)
+  restored <- O.requireReleasedBalance result
+  O.assertConserved f result.book f.positions.reserve restored
+  account <- C.loadAccount f.positions.custody restored
+  assert (account.available == 5.0)
+
+testAdmissionPrecisionBounds : Script ()
+testAdmissionPrecisionBounds = script do
+  f <- O.setup Good 1
+  let a = f.positions.custody.asset
+  forA_ [-1, 11] (\precision -> submitMustFail (actAs a.operator <> readAs a.issuer) do
+    exerciseCmd f.positions.protocol Protocol_ApproveAsset with
+      instrument = a.instrument; factory = toInterfaceContractId @T.TransferFactory a.registry; assetDecimals = precision)
+  forA_ [0, 10] (\precision -> do
+    cid <- submit (actAs a.operator <> readAs a.issuer) do
+      exerciseCmd f.positions.protocol Protocol_ApproveAsset with
+        instrument = a.instrument; factory = toInterfaceContractId @T.TransferFactory a.registry; assetDecimals = precision
+    admission <- queryContractId a.operator cid
+    assert (fmap (\value -> value.assetDecimals) admission == Some precision))
+
+testBookRejectsUnsettleableTickAndPinsExistingPrecision : Script ()
+testBookRejectsUnsettleableTickAndPinsExistingPrecision = script do
+  f <- O.setup Good 1
+  let a = f.positions.custody.asset
+  let vault = f.positions.custody.vault
+  zero <- submit (actAs a.operator <> readAs a.issuer) do
+    exerciseCmd f.positions.protocol Protocol_ApproveAsset with
+      instrument = a.instrument; factory = toInterfaceContractId @T.TransferFactory a.registry; assetDecimals = 0
+  fresh <- submit [a.operator, vault] do
+    createCmd OrderRegistry with operator = a.operator; vault; protocolName = "outcomia"; marketIds = []
+  submitMustFail a.operator do
+    exerciseCmd fresh OrderRegistry_CreateBook with
+      creator = a.operator; protocol = f.positions.protocol; market = f.positions.market; reserve = f.positions.reserve; admission = zero
+  -- Revoking/replacing admission does not change precision of the existing book.
+  submit a.operator do archiveCmd a.admission
+  placed <- O.buy f f.book f.positions.balance Yes 0.4 1
+  order <- O.loadOrder f placed.order
+  assert (order.feeTerms.assetDecimals == 6)
+
+-- A maker sell can outlive several taker buys; it keeps its original snapshot.
+testPartialSellSnapshotSurvivesUpdate : Script ()
+testPartialSellSnapshotSurvivesUpdate = script do
+  f <- S.setup Good
+  placed <- S.cross f True No 0.6 1 0.4 3
+  _ <- setRate f.orders f.orders.positions.protocol 25
+  result <- S.match f placed No
+  index <- O.loadBook f.orders result.book
+  case index.orders of
+    [ref] -> do
+      remaining <- O.loadOrder f.orders ref.order
+      assert (remaining.side == Sell && remaining.quantity == 2 &&
+        remaining.feeRevision == 0 && remaining.feeTerms == Fees.FeeTerms 0 6)
+    _ -> abort "Expected one partial sell"
+  S.assertConserved f result.book
+
+testSellQuoteMismatchDoesNotConsumePosition : Script ()
+testSellQuoteMismatchDoesNotConsumePosition = script do
+  f <- O.setup Good 1
+  let a = f.positions.custody.asset
+  split <- P.split f.positions f.positions.reserve f.positions.balance 2
+  forA_ [(1, Fees.FeeTerms 0 6), (0, Fees.FeeTerms 0 2), (0, Fees.FeeTerms 25 6)] (\(revision, terms) ->
+    submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+      exerciseCmd f.book OrderBook_PlaceSell with
+        owner = a.alice; market = f.positions.market; positions = [split.position]
+        outcome = Yes; price = 0.4; quantity = 1
+        feePolicy = f.positions.protocol; expectedFeeRevision = revision; expectedFeeTerms = terms)
+  O.assertConserved f f.book split.reserve split.balance
+  placed <- O.sell f f.book [split.position] Yes 0.4 1
+  value <- O.loadOrder f placed.order
+  assert (value.orderId == 1 && value.feeTerms == Fees.FeeTerms 0 6)
+
+-- Fractional prices are valid even with whole-unit cash if the lot makes each
+-- possible execution integral: 0.01 tick * 100 contracts = one collateral unit.
+testWholeUnitAssetAcceptsAlignedLot : Script ()
+testWholeUnitAssetAcceptsAlignedLot = script do
+  f <- O.setup Good 100
+  let a = f.positions.custody.asset
+  let vault = f.positions.custody.vault
+  zero <- submit (actAs a.operator <> readAs a.issuer) do
+    exerciseCmd f.positions.protocol Protocol_ApproveAsset with
+      instrument = a.instrument; factory = toInterfaceContractId @T.TransferFactory a.registry; assetDecimals = 0
+  fresh <- submit [a.operator, vault] do
+    createCmd OrderRegistry with operator = a.operator; vault; protocolName = "outcomia"; marketIds = []
+  (_, cid) <- submit a.operator do
+    exerciseCmd fresh OrderRegistry_CreateBook with
+      creator = a.operator; protocol = f.positions.protocol; market = f.positions.market; reserve = f.positions.reserve; admission = zero
+  value <- O.loadBook f cid
+  assert (value.assetDecimals == 0 && value.terms.priceTick == 0.01 && value.terms.quantityLot == 100)

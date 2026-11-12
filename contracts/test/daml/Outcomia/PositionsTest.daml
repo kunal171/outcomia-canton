@@ -366,11 +366,11 @@ testReserveInitializationBoundaries = script do
   (protocol, draft) <- submit a.operator do
     exerciseCmd f.protocol Protocol_CreateBinary with creator = a.operator; terms = termsFor a.issuer a.now
   wrongAsset <- submit (actAs a.operator <> readAs a.issuer) do
-    exerciseCmd protocol Protocol_ApproveAsset with instrument = CollateralInstrument a.issuer "other"; factory = toInterfaceContractId @T.TransferFactory a.registry
+    exerciseCmd protocol Protocol_ApproveAsset with instrument = CollateralInstrument a.issuer "other"; factory = toInterfaceContractId @T.TransferFactory a.registry; assetDecimals = 6
   submitMustFail a.operator do
     exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.operator; protocol; market = draft; admission = wrongAsset
   otherProtocol <- submit a.operator do
-    createCmd Protocol with operator = a.operator; protocolName = "other"; admins = [a.operator]; nextMarketId = 1
+    createCmd Protocol with operator = a.operator; protocolName = "other"; admins = [a.operator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
   submitMustFail a.operator do
     exerciseCmd f.registry PositionRegistry_CreateReserve with creator = a.operator; protocol = otherProtocol; market = draft; admission = a.admission
   otherNamespace <- submit [a.operator, f.custody.vault] do

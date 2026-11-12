@@ -16,7 +16,7 @@ setup () = script do
   outsider <- allocatePartyByHint (PartyIdHint "Outsider")
   now <- getTime
   protocol <- submit operator do
-    createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator, creator]; nextMarketId = 1
+    createCmd Protocol with operator; protocolName = "outcomia"; admins = [operator, creator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
   pure (operator, creator, outsider, protocol, (now, termsFor operator now))
 
 marketFor : Party -> ContractId BinaryMarket -> Script BinaryMarket
@@ -93,8 +93,8 @@ testWrongProtocolRejected : Script ()
 testWrongProtocolRejected = script do
   (operator, creator, outsider, protocol, (_, terms)) <- setup ()
   (next, draft) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
-  wrongOperator <- submit outsider do createCmd Protocol with operator = outsider; protocolName = "outcomia"; admins = [outsider, creator]; nextMarketId = 1
-  wrongName <- submit operator do createCmd Protocol with operator; protocolName = "other"; admins = [operator, creator]; nextMarketId = 1
+  wrongOperator <- submit outsider do createCmd Protocol with operator = outsider; protocolName = "outcomia"; admins = [outsider, creator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  wrongName <- submit operator do createCmd Protocol with operator; protocolName = "other"; admins = [operator, creator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
   submitMustFail creator do exerciseCmd draft Binary_Open with protocol = wrongOperator
   submitMustFail creator do exerciseCmd draft Binary_Open with protocol = wrongName
   _ <- submit creator do exerciseCmd draft Binary_Open with protocol = next

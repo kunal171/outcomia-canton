@@ -8,6 +8,7 @@ import DA.Foldable (forA_)
 import DA.List (unique)
 import DA.Time (addRelTime, seconds)
 import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.Fees qualified as Fees
 import Outcomia.Binary
 import Outcomia.Custody
 import Outcomia.CustodyTest qualified as C
@@ -59,7 +60,7 @@ placeSell : Fixture -> ContractId OrderBook -> [ContractId PositionLot] -> Outco
 placeSell f book positions outcome price quantity = do
   let a = f.orders.positions.custody.asset
   submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
-    exerciseCmd book OrderBook_PlaceSell with owner = a.bob; market = f.orders.positions.market; positions; outcome; price; quantity
+    exerciseCmd book OrderBook_PlaceSell with owner = a.bob; market = f.orders.positions.market; positions; outcome; price; quantity; feePolicy = f.orders.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
 
 cross : Fixture -> Bool -> Outcome -> Decimal -> Int -> Decimal -> Int -> Script Crossed
 cross f sellFirst outcome buyPrice buyQty sellPrice sellQty = do

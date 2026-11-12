@@ -4,6 +4,7 @@ module Outcomia.OrdersTest where
 
 import Daml.Script
 import DA.Foldable (forA_)
+import Outcomia.Fees qualified as Fees
 import Outcomia.Binary
 import Outcomia.Custody
 import Outcomia.CustodyTest qualified as C
@@ -27,16 +28,16 @@ setup mode lot = script do
   root <- submit [a.operator, positions.custody.vault] do
     createCmd OrderRegistry with operator = a.operator; vault = positions.custody.vault; protocolName = "outcomia"; marketIds = []
   (registry, book) <- submit a.operator do
-    exerciseCmd root OrderRegistry_CreateBook with creator = a.operator; protocol = positions.protocol; market = positions.market; reserve = positions.reserve
+    exerciseCmd root OrderRegistry_CreateBook with creator = a.operator; protocol = positions.protocol; market = positions.market; reserve = positions.reserve; admission = positions.custody.asset.admission
   pure Fixture with positions; registry; book
 
 buy : Fixture -> ContractId OrderBook -> ContractId AssetBalance -> Outcome -> Decimal -> Int -> Script PlacementResult
 buy f book balance outcome price quantity = submit (actAs f.positions.custody.asset.alice <> readAs [f.positions.custody.asset.operator, f.positions.custody.asset.issuer]) do
-  exerciseCmd book OrderBook_PlaceBuy with owner = f.positions.custody.asset.alice; market = f.positions.market; balance; outcome; price; quantity; extraArgs = C.registryContext
+  exerciseCmd book OrderBook_PlaceBuy with owner = f.positions.custody.asset.alice; market = f.positions.market; balance; outcome; price; quantity; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
 
 sell : Fixture -> ContractId OrderBook -> [ContractId PositionLot] -> Outcome -> Decimal -> Int -> Script PlacementResult
 sell f book positions outcome price quantity = submit (actAs f.positions.custody.asset.alice <> readAs [f.positions.custody.asset.operator, f.positions.custody.asset.issuer]) do
-  exerciseCmd book OrderBook_PlaceSell with owner = f.positions.custody.asset.alice; market = f.positions.market; positions; outcome; price; quantity
+  exerciseCmd book OrderBook_PlaceSell with owner = f.positions.custody.asset.alice; market = f.positions.market; positions; outcome; price; quantity; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
 
 cancel : Fixture -> ContractId OrderBook -> ContractId LimitOrder -> Optional (ContractId AssetBalance) -> Script CancellationResult
 cancel f book order balance = submit (actAs f.positions.custody.asset.alice <> readAs [f.positions.custody.asset.operator, f.positions.custody.asset.issuer]) do
@@ -144,7 +145,7 @@ testPlacementAndCancellationAuthorization = script do
   let a = c.asset
   forA_ [a.bob, a.operator, c.vault] (\caller -> do
     submitMustFail (actAs caller <> readAs [a.alice, a.operator, a.issuer, c.vault]) do
-      exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext)
+      exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)
   placed <- buy f f.book f.positions.balance Yes 0.4 3
   balance <- requireBalance placed
   forA_ [a.bob, a.operator, c.vault] (\caller -> do
@@ -163,10 +164,10 @@ testInvalidTicksLotsAndInsufficientFunds = script do
   let a = f.positions.custody.asset
   forA_ [0.0, -0.1, 1.0, 1.1, 0.405, 0.4000000001] (\price -> do
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-      exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price; quantity = 2; extraArgs = C.registryContext)
+      exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price; quantity = 2; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)
   forA_ [0, -2, 1, 3, 20] (\quantity -> do
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-      exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity; extraArgs = C.registryContext)
+      exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)
   assert (validPrice 0.0000000001 0.0000000001 && validPrice 0.03 0.99 && not (validPrice 0.03 0.10))
   placed <- buy f f.book f.positions.balance No 0.01 2
   balance <- requireBalance placed
@@ -179,15 +180,15 @@ testSellShortageDuplicateAndSpentLots = script do
   split <- P.split f.positions f.positions.reserve f.positions.balance 3
   forA_ [([], 1), ([split.position, split.position], 1), ([split.position], 4), ([split.position], 0)] (\(positions, quantity) -> do
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-      exerciseCmd f.book OrderBook_PlaceSell with owner = a.alice; market = f.positions.market; positions; outcome = Yes; price = 0.5; quantity)
+      exerciseCmd f.book OrderBook_PlaceSell with owner = a.alice; market = f.positions.market; positions; outcome = Yes; price = 0.5; quantity; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.book OrderBook_PlaceSell with owner = a.alice; market = f.positions.market; positions = [split.position]; outcome = Yes; price = 0.405; quantity = 1
+    exerciseCmd f.book OrderBook_PlaceSell with owner = a.alice; market = f.positions.market; positions = [split.position]; outcome = Yes; price = 0.405; quantity = 1; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   placed <- sell f f.book [split.position] Yes 0.5 3
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd placed.book OrderBook_PlaceSell with owner = a.alice; market = f.positions.market; positions = [split.position]; outcome = Yes; price = 0.5; quantity = 1
+    exerciseCmd placed.book OrderBook_PlaceSell with owner = a.alice; market = f.positions.market; positions = [split.position]; outcome = Yes; price = 0.5; quantity = 1; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   noOnly <- requirePosition placed.remainder
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd placed.book OrderBook_PlaceSell with owner = a.alice; market = f.positions.market; positions = [noOnly]; outcome = Yes; price = 0.5; quantity = 1
+    exerciseCmd placed.book OrderBook_PlaceSell with owner = a.alice; market = f.positions.market; positions = [noOnly]; outcome = Yes; price = 0.5; quantity = 1; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   assertConserved f placed.book split.reserve split.balance
 
 testClosedCutoffAndRevokedAdmissionCancellation : Script ()
@@ -200,7 +201,7 @@ testClosedCutoffAndRevokedAdmissionCancellation = script do
   sellOrder <- sell f buyOrder.book [split.position] No 0.5 1
   closed <- submit a.operator do exerciseCmd f.positions.market Binary_Close with protocol = f.positions.protocol; reason = "Stop trading"
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd sellOrder.book OrderBook_PlaceBuy with owner = a.alice; market = closed; balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd sellOrder.book OrderBook_PlaceBuy with owner = a.alice; market = closed; balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   market <- queryContractId a.operator closed
   cutoff <- case market of Some value -> pure value.terms.closeAt; None -> abort "Missing market"
   setTime cutoff
@@ -220,10 +221,10 @@ testExactCutoffAndImmutableMarketTerms = script do
   draft <- submit a.operator do createCmd (market with status = Draft)
   forA_ [altered, draft] (\cid -> do
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-      exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = cid; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext)
+      exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = cid; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)
   setTime market.terms.closeAt
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   assertConserved f f.book f.positions.reserve f.positions.balance
 
 testReplayCancellationAndAccountChecks : Script ()
@@ -236,7 +237,7 @@ testReplayCancellationAndAccountChecks = script do
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
       exerciseCmd placed.book OrderBook_Cancel with owner = a.alice; order = placed.order; balance = account; extraArgs = C.registryContext)
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   first <- cancel f placed.book placed.order (Some balance)
   restored <- requireReleasedBalance first
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
@@ -274,7 +275,7 @@ testBuyRegistryFailureAndCancellationRollback = script do
   -- Available=5; buying 5 at 0.6 targets available backing=2, which this
   -- registry deliberately underpays after consuming the original input.
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.6; quantity = 5; extraArgs = C.registryContext
+    exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.6; quantity = 5; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   assertConserved f f.book f.positions.reserve f.positions.balance
   first <- buy f f.book f.positions.balance Yes 0.5 1
   firstBalance <- requireBalance first
@@ -313,14 +314,14 @@ testCrossMarketPositionsAndOrderCancellation = script do
     exerciseCmd p.registry PositionRegistry_CreateReserve with creator = a.operator; protocol; market = draft; admission = a.admission
   otherMarket <- submit a.operator do exerciseCmd draft Binary_Open with protocol
   (_, otherBook) <- submit a.operator do
-    exerciseCmd f.registry OrderRegistry_CreateBook with creator = a.operator; protocol; market = otherMarket; reserve
+    exerciseCmd f.registry OrderRegistry_CreateBook with creator = a.operator; protocol; market = otherMarket; reserve; admission = a.admission
   split <- P.split p p.reserve p.balance 2
-  sellOrder <- sell f f.book [split.position] Yes 0.5 1
+  sellOrder <- sell (f with positions = p with protocol = protocol) f.book [split.position] Yes 0.5 1
   remainder <- requirePosition sellOrder.remainder
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd otherBook OrderBook_PlaceSell with owner = a.alice; market = otherMarket; positions = [remainder]; outcome = Yes; price = 0.5; quantity = 1
+    exerciseCmd otherBook OrderBook_PlaceSell with owner = a.alice; market = otherMarket; positions = [remainder]; outcome = Yes; price = 0.5; quantity = 1; feePolicy = protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   otherBuy <- submit (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd otherBook OrderBook_PlaceBuy with owner = a.alice; market = otherMarket; balance = split.balance; outcome = Yes; price = 0.5; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd otherBook OrderBook_PlaceBuy with owner = a.alice; market = otherMarket; balance = split.balance; outcome = Yes; price = 0.5; quantity = 1; extraArgs = C.registryContext; feePolicy = protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   balance <- requireBalance otherBuy
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
     exerciseCmd otherBuy.book OrderBook_Cancel with owner = a.alice; order = sellOrder.order; balance = None; extraArgs = C.registryContext
@@ -355,7 +356,7 @@ testGenuineBookCapacityAndCancellationSlot = script do
   split <- P.split p p.reserve funded.balance 128
   (book, remainder, orders) <- sellMany f f.book split.position 128
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd book OrderBook_PlaceSell with owner = a.alice; market = p.market; positions = [remainder]; outcome = No; price = 0.5; quantity = 1
+    exerciseCmd book OrderBook_PlaceSell with owner = a.alice; market = p.market; positions = [remainder]; outcome = No; price = 0.5; quantity = 1; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   first <- case orders of cid :: _ -> pure cid; [] -> abort "Missing order"
   cancelled <- cancel f book first None
   returned <- requirePosition cancelled.released.position
@@ -378,14 +379,14 @@ testWrongAccountsOwnersAndRefundShape = script do
   (_, bobBalance) <- submit (actAs a.bob <> readAs a.operator) do
     exerciseCmd c.authority VaultAuthority_OpenBalance with owner = a.bob; admission = a.admission
   submitMustFail (actAs a.bob <> readAs [a.operator, a.issuer, a.alice]) do
-    exerciseCmd f.book OrderBook_PlaceBuy with owner = a.bob; market = p.market; balance = p.balance; outcome = Yes; price = 0.5; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd f.book OrderBook_PlaceBuy with owner = a.bob; market = p.market; balance = p.balance; outcome = Yes; price = 0.5; quantity = 1; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   placed <- buy f f.book p.balance Yes 0.5 1
   balance <- requireBalance placed
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer, a.bob]) do
     exerciseCmd placed.book OrderBook_Cancel with owner = a.alice; order = placed.order; balance = Some bobBalance; extraArgs = C.registryContext
   split <- P.split p p.reserve balance 2
   submitMustFail (actAs a.bob <> readAs [a.operator, a.issuer, a.alice]) do
-    exerciseCmd placed.book OrderBook_PlaceSell with owner = a.bob; market = p.market; positions = [split.position]; outcome = Yes; price = 0.5; quantity = 1
+    exerciseCmd placed.book OrderBook_PlaceSell with owner = a.bob; market = p.market; positions = [split.position]; outcome = Yes; price = 0.5; quantity = 1; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   sellOrder <- sell f placed.book [split.position] Yes 0.5 1
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
     exerciseCmd sellOrder.book OrderBook_Cancel with owner = a.alice; order = sellOrder.order; balance = Some split.balance; extraArgs = C.registryContext
@@ -402,7 +403,7 @@ testGenuineSellInputLimit = script do
   funded <- C.deposit c p.balance 12.0 [toInterfaceContractId @H.Holding input]
   (reserve, _, lots) <- P.splitLots p p.reserve funded.balance 17
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.book OrderBook_PlaceSell with owner = a.alice; market = p.market; positions = lots; outcome = No; price = 0.5; quantity = 16
+    exerciseCmd f.book OrderBook_PlaceSell with owner = a.alice; market = p.market; positions = lots; outcome = No; price = 0.5; quantity = 16; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   placed <- sell f f.book (take 16 lots) No 0.5 16
   pool <- P.loadReserve p reserve
   positions <- query @PositionLot c.vault
@@ -419,17 +420,17 @@ testBookInitializationRolesAndBounds = script do
   let c = p.custody
   let a = c.asset
   submitMustFail a.operator do
-    exerciseCmd f.registry OrderRegistry_CreateBook with creator = a.operator; protocol = p.protocol; market = p.market; reserve = p.reserve
+    exerciseCmd f.registry OrderRegistry_CreateBook with creator = a.operator; protocol = p.protocol; market = p.market; reserve = p.reserve; admission = a.admission
   submitMustFail (actAs a.bob <> readAs [a.operator, c.vault]) do
-    exerciseCmd f.registry OrderRegistry_CreateBook with creator = a.bob; protocol = p.protocol; market = p.market; reserve = p.reserve
+    exerciseCmd f.registry OrderRegistry_CreateBook with creator = a.bob; protocol = p.protocol; market = p.market; reserve = p.reserve; admission = a.admission
   other <- submit [a.operator, c.vault] do
     createCmd OrderRegistry with operator = a.operator; vault = c.vault; protocolName = "other"; marketIds = []
   submitMustFail a.operator do
-    exerciseCmd other OrderRegistry_CreateBook with creator = a.operator; protocol = p.protocol; market = p.market; reserve = p.reserve
+    exerciseCmd other OrderRegistry_CreateBook with creator = a.operator; protocol = p.protocol; market = p.market; reserve = p.reserve; admission = a.admission
   full <- submit [a.operator, c.vault] do
     createCmd OrderRegistry with operator = a.operator; vault = c.vault; protocolName = "outcomia"; marketIds = [100..1123]
   submitMustFail a.operator do
-    exerciseCmd full OrderRegistry_CreateBook with creator = a.operator; protocol = p.protocol; market = p.market; reserve = p.reserve
+    exerciseCmd full OrderRegistry_CreateBook with creator = a.operator; protocol = p.protocol; market = p.market; reserve = p.reserve; admission = a.admission
   found <- queryContractId a.operator p.market
   market <- case found of Some value -> pure value; None -> abort "Missing market"
   enabled <- submit a.operator do exerciseCmd p.protocol Protocol_SetAdmins with replacementAdmins = [a.operator, a.alice]
@@ -439,7 +440,7 @@ testBookInitializationRolesAndBounds = script do
     exerciseCmd p.registry PositionRegistry_CreateReserve with creator = a.alice; protocol = next; market = draft; admission = a.admission
   revoked <- submit a.operator do exerciseCmd next Protocol_SetAdmins with replacementAdmins = [a.operator]
   submitMustFail (actAs a.alice <> readAs [a.operator, c.vault]) do
-    exerciseCmd f.registry OrderRegistry_CreateBook with creator = a.alice; protocol = revoked; market = draft; reserve
+    exerciseCmd f.registry OrderRegistry_CreateBook with creator = a.alice; protocol = revoked; market = draft; reserve; admission = a.admission
 
 testSequenceExhaustion : Script ()
 testSequenceExhaustion = script do
@@ -448,7 +449,7 @@ testSequenceExhaustion = script do
   book <- loadBook f f.book
   exhausted <- submit [c.asset.operator, c.vault] do createCmd (book with nextOrderId = 9223372036854775807)
   submitMustFail (actAs c.asset.alice <> readAs [c.asset.operator, c.asset.issuer]) do
-    exerciseCmd exhausted OrderBook_PlaceBuy with owner = c.asset.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.5; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd exhausted OrderBook_PlaceBuy with owner = c.asset.alice; market = f.positions.market; balance = f.positions.balance; outcome = Yes; price = 0.5; quantity = 1; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
   assertConserved f f.book f.positions.reserve f.positions.balance
 
 testSellPriceTimeSelection : Script ()

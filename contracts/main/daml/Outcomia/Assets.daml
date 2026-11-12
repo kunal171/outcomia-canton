@@ -34,15 +34,18 @@ data ExactTransferResult = ExactTransferResult with
 -- | An operator-approved instrument and exact registry factory. Approval assumes
 -- the operator has verified the factory's origin and vetted implementation; a
 -- self-reported admin in an interface view is not proof of authenticity.
--- Future market contracts must bind operator/instrument to their own signed terms.
+-- assetDecimals is vetted settlement precision, not wallet display metadata.
+-- Books pin it at creation; later admission changes cannot reinterpret orders.
+-- Market contracts bind operator/instrument to their own signed terms.
 template AssetAdmission
   with
     operator : Party
     instrument : CollateralInstrument
     factory : ContractId T.TransferFactory
+    assetDecimals : Int
   where
     signatory operator
-    ensure boundedText 128 instrument.id
+    ensure boundedText 128 instrument.id && assetDecimals >= 0 && assetDecimals <= 10
 
     -- | Inputs: expected operator/instrument from the calling market and intent.
     -- Rejects: wrong binding, missing sender/receiver authority, invalid holdings,
