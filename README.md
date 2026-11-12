@@ -9,8 +9,8 @@ exactly one winner. Canton spot trading is outside the current scope.
 
 The UI lives in [`kunal171/outcomia/app`](https://github.com/kunal171/outcomia/tree/master/app).
 There is no separate Canton frontend. That app uses the selected wallet to open
-Solana markets or the Canton prediction workspace. Console Wallet must provide
-an allocated primary party on the configured network (`canton:devnet` by default).
+Solana markets or the Canton prediction workspace. Loop or Console Wallet verifies its primary party on the configured network
+(`canton:devnet` by default).
 
 Run the shared app using [its setup guide](https://github.com/kunal171/outcomia/blob/master/app/README.md).
 See [the wallet boundary](docs/wallet-gateway.md) and
@@ -25,7 +25,9 @@ Use small commits, a feature PR, and a merge before the next checkpoint. See
 [dedicated-vault balances](docs/collateral-custody.md) support deposits and withdrawals;
 [complete sets](docs/complete-set-positions.md) support YES/NO split and merge.
 [Resting limit orders](docs/binary-limit-orders.md) lock buys/sells and support
-owner cancellation. Matching, resolution and redemption remain.
+owner cancellation. The [matching planner](docs/binary-matching.md) selects
+price/FIFO pairs and computes partial fills and refunds. Atomic settlement,
+resolution and redemption remain.
 No Canton markets are deployed yet.
 
 ## Contracts

@@ -1,0 +1,107 @@
+-- | Pure, bounded selection and cash arithmetic for one binary fill. This
+-- module cannot fetch, archive or transfer anything. Its input is a snapshot,
+-- not proof that an order exists or that its escrow is funded. Settlement must
+-- rebuild that snapshot from the current book and verified contracts on-ledger.
+module Outcomia.Matching where
+
+import DA.List (sortOn, unique)
+import Outcomia.Types
+
+-- | A verified-order projection. Acceptance IDs are local to one book lineage;
+-- passing orders from another market is a caller error the settlement boundary
+-- must reject before constructing this projection.
+data MatchOrder = MatchOrder with
+    orderId : Int
+    owner : Party
+    outcome : Outcome
+    side : OrderSide
+    price : Decimal
+    quantity : Int
+  deriving (Eq, Show)
+
+-- | Amounts are collateral units; quantities are whole outcome contracts.
+-- buyerRefund covers price improvement on the filled quantity only. The
+-- unfilled buy stays funded at its original limit, not the execution price.
+data FillPlan = FillPlan with
+    buyId : Int
+    sellId : Int
+    makerId : Int
+    takerId : Int
+    outcome : Outcome
+    price : Decimal
+    quantity : Int
+    sellerProceeds : Decimal
+    buyerRefund : Decimal
+    buyerRemaining : Int
+    sellerRemaining : Int
+    buyerEscrowRemaining : Decimal
+  deriving (Eq, Show)
+
+-- | A self-cross requests cancellation of the newer order. It is not a fill
+-- and does not itself cancel anything. Settlement must release its escrow and
+-- remove its reference atomically, then select again from the successor book.
+data MatchDecision = NoMatch | CancelSelfTrade Int | Fill FillPlan
+  deriving (Eq, Show)
+
+-- | Inputs: admitted tick, lot, selected outcome and the complete bounded book
+-- projection. Errors: invalid increments, >128 entries, duplicate/nonpositive
+-- IDs, off-tick prices or nonpositive/off-lot quantities. Result: no crossing,
+-- one self-trade cancellation request or one exact fill plan. Never skips the
+-- best order to find a different owner, and never matches YES against NO.
+planFill : Decimal -> Int -> Outcome -> [MatchOrder] -> Either Text MatchDecision
+planFill tick lot outcome orders
+  | tick <= 0.0 || tick >= 1.0 || lot <= 0 = Left "Invalid market increments"
+  | length orders > 128 = Left "Matching snapshot exceeds 128 orders"
+  | not (unique (map (\o -> o.orderId) orders)) = Left "Duplicate acceptance IDs"
+  | not (all valid orders) = Left "Invalid order in matching snapshot"
+  | otherwise = case (best Buy, best Sell) of
+      (Some buy, Some sell)
+        | buy.price < sell.price -> Right NoMatch
+        | buy.owner == sell.owner -> Right (CancelSelfTrade (max buy.orderId sell.orderId))
+        | otherwise -> Right (Fill (fillTerms buy sell))
+      _ -> Right NoMatch
+  where
+    valid order = order.orderId > 0 && validMatchPrice tick order.price &&
+      order.quantity > 0 && order.quantity % lot == 0
+    best side = case sortOn (\o -> priorityKey side o.price o.orderId)
+        (filter (\o -> o.outcome == outcome && o.side == side) orders) of
+      [] -> None
+      first :: _ -> Some first
+
+-- | Inputs: side, valid sub-unit price and acceptance ID. Result: sortable key
+-- with highest buys/lowest sells first, then FIFO. Ledger timestamps and input
+-- list order do not affect priority. Shared with the committed-reference index.
+priorityKey : OrderSide -> Decimal -> Int -> (Decimal, Int)
+priorityKey side price orderId = (if side == Buy then negate price else price, orderId)
+
+-- | Inputs: tick and candidate price. Result: exact tick alignment. Daml Decimal
+-- has ten fractional digits. Both sub-unit values scale below 10^10, safely
+-- within Int; modulo avoids rounded division accepting 0.4000000001 on 0.01.
+validMatchPrice : Decimal -> Decimal -> Bool
+validMatchPrice tick price =
+  if tick <= 0.0 || tick >= 1.0 || price <= 0.0 || price >= 1.0 then False
+  else truncate (price * 10000000000.0) % truncate (tick * 10000000000.0) == 0
+
+-- | Inputs: the validated best crossing buy and sell for different owners.
+-- Result: one fill at the older order's price, with the smaller quantity.
+-- Example: buy 5 at 0.60 meets older sell 3 at 0.40. Seller receives 1.20,
+-- buyer gets 0.60 improvement and 2 buys remain backed by 1.20. Thus the
+-- original 3.00 buy escrow equals 1.20 proceeds + 0.60 refund + 1.20 remainder.
+-- Integer quantities times Decimal prices are exact here; no fees are charged.
+fillTerms : MatchOrder -> MatchOrder -> FillPlan
+fillTerms buy sell =
+  let filled = min buy.quantity sell.quantity
+      executionPrice = if buy.orderId < sell.orderId then buy.price else sell.price
+  in FillPlan with
+    buyId = buy.orderId
+    sellId = sell.orderId
+    makerId = min buy.orderId sell.orderId
+    takerId = max buy.orderId sell.orderId
+    outcome = buy.outcome
+    price = executionPrice
+    quantity = filled
+    sellerProceeds = executionPrice * intToDecimal filled
+    buyerRefund = (buy.price - executionPrice) * intToDecimal filled
+    buyerRemaining = buy.quantity - filled
+    sellerRemaining = sell.quantity - filled
+    buyerEscrowRemaining = buy.price * intToDecimal (buy.quantity - filled)

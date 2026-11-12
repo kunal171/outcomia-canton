@@ -90,7 +90,7 @@ Stale book/account/lot IDs, duplicate inputs, missing outcomes, incorrect backin
 or faulty registry output reject the whole transaction. If a refund fails after
 registry consumption, the order, index entry, balance and escrow all remain live.
 
-## Price-time priority and the next checkpoint
+## Price-time priority and matching
 
 `bestOrderReference` selects within one outcome and side: highest buy or lowest
 sell price first, then lowest accepted ID. Ledger timestamps are informational;
@@ -103,12 +103,14 @@ markets have separate books, while the same trader account remains a shared
 spending dependency. The bounds simplify the first implementation but limit
 throughput and depth; measure both before choosing a larger structure.
 
-Matching must fetch the current book and validate its best reference in the
+The [pure matching planner](binary-matching.md) now defines maker-price execution,
+partial-fill amounts and cancel-newer self-trade behavior. It executes nothing.
+Settlement must fetch the current book and validate its best reference in the
 settlement transaction. An off-chain matcher supplying a candidate is not proof
 of FIFO. Partial fills must update the order and its reference together, preserve
 the original acceptance ID, transfer outcome ownership, settle cash and return
-price improvement. Fees, maker/taker behavior, bounded fill batches, self-trade
-policy and cross-outcome matching need their own rules and tests.
+price improvement. Fees, bounded fill batches and cross-outcome matching remain separate work.
+The selected same-outcome plan still needs atomic escrow updates and tests.
 
 ## Verification and deployment limits
 

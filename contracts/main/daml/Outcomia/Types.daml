@@ -7,6 +7,9 @@ module Outcomia.Types where
 data Outcome = Yes | No
   deriving (Eq, Show)
 
+-- | A buy escrows collateral; a sell escrows its selected outcome contracts.
+data OrderSide = Buy | Sell deriving (Eq, Show)
+
 -- | Closed is an administrative trading stop, not an outcome or a payout.
 -- There is no reopen transition. Future settlement must use separate states.
 data MarketStatus = Draft | Open | Closed
