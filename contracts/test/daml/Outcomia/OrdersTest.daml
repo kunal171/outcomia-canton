@@ -22,8 +22,11 @@ data Fixture = Fixture with
   deriving (Eq, Show)
 
 setup : FactoryMode -> Int -> Script Fixture
-setup mode lot = script do
-  positions <- P.setup mode lot
+setup mode lot = setupWithTick mode lot 0.01
+
+setupWithTick : FactoryMode -> Int -> Decimal -> Script Fixture
+setupWithTick mode lot tick = script do
+  positions <- P.setupWithTick mode lot tick
   let a = positions.custody.asset
   root <- submit [a.operator, positions.custody.vault] do
     createCmd OrderRegistry with operator = a.operator; vault = positions.custody.vault; protocolName = "outcomia"; marketIds = []
@@ -75,10 +78,13 @@ assertConserved f book reserve balance = do
   orders <- query @LimitOrder c.vault
   let amountAt cid = sum [h.amount | (holdingCid, h) <- holdings, Some (toInterfaceContractId @H.Holding holdingCid) == cid]
   let cashOrders = [(order, cid) | (_, order) <- orders, CashEscrow cid <- [order.backing]]
-  forA_ cashOrders (\(order, cid) -> assert (amountAt (Some cid) == order.price * intToDecimal order.quantity))
+  forA_ cashOrders (\(order, cid) -> case Fees.buyFunding order.feeTerms (buyFeeState order) of
+    Right expected -> assert (amountAt (Some cid) == expected.totalEscrow)
+    Left _ -> abort "Invalid signed buy funding")
   assert (amountAt account.cash == account.available && amountAt pool.cash == intToDecimal pool.completeSets)
+  assert (amountAt current.fees.cash == current.fees.amount)
   assert (sum [h.amount | (_, h) <- holdings] == 5.0)
-  assert (account.available + intToDecimal pool.completeSets + sum [amountAt (Some cid) | (_, cid) <- cashOrders] == 5.0)
+  assert (account.available + intToDecimal pool.completeSets + sum [amountAt (Some cid) | (_, cid) <- cashOrders] + current.fees.amount == 5.0)
   assert (length current.orders == length orders)
   assert (all (\r -> any (\(cid, order) -> cid == r.order && order.orderId == r.orderId && order.outcome == r.outcome && order.side == r.side && order.price == r.price) orders) current.orders)
   let escrow outcome = sum [order.quantity | (_, order) <- orders, order.side == Sell && order.outcome == outcome]

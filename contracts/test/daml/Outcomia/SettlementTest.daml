@@ -37,8 +37,11 @@ data Crossed = Crossed with
   deriving (Eq, Show)
 
 setup : FactoryMode -> Script Fixture
-setup mode = script do
-  orders <- O.setup mode 1
+setup mode = setupWithTick mode 0.01
+
+setupWithTick : FactoryMode -> Decimal -> Script Fixture
+setupWithTick mode tick = script do
+  orders <- O.setupWithTick mode 1 tick
   let c = orders.positions.custody
   let a = c.asset
   (_, bobAccount) <- submit (actAs a.bob <> readAs a.operator) do
@@ -105,13 +108,17 @@ assertConserved f book = do
   let amountAt cid = sum [h.amount | (holdingCid, h) <- holdings, Some (toInterfaceContractId @H.Holding holdingCid) == cid]
   let cashOrders = [(value, cid) | (_, value) <- orders, CashEscrow cid <- [value.backing]]
   let backing = [cid | (_, value) <- accounts, Some cid <- [value.cash]] ++
-                optionalHoldings pool.cash ++ [cid | (_, cid) <- cashOrders]
+                optionalHoldings pool.cash ++ [cid | (_, cid) <- cashOrders] ++ optionalHoldings index.fees.cash
   assert (unique backing)
   assert (sum [h.amount | (_, h) <- holdings] == 10.0)
   assert (all (\(_, value) -> amountAt value.cash == value.available) accounts)
-  assert (all (\(value, cid) -> amountAt (Some cid) == value.price * intToDecimal value.quantity) cashOrders)
+  forA_ cashOrders (\(value, cid) -> case Fees.buyFunding value.feeTerms (buyFeeState value) of
+    Right expected -> assert (amountAt (Some cid) == expected.totalEscrow)
+    Left _ -> abort "Invalid signed buy funding")
+  assert (amountAt index.fees.cash == index.fees.amount)
+  let walletCash = sum [h.amount | (_, h) <- holdings, h.account.owner /= Some c.vault]
   assert (amountAt pool.cash == intToDecimal pool.completeSets)
-  assert (sum [value.available | (_, value) <- accounts] + intToDecimal pool.completeSets + sum [amountAt (Some cid) | (_, cid) <- cashOrders] == 10.0)
+  assert (sum [value.available | (_, value) <- accounts] + intToDecimal pool.completeSets + sum [amountAt (Some cid) | (_, cid) <- cashOrders] + index.fees.amount + walletCash == 10.0)
   assert (length index.orders == length orders)
   assert (all (\ref -> any (\(cid, value) -> ref.order == cid && ref.orderId == value.orderId && ref.price == value.price && ref.outcome == value.outcome && ref.side == value.side) orders) index.orders)
   let escrow outcome = sum [value.quantity | (_, value) <- orders, value.side == Sell && value.outcome == outcome]

@@ -1,0 +1,93 @@
+-- | Canonical fee backing embedded in each signed OrderBook. This is separate
+-- from trader cash and complete-set reserves, not an unbacked revenue counter.
+-- Helpers require the caller to bind market/asset/factory and supply vault
+-- authority. Raw vault signers remain trusted, as in the custody module.
+module Outcomia.MarketFees where
+
+import DA.Numeric qualified as Numeric
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Outcomia.Assets (holdingTotal, transferExact)
+import Outcomia.Custody (optionalHoldings, transferIntent, exactlyOne, canonicalOptional)
+import Outcomia.Types (CollateralInstrument)
+
+data FeePoolState = FeePoolState with
+    amount : Decimal
+    cash : Optional (ContractId H.Holding)
+  deriving (Eq, Show)
+
+data FeeCollection = FeeCollection with
+    pool : FeePoolState
+    remainingCash : Optional (ContractId H.Holding)
+  deriving (Eq, Show)
+
+data FeeWithdrawal = FeeWithdrawal with
+    pool : FeePoolState
+    walletHoldings : [ContractId H.Holding]
+  deriving (Eq, Show)
+
+-- | Inputs: vetted precision and proposed signed pool. Result: canonical shape,
+-- transferable amount and bounded accumulation. Hitting the prototype bound
+-- requires a withdrawal before another fee-bearing fill; nothing is truncated.
+validPool : Int -> FeePoolState -> Bool
+validPool decimals pool = decimals >= 0 && decimals <= 10 &&
+  pool.amount >= 0.0 && pool.amount <= intToDecimal 9223372036854775807 &&
+  ((pool.amount == 0.0) == (pool.cash == None)) && aligned decimals pool.amount
+
+-- | Inputs: vault/asset, precision and signed pool. Errors: invalid shape or
+-- inactive, locked, foreign or incorrectly sized backing. Result: no mutation.
+validatePool : Party -> CollateralInstrument -> Int -> FeePoolState -> Update ()
+validatePool vault instrument decimals pool = do
+  assertMsg "Invalid market fee pool" (validPool decimals pool)
+  total <- holdingTotal (H.InstrumentId instrument.admin instrument.id)
+    (H.Account (Some vault) None "") (optionalHoldings pool.cash)
+  assertMsg "Market fee backing does not equal recorded fees" (total == pool.amount)
+
+-- | Inputs: pinned registry, current pool, fee and the residual buy escrow after
+-- seller credit. Errors: unbacked/foreign cash, uncovered/off-quantum fee, pool
+-- overflow or inaccurate registry outputs. Result: one fee holding and canonical
+-- residual buy cash. Zero fees skip the transfer but still validate both inputs.
+-- Example: .003 existing + .002 fee creates .005 backing; only .002 leaves the
+-- supplied buy escrow. Any later failure rolls back this consolidation too.
+collectFees : Party -> CollateralInstrument -> ContractId T.TransferFactory -> Int -> FeePoolState -> Decimal -> Optional (ContractId H.Holding) -> Decimal -> ExtraArgs -> Update FeeCollection
+collectFees vault instrument factory decimals pool fee inputCash inputAmount extraArgs = do
+  validatePool vault instrument decimals pool
+  assertMsg "Invalid fee input or uncovered charge"
+    (fee >= 0.0 && fee <= inputAmount && aligned decimals fee &&
+     inputAmount >= 0.0 && ((inputAmount == 0.0) == (inputCash == None)))
+  total <- holdingTotal (H.InstrumentId instrument.admin instrument.id)
+    (H.Account (Some vault) None "") (optionalHoldings inputCash)
+  assertMsg "Fee input cash has incorrect amount" (total == inputAmount)
+  if fee == 0.0 then pure FeeCollection with pool; remainingCash = inputCash
+  else do
+    let nextAmount = pool.amount + fee
+    assertMsg "Market fee pool limit reached" (nextAmount <= intToDecimal 9223372036854775807)
+    intent <- transferIntent vault vault nextAmount
+      (optionalHoldings pool.cash ++ optionalHoldings inputCash) extraArgs
+    moved <- transferExact factory instrument intent
+    cash <- exactlyOne moved.received
+    remainingCash <- canonicalOptional (inputAmount - fee) moved.change
+    pure FeeCollection with pool = FeePoolState nextAmount (Some cash); remainingCash
+
+-- | Inputs: the fixed operator beneficiary, pinned pool and positive amount.
+-- Errors: malformed/stale backing, excess/off-quantum amount or registry failure.
+-- Result: actual operator-wallet holdings and remaining pool. The enclosing
+-- book choice enforces operator authorization; no caller-selected recipient,
+-- trader account or complete-set reserve participates in this withdrawal.
+withdrawFees : Party -> Party -> CollateralInstrument -> ContractId T.TransferFactory -> Int -> FeePoolState -> Decimal -> ExtraArgs -> Update FeeWithdrawal
+withdrawFees operator vault instrument factory decimals pool amount extraArgs = do
+  validatePool vault instrument decimals pool
+  assertMsg "Fee withdrawal must be positive, covered and precision-aligned"
+    (amount > 0.0 && amount <= pool.amount && aligned decimals amount)
+  intent <- transferIntent vault operator amount (optionalHoldings pool.cash) extraArgs
+  moved <- transferExact factory instrument intent
+  cash <- canonicalOptional (pool.amount - amount) moved.change
+  -- Enforce the same canonical output rule as custody, including withdrawals.
+  wallet <- exactlyOne moved.received
+  pure FeeWithdrawal with pool = FeePoolState (pool.amount - amount) cash; walletHoldings = [wallet]
+
+-- | Inputs: supported precision and amount. Result: whether rounding would leave
+-- it unchanged. Callers validate the precision before invoking this helper.
+aligned : Int -> Decimal -> Bool
+aligned decimals amount = Numeric.roundNumeric decimals Numeric.RoundingDown amount == amount

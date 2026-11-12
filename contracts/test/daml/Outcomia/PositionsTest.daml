@@ -25,12 +25,17 @@ data Fixture = Fixture with
   deriving (Eq, Show)
 
 setup : FactoryMode -> Int -> Script Fixture
-setup mode lot = script do
+setup mode lot = setupWithTick mode lot 0.01
+
+-- | Inputs: registry behavior, whole-contract lot and exact market tick. Result:
+-- a genuinely initialized market/reserve, including tiny-cash rounding fixtures.
+setupWithTick : FactoryMode -> Int -> Decimal -> Script Fixture
+setupWithTick mode lot tick = script do
   custody <- C.setup mode
   let f = custody.asset
   funded <- C.deposit custody custody.balance 5.0 [toInterfaceContractId @H.Holding f.input]
   (protocol, draft) <- submit f.operator do
-    exerciseCmd f.protocol Protocol_CreateBinary with creator = f.operator; terms = ((termsFor f.issuer f.now) with quantityLot = lot)
+    exerciseCmd f.protocol Protocol_CreateBinary with creator = f.operator; terms = ((termsFor f.issuer f.now) with quantityLot = lot; priceTick = tick)
   root <- submit [f.operator, custody.vault] do
     createCmd PositionRegistry with operator = f.operator; vault = custody.vault; protocolName = "outcomia"; marketIds = []
   (registry, reserve) <- submit f.operator do
