@@ -2,12 +2,14 @@
 -- and one NO unit; a merge burns one of each and returns one collateral unit.
 -- Tokens and position state move in one ledger transaction, never via receipts.
 --
--- This checkpoint has no final resolution or redemption. A later resolution
--- transition must consume the reserve and define which merges remain valid.
+-- Binding a final outcome consumes the live reserve and disables split/merge.
+-- The settled successor burns owned lots and credits exact collateral payouts.
 -- The dedicated vault and its approved registry remain custody trust boundaries.
 module Outcomia.Positions where
 
 import DA.List (unique)
+import DA.Numeric qualified as Numeric
+import Outcomia.Resolution qualified as Resolution
 import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
@@ -55,6 +57,8 @@ template PositionRegistry
         admitted <- fetch admission
         assertMsg "Reserve admission does not match collateral"
           (admitted.operator == operator && admitted.instrument == current.terms.collateral)
+        assertMsg "Invalid-result refunds must align with collateral precision"
+          (Numeric.roundNumeric admitted.assetDecimals Numeric.RoundingDown (0.5 * intToDecimal current.terms.quantityLot) == 0.5 * intToDecimal current.terms.quantityLot)
         next <- create this with marketIds = current.marketId :: marketIds
         reserve <- create MarketReserve with
           key = MarketKey operator protocolName current.marketId
@@ -62,13 +66,15 @@ template PositionRegistry
           terms = current.terms
           createdAt = current.createdAt
           factory = admitted.factory
+          assetDecimals = admitted.assetDecimals
           completeSets = 0
           cash = None
         pure (next, reserve)
 
 -- | Positions are ledger-native contract lots, not Token Standard assets yet.
 -- There may be several lots per owner. Bounded merge inputs combine them and
--- retain any unburned YES/NO in a successor lot. No one-sided redemption exists.
+-- retain any unburned YES/NO in a successor lot. Settled redemption consumes
+-- whole supplied lots, including worthless losing outcomes, without replay.
 template PositionLot
   with
     key : MarketKey
@@ -106,6 +112,7 @@ template MarketReserve
     terms : BinaryTerms
     createdAt : Time
     factory : ContractId T.TransferFactory
+    assetDecimals : Int
     completeSets : Int
     cash : Optional (ContractId H.Holding)
   where
@@ -113,7 +120,32 @@ template MarketReserve
     observer creator
     ensure key.operator /= vault && key.marketId > 0 && boundedText 64 key.protocolName &&
       null (termsErrors creator createdAt terms) && completeSets >= 0 &&
+      assetDecimals >= 0 && assetDecimals <= 10 &&
+      Numeric.roundNumeric assetDecimals Numeric.RoundingDown (0.5 * intToDecimal terms.quantityLot) == 0.5 * intToDecimal terms.quantityLot &&
       ((completeSets == 0) == (cash == None))
+
+    -- | Inputs: final resolution matching this exact market/terms/creator.
+    -- Errors: foreign/altered final snapshot, future timestamp or incorrect cash.
+    -- Result: consumes this reserve and creates its settled successor. Old split
+    -- and merge IDs become unusable; open sell orders can still cancel into lots.
+    choice MarketReserve_BindResolution : ContractId SettledReserve
+      with resolution : ContractId Resolution.FinalResolution
+      controller key.operator
+      do
+        final <- fetch resolution
+        assertMsg "Final resolution does not match this reserve"
+          (final.proposal.key == key && final.proposal.creator == creator &&
+           final.proposal.terms == terms && final.proposal.marketCreatedAt == createdAt)
+        now <- getTime
+        assertMsg "Final resolution is dated in the future" (now >= final.finalizedAt)
+        actual <- holdingTotal (H.InstrumentId terms.collateral.admin terms.collateral.id)
+          (H.Account (Some vault) None "") (optionalHoldings cash)
+        assertMsg "Reserve backing does not equal complete sets" (actual == intToDecimal completeSets)
+        create SettledReserve with
+          key; vault; creator; terms; createdAt; factory; assetDecimals; resolution
+          outcome = final.proposal.outcome
+          yesOutstanding = completeSets; noOutstanding = completeSets
+          remainingCollateral = intToDecimal completeSets; cash
 
     -- | Inputs: owner, current market, enrolled asset balance, quantity and
     -- registry context. Rejects: wrong/revised terms, non-Open/cutoff market,
@@ -203,3 +235,95 @@ checkQuantity : Int -> Int -> Update ()
 checkQuantity lot quantity =
   assertMsg "Quantity must be positive and a multiple of the market lot"
     (quantity > 0 && quantity % lot == 0)
+
+-- | A consumed claim returns current IDs and its exact credit. Burning losing
+-- positions may pay zero, in which case the account ID is intentionally retained.
+data RedemptionResult = RedemptionResult with
+    reserve : ContractId SettledReserve
+    balance : ContractId AssetBalance
+    paid : Decimal
+    burnedYes : Int
+    burnedNo : Int
+  deriving (Eq, Show)
+
+-- | Remaining collateral equals the total liability of unburned outcomes.
+-- Fee pools and trader balances are not inputs. Only a checked transition from
+-- the configured live reserve creates this lineage; raw signers remain trusted.
+template SettledReserve
+  with
+    key : MarketKey
+    vault : Party
+    creator : Party
+    terms : BinaryTerms
+    createdAt : Time
+    factory : ContractId T.TransferFactory
+    assetDecimals : Int
+    resolution : ContractId Resolution.FinalResolution
+    outcome : Resolution.ResolutionOutcome
+    yesOutstanding : Int
+    noOutstanding : Int
+    remainingCollateral : Decimal
+    cash : Optional (ContractId H.Holding)
+  where
+    signatory key.operator, vault
+    observer creator
+    ensure key.operator /= vault && key.marketId > 0 && boundedText 64 key.protocolName &&
+      null (termsErrors creator createdAt terms) && assetDecimals >= 0 && assetDecimals <= 10 &&
+      yesOutstanding >= 0 && noOutstanding >= 0 && remainingCollateral >= 0.0 &&
+      remainingCollateral == outcomePayout outcome yesOutstanding noOutstanding &&
+      Numeric.roundNumeric assetDecimals Numeric.RoundingDown remainingCollateral == remainingCollateral &&
+      ((remainingCollateral == 0.0) == (cash == None))
+
+    -- | Inputs: owner, matching balance and 1..16 unique owned position lots.
+    -- Errors: foreign/replayed lots, supply excess, off-lot quantities, wrong
+    -- account, off-precision payout or registry failure. Result: all supplied
+    -- positions burned exactly once; payout credited to free balance. Losing
+    -- lots are cleared without a zero transfer. Withdrawal remains owner-only.
+    choice SettledReserve_Redeem : RedemptionResult
+      with
+        owner : Party
+        balance : ContractId AssetBalance
+        positions : [ContractId PositionLot]
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        assertMsg "Redeem requires 1 to 16 unique position lots"
+          (not (null positions) && length positions <= 16 && unique positions)
+        account <- fetch balance
+        assertMsg "Claim balance does not match owner, asset, factory or deployment"
+          (account.owner == owner && account.operator == key.operator && account.vault == vault &&
+           account.protocolName == key.protocolName && account.instrument == terms.collateral && account.factory == factory)
+        actual <- holdingTotal (H.InstrumentId terms.collateral.admin terms.collateral.id)
+          (H.Account (Some vault) None "") (optionalHoldings cash)
+        assertMsg "Settled reserve backing is incorrect" (actual == remainingCollateral)
+        lots <- mapA (\cid -> do
+          lot <- fetch cid
+          assertMsg "Claim position does not match owner, vault or market"
+            (lot.owner == owner && lot.vault == vault && lot.key == key)
+          exercise cid Archive
+          pure lot) positions
+        let yes = sum (map (\lot -> lot.yes) lots)
+        let no = sum (map (\lot -> lot.no) lots)
+        assertMsg "Claim exceeds outstanding supply or violates market lots"
+          (yes <= yesOutstanding && no <= noOutstanding &&
+           yes % terms.quantityLot == 0 && no % terms.quantityLot == 0)
+        let payout = outcomePayout outcome yes no
+        assertMsg "Claim payout must be covered and precision-aligned"
+          (payout <= remainingCollateral && Numeric.roundNumeric assetDecimals Numeric.RoundingDown payout == payout)
+        (nextBalance, nextCash) <- if payout == 0.0 then pure (balance, cash) else do
+          moved <- exercise balance AssetBalance_Repartition with
+            otherCash = cash; otherAmount = remainingCollateral; delta = payout; extraArgs
+          pure (moved.balance, moved.otherCash)
+        next <- create this with
+          yesOutstanding = yesOutstanding - yes; noOutstanding = noOutstanding - no
+          remainingCollateral = remainingCollateral - payout; cash = nextCash
+        pure RedemptionResult with reserve = next; balance = nextBalance; paid = payout; burnedYes = yes; burnedNo = no
+
+-- | Inputs: fixed final outcome and nonnegative quantities. Result: exact token
+-- liability. Convert before adding: YES+NO as Int could overflow near supply cap.
+-- An invalid complete set refunds one unit: half for each outcome.
+outcomePayout : Resolution.ResolutionOutcome -> Int -> Int -> Decimal
+outcomePayout outcome yes no = case outcome of
+  Resolution.YesWins -> intToDecimal yes
+  Resolution.NoWins -> intToDecimal no
+  Resolution.Invalid -> 0.5 * intToDecimal yes + 0.5 * intToDecimal no
