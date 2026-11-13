@@ -184,8 +184,8 @@ trusted and can bypass application accounting, as described in
 
 ## Verification
 
-The full suite passes 156 Daml scripts, including 15 collection/withdrawal
-scripts, plus four Python checks. Production DAR validation passes with 38
+The full suite passes 166 Daml scripts, including 15 collection/withdrawal
+scripts, plus four Python checks. Production DAR validation passes with 39
 packages. Run `make DPM="$PWD/target/tools/dpm" test` for the ledger suite and independent
 arithmetic checks. The production DAR excludes the test registry and daml-script.
 Tests cover funded placement, both taker directions, partial-fill accumulation,

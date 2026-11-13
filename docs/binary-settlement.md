@@ -145,9 +145,9 @@ fault-injecting registry and `daml-script`.
 
 ## Verification
 
-`make DPM="$PWD/target/tools/dpm" test` passes 156 Daml scripts, including 20
+`make DPM="$PWD/target/tools/dpm" test` passes 166 Daml scripts, including 20
 settlement scripts, plus four Python dependency checks. Production DAR validation
-passes with 38 packages.
+passes with 39 packages.
 
 The settlement scripts reconcile actual cash holdings, free accounts, buy
 escrows, reserve backing and both outcome supplies. They cover maker direction,

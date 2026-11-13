@@ -29,12 +29,15 @@ owner cancellation. The [matching planner](docs/binary-matching.md) selects
 price/FIFO pairs and computes partial fills and refunds. The [atomic settlement path](docs/binary-settlement.md) now applies one fill or
 cancel-newer self-trade action. The [fee rules and pure arithmetic](docs/fee-accounting.md) are locally checked;
 operator policy, funded fees, atomic collection and fee withdrawal are also checked.
-[Resolution proposals](docs/binary-resolution.md) are locally checked;
-corrections, finalization and redemption remain. [Clubs/private markets](docs/clubs-private-markets.md)
+[Resolution proposals, corrections and delayed finalization](docs/binary-resolution.md)
+are locally checked; collateral-backed redemption remains. [Clubs/private markets](docs/clubs-private-markets.md)
 are planned and have no implementation yet.
 No Canton markets are deployed yet.
 
 ## Contracts
+
+The read-only protocol-role interface lives in `contracts/roles`, separately from
+template implementations for upgrade safety.
 
 Use DPM SDK 3.7.1, Java 17 or newer and Python 3.10+. `make deps` fetches and
 verifies pinned Token Standard interfaces. `make build` builds the production and
