@@ -134,7 +134,7 @@ template OrderRegistry
         pool <- fetch reserve
         asset <- fetch admission
         assertMsg "Book admission does not match reserve asset/factory"
-          (asset.operator == operator && asset.instrument == pool.terms.collateral && asset.factory == pool.factory)
+          (asset.operator == operator && asset.instrument == pool.terms.collateral && asset.factory == pool.factory && asset.assetDecimals == pool.assetDecimals)
         -- Whole-contract lots and ticks must produce registry-transferable cash.
         -- For a 2-decimal asset, tick 0.001 and lot 1 would create unpayable fills.
         let lotNotional = pool.terms.priceTick * intToDecimal pool.terms.quantityLot

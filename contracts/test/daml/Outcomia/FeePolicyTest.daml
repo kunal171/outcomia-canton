@@ -218,16 +218,6 @@ testSellQuoteMismatchDoesNotConsumePosition = script do
 -- possible execution integral: 0.01 tick * 100 contracts = one collateral unit.
 testWholeUnitAssetAcceptsAlignedLot : Script ()
 testWholeUnitAssetAcceptsAlignedLot = script do
-  f <- O.setup Good 100
-  let a = f.positions.custody.asset
-  let vault = f.positions.custody.vault
-  zero <- submit (actAs a.operator <> readAs a.issuer) do
-    exerciseCmd f.positions.protocol Protocol_ApproveAsset with
-      instrument = a.instrument; factory = toInterfaceContractId @T.TransferFactory a.registry; assetDecimals = 0
-  fresh <- submit [a.operator, vault] do
-    createCmd OrderRegistry with operator = a.operator; vault; protocolName = "outcomia"; marketIds = []
-  (_, cid) <- submit a.operator do
-    exerciseCmd fresh OrderRegistry_CreateBook with
-      creator = a.operator; protocol = f.positions.protocol; market = f.positions.market; reserve = f.positions.reserve; admission = zero
-  value <- O.loadBook f cid
+  f <- O.setupWithPrecision Good 100 0.01 0
+  value <- O.loadBook f f.book
   assert (value.assetDecimals == 0 && value.terms.priceTick == 0.01 && value.terms.quantityLot == 100)

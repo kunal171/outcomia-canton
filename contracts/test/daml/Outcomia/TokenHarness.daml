@@ -7,7 +7,7 @@ import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Splice.Api.Token.MetadataV1
 
-data FactoryMode = Good | Pending | Failed | ShortPayment | WrongChange | WrongAsset | WrongReceiver | LockedOutput | DuplicateOutput | NoOutputs | FragmentedSelf | ShortPartition | ShortSettlementCredit | ShortSettlementRefund | ShortFeeCollection | ShortFeeRefund | ShortFeeWithdrawal
+data FactoryMode = Good | Pending | Failed | ShortPayment | WrongChange | WrongAsset | WrongReceiver | LockedOutput | DuplicateOutput | NoOutputs | FragmentedSelf | ShortPartition | ShortSettlementCredit | ShortSettlementRefund | ShortFeeCollection | ShortFeeRefund | ShortFeeWithdrawal | ShortRedemption
   deriving (Eq, Show)
 
 template TestHolding
@@ -72,7 +72,8 @@ registryTransfer issuer mode factory args = do
              (mode == ShortSettlementCredit && transfer.amount == 3.2) ||
              (mode == ShortSettlementRefund && transfer.amount == 2.6) ||
              (mode == ShortFeeCollection && transfer.amount == 0.003) ||
-             (mode == ShortFeeRefund && transfer.amount == 2.594))
+             (mode == ShortFeeRefund && transfer.amount == 2.594) ||
+             (mode == ShortRedemption && transfer.amount == 6.797))
       let amount = if mode == ShortPayment || fragmented || shortPartition || (mode == ShortFeeWithdrawal && sender /= receiver && transfer.amount == 0.003) then transfer.amount / 2.0 else transfer.amount
       let account = if mode == WrongReceiver then H.Account (Some issuer) None "" else transfer.receiver
       let instrument = if mode == WrongAsset then H.InstrumentId issuer "other" else transfer.instrumentId

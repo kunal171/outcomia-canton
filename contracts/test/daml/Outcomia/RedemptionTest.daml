@@ -1,0 +1,243 @@
+-- | Full funded lifecycle and final reserve accounting. Claims burn genuine
+-- lots; every check includes actual token holdings, not only returned numbers.
+module Outcomia.RedemptionTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import DA.List (unique)
+import Outcomia.Binary
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.FeeCollectionTest qualified as Fee
+import Outcomia.LifecycleTest qualified as L
+import Outcomia.Fixtures (termsFor)
+import Outcomia.Orders
+import Outcomia.OrdersTest qualified as O
+import Outcomia.Positions
+import Outcomia.Resolution
+import Outcomia.ResolutionTest qualified as R
+import Outcomia.SettlementTest qualified as S
+import Outcomia.TokenHarness
+import Outcomia.Types
+import Splice.Api.Token.HoldingV2 qualified as H
+
+data Fixture = Fixture with
+    fees : Fee.Config
+    book : ContractId OrderBook
+    reserve : ContractId SettledReserve
+    aliceBalance : ContractId AssetBalance
+    bobBalance : ContractId AssetBalance
+    alicePosition : ContractId PositionLot
+    bobPosition : ContractId PositionLot
+    final : ContractId FinalResolution
+  deriving (Eq, Show)
+
+-- | Create/fund/trade/resolve/finalize/bind, using the real public choices.
+-- Three collateral units back three YES owned by Alice and three NO by Bob.
+setup : FactoryMode -> ResolutionOutcome -> Script Fixture
+setup mode outcome = script do
+  fees <- Fee.setup mode 0.01
+  placed <- Fee.cross fees True 0.6 5 0.4 3
+  matched <- S.match fees.ledger placed Yes
+  (buyRef, _) <- Fee.findOrder fees matched.book Buy
+  (alice, bobBalance) <- S.resultAccounts matched
+  cancelled <- O.cancel fees.ledger.orders matched.book buyRef.order (Some alice)
+  aliceBalance <- O.requireReleasedBalance cancelled
+  alicePosition <- O.requirePosition matched.position
+  let p = fees.ledger.orders.positions
+  let c = p.custody
+  lots <- query @PositionLot c.vault
+  bobPosition <- case [cid | (cid, lot) <- lots, lot.owner == c.asset.bob] of
+    [cid] -> pure cid
+    _ -> abort "Expected Bob's NO lot"
+  market <- L.marketFor c.asset.operator p.market
+  setTime market.terms.closeAt
+  proposal <- submit c.asset.operator do
+    exerciseCmd p.market Binary_ProposeResolution with protocol = fees.policy; outcome; evidence = R.validEvidence
+  pending <- R.loadProposal c.asset.operator proposal
+  setTime pending.finalizableAt
+  final <- submit c.asset.operator do exerciseCmd proposal ResolutionProposal_Finalize
+  reserve <- submit (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd fees.ledger.reserve MarketReserve_BindResolution with resolution = final
+  pure Fixture with fees; book = cancelled.book; reserve; aliceBalance; bobBalance; alicePosition; bobPosition; final
+
+claim : Fixture -> Party -> ContractId SettledReserve -> ContractId AssetBalance -> [ContractId PositionLot] -> Script RedemptionResult
+claim f owner reserve balance positions = do
+  let c = f.fees.ledger.orders.positions.custody
+  submit (actAs owner <> readAs [c.asset.operator, c.asset.issuer]) do
+    exerciseCmd reserve SettledReserve_Redeem with owner; balance; positions; extraArgs = C.registryContext
+
+-- Independent reconciliation includes fees and wallet exits, verifies each
+-- referenced holding, and rejects duplicate backing across accounting buckets.
+assertConserved : Fixture -> ContractId SettledReserve -> Script ()
+assertConserved f reserve = do
+  let c = f.fees.ledger.orders.positions.custody
+  found <- queryContractId c.vault reserve
+  settled <- case found of Some value -> pure value; None -> abort "Missing settled reserve"
+  holdings <- query @TestHolding c.asset.issuer
+  accounts <- query @AssetBalance c.vault
+  lots <- query @PositionLot c.vault
+  index <- O.loadBook f.fees.ledger.orders f.book
+  let amountAt cid = sum [h.amount | (id, h) <- holdings, Some (toInterfaceContractId @H.Holding id) == cid]
+  let ids = optionalHoldings settled.cash ++ optionalHoldings index.fees.cash ++ [cid | (_, b) <- accounts, Some cid <- [b.cash]]
+  assert (unique ids && null index.orders)
+  assert (amountAt settled.cash == settled.remainingCollateral && amountAt index.fees.cash == index.fees.amount)
+  assert (all (\(_, b) -> amountAt b.cash == b.available) accounts)
+  assert (sum [lot.yes | (_, lot) <- lots] == settled.yesOutstanding && sum [lot.no | (_, lot) <- lots] == settled.noOutstanding)
+  let wallets = sum [h.amount | (_, h) <- holdings, h.account.owner /= Some c.vault]
+  assert (sum [h.amount | (_, h) <- holdings] == 10.0)
+  assert (sum [b.available | (_, b) <- accounts] + settled.remainingCollateral + index.fees.amount + wallets == 10.0)
+
+runLifecycle : ResolutionOutcome -> Decimal -> Decimal -> Script ()
+runLifecycle outcome alicePayout bobPayout = script do
+  f <- setup Good outcome
+  let c = f.fees.ledger.orders.positions.custody
+  alice <- claim f c.asset.alice f.reserve f.aliceBalance [f.alicePosition]
+  assert (alice.paid == alicePayout && alice.burnedYes == 3 && alice.burnedNo == 0)
+  bob <- claim f c.asset.bob alice.reserve f.bobBalance [f.bobPosition]
+  assert (bob.paid == bobPayout && bob.burnedYes == 0 && bob.burnedNo == 3)
+  assertConserved f bob.reserve
+  a <- S.loadBalance f.fees.ledger alice.balance
+  b <- S.loadBalance f.fees.ledger bob.balance
+  assert (a.available == 3.797 + alicePayout && b.available == 3.2 + bobPayout)
+  forA_ [(c.asset.alice, alice.balance, a.available), (c.asset.bob, bob.balance, b.available)] (\(owner, balance, amount) -> do
+    _ <- submit (actAs owner <> readAs c.asset.issuer) do
+      exerciseCmd balance AssetBalance_Withdraw with amount; extraArgs = C.registryContext
+    pure ())
+  withdrawn <- Fee.withdraw f.fees f.book 0.003
+  assertConserved (f with book = withdrawn.book) bob.reserve
+
+testYesLifecycleThroughWalletWithdrawal : Script ()
+testYesLifecycleThroughWalletWithdrawal = runLifecycle YesWins 3.0 0.0
+
+testNoLifecycleThroughWalletWithdrawal : Script ()
+testNoLifecycleThroughWalletWithdrawal = runLifecycle NoWins 0.0 3.0
+
+testInvalidLifecycleRefundsHalfPerOutcome : Script ()
+testInvalidLifecycleRefundsHalfPerOutcome = runLifecycle Invalid 1.5 1.5
+
+testClaimOwnerDuplicateAndAccountChecks : Script ()
+testClaimOwnerDuplicateAndAccountChecks = script do
+  f <- setup Good YesWins
+  let c = f.fees.ledger.orders.positions.custody
+  forA_ [[], [f.alicePosition, f.alicePosition], [f.bobPosition]] (\positions ->
+    submitMustFail (actAs c.asset.alice <> readAs [c.asset.operator, c.asset.issuer, c.asset.bob]) do
+      exerciseCmd f.reserve SettledReserve_Redeem with owner = c.asset.alice; balance = f.aliceBalance; positions; extraArgs = C.registryContext)
+  submitMustFail (actAs c.asset.bob <> readAs [c.asset.operator, c.asset.issuer, c.asset.alice]) do
+    exerciseCmd f.reserve SettledReserve_Redeem with owner = c.asset.alice; balance = f.aliceBalance; positions = [f.alicePosition]; extraArgs = C.registryContext
+  submitMustFail (actAs c.asset.alice <> readAs [c.asset.operator, c.asset.issuer, c.asset.bob]) do
+    exerciseCmd f.reserve SettledReserve_Redeem with owner = c.asset.alice; balance = f.bobBalance; positions = [f.alicePosition]; extraArgs = C.registryContext
+  assertConserved f f.reserve
+
+testClaimCannotReplayLotsOrOldReserve : Script ()
+testClaimCannotReplayLotsOrOldReserve = script do
+  f <- setup Good YesWins
+  let c = f.fees.ledger.orders.positions.custody
+  result <- claim f c.asset.alice f.reserve f.aliceBalance [f.alicePosition]
+  forA_ [f.reserve, result.reserve] (\reserve ->
+    submitMustFail (actAs c.asset.alice <> readAs [c.asset.operator, c.asset.issuer]) do
+      exerciseCmd reserve SettledReserve_Redeem with owner = c.asset.alice; balance = result.balance; positions = [f.alicePosition]; extraArgs = C.registryContext)
+  assertConserved f result.reserve
+
+testLosingClaimWorksAfterReserveIsEmptyAndAdmissionRevoked : Script ()
+testLosingClaimWorksAfterReserveIsEmptyAndAdmissionRevoked = script do
+  f <- setup Good YesWins
+  let c = f.fees.ledger.orders.positions.custody
+  winner <- claim f c.asset.alice f.reserve f.aliceBalance [f.alicePosition]
+  submit c.asset.operator do archiveCmd c.asset.admission
+  loser <- claim f c.asset.bob winner.reserve f.bobBalance [f.bobPosition]
+  assert (loser.paid == 0.0 && loser.balance == f.bobBalance)
+  assertConserved f loser.reserve
+
+testBindingConsumesOldSplitMergeReserve : Script ()
+testBindingConsumesOldSplitMergeReserve = script do
+  f <- setup Good YesWins
+  let p = f.fees.ledger.orders.positions
+  let c = p.custody
+  submitMustFail (actAs c.asset.alice <> readAs [c.asset.operator, c.asset.issuer]) do
+    exerciseCmd f.fees.ledger.reserve MarketReserve_Merge with owner = c.asset.alice; balance = f.aliceBalance; positions = [f.alicePosition]; quantity = 1; extraArgs = C.registryContext
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd f.fees.ledger.reserve MarketReserve_BindResolution with resolution = f.final
+  assertConserved f f.reserve
+
+testFaultyRegistryRestoresClaimAndBacking : Script ()
+testFaultyRegistryRestoresClaimAndBacking = script do
+  f <- setup ShortRedemption YesWins
+  let c = f.fees.ledger.orders.positions.custody
+  before <- query @TestHolding c.asset.issuer
+  submitMustFail (actAs c.asset.alice <> readAs [c.asset.operator, c.asset.issuer]) do
+    exerciseCmd f.reserve SettledReserve_Redeem with owner = c.asset.alice; balance = f.aliceBalance; positions = [f.alicePosition]; extraArgs = C.registryContext
+  after <- query @TestHolding c.asset.issuer
+  assert (before == after)
+  lot <- queryContractId c.asset.alice f.alicePosition
+  assert (lot /= None)
+  assertConserved f f.reserve
+
+testWrongFinalBindingAndPrematureResultReject : Script ()
+testWrongFinalBindingAndPrematureResultReject = script do
+  fees <- Fee.setup Good 0.01
+  let p = fees.ledger.orders.positions
+  let c = p.custody
+  market <- L.marketFor c.asset.operator p.market
+  setTime market.terms.closeAt
+  pending <- submit c.asset.operator do
+    exerciseCmd p.market Binary_ProposeResolution with protocol = fees.policy; outcome = YesWins; evidence = R.validEvidence
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd fees.ledger.reserve MarketReserve_BindResolution with resolution = coerceContractId pending
+  proposal <- R.loadProposal c.asset.operator pending
+  setTime proposal.finalizableAt
+  final <- submit c.asset.operator do exerciseCmd pending ResolutionProposal_Finalize
+  value <- queryContractId c.asset.operator final
+  snapshot <- case value of Some result -> pure result; None -> abort "Missing final result"
+  wrong <- submit c.asset.operator do
+    createCmd (snapshot with proposal = snapshot.proposal with key = snapshot.proposal.key with marketId = 999)
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd fees.ledger.reserve MarketReserve_BindResolution with resolution = wrong
+  S.assertConserved fees.ledger fees.ledger.orders.book
+
+testWholeUnitAssetRejectsUnpayableInvalidLot : Script ()
+testWholeUnitAssetRejectsUnpayableInvalidLot = script do
+  c <- C.setupWithPrecision Good 0
+  let a = c.asset
+  (protocol, draft) <- submit a.operator do
+    exerciseCmd a.protocol Protocol_CreateBinary with creator = a.operator; terms = (termsFor a.issuer a.now) with priceTick = 0.2; quantityLot = 5
+  root <- submit [a.operator, c.vault] do
+    createCmd PositionRegistry with operator = a.operator; vault = c.vault; protocolName = "outcomia"; marketIds = []
+  submitMustFail a.operator do
+    exerciseCmd root PositionRegistry_CreateReserve with creator = a.operator; protocol; market = draft; admission = a.admission
+  found <- queryContractId a.operator root
+  assert (found /= None)
+
+testCancelledSellEscrowCanClaimAfterBinding : Script ()
+testCancelledSellEscrowCanClaimAfterBinding = script do
+  fees <- Fee.setup Good 0.01
+  placed <- Fee.cross fees True 0.6 1 0.4 3
+  matched <- S.match fees.ledger placed Yes
+  let p = fees.ledger.orders.positions
+  let c = p.custody
+  market <- L.marketFor c.asset.operator p.market
+  setTime market.terms.closeAt
+  proposal <- submit c.asset.operator do
+    exerciseCmd p.market Binary_ProposeResolution with protocol = fees.policy; outcome = YesWins; evidence = R.validEvidence
+  pending <- R.loadProposal c.asset.operator proposal
+  setTime pending.finalizableAt
+  final <- submit c.asset.operator do exerciseCmd proposal ResolutionProposal_Finalize
+  settled <- submit (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd fees.ledger.reserve MarketReserve_BindResolution with resolution = final
+  (askRef, _) <- Fee.findOrder fees matched.book Sell
+  cancelled <- submit (actAs c.asset.bob <> readAs [c.asset.operator, c.asset.issuer]) do
+    exerciseCmd matched.book OrderBook_Cancel with owner = c.asset.bob; order = askRef.order; balance = None; extraArgs = C.registryContext
+  lots <- query @PositionLot c.vault
+  let positions = [cid | (cid, lot) <- lots, lot.owner == c.asset.bob]
+  (_, balance) <- S.resultAccounts matched
+  paid <- submit (actAs c.asset.bob <> readAs [c.asset.operator, c.asset.issuer]) do
+    exerciseCmd settled SettledReserve_Redeem with owner = c.asset.bob; balance; positions; extraArgs = C.registryContext
+  assert (paid.paid == 2.0 && paid.burnedYes == 2 && paid.burnedNo == 3)
+  index <- O.loadBook fees.ledger.orders cancelled.book
+  assert (null index.orders && index.fees.amount == 0.001)
+  actual <- queryContractId c.vault paid.reserve
+  case actual of Some value -> assert (value.remainingCollateral == 1.0 && value.yesOutstanding == 1 && value.noOutstanding == 0); None -> abort "Missing settled state"
+
+testInvalidPayoutDoesNotOverflowSumOfOutcomeSupply : Script ()
+testInvalidPayoutDoesNotOverflowSumOfOutcomeSupply = script do
+  assert (outcomePayout Invalid 9223372036854775807 9223372036854775807 == intToDecimal 9223372036854775807)

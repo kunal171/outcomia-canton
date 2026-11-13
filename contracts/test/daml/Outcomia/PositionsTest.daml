@@ -30,8 +30,11 @@ setup mode lot = setupWithTick mode lot 0.01
 -- | Inputs: registry behavior, whole-contract lot and exact market tick. Result:
 -- a genuinely initialized market/reserve, including tiny-cash rounding fixtures.
 setupWithTick : FactoryMode -> Int -> Decimal -> Script Fixture
-setupWithTick mode lot tick = script do
-  custody <- C.setup mode
+setupWithTick mode lot tick = setupWithPrecision mode lot tick 6
+
+setupWithPrecision : FactoryMode -> Int -> Decimal -> Int -> Script Fixture
+setupWithPrecision mode lot tick precision = script do
+  custody <- C.setupWithPrecision mode precision
   let f = custody.asset
   funded <- C.deposit custody custody.balance 5.0 [toInterfaceContractId @H.Holding f.input]
   (protocol, draft) <- submit f.operator do

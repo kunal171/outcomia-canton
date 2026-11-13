@@ -25,8 +25,11 @@ setup : FactoryMode -> Int -> Script Fixture
 setup mode lot = setupWithTick mode lot 0.01
 
 setupWithTick : FactoryMode -> Int -> Decimal -> Script Fixture
-setupWithTick mode lot tick = script do
-  positions <- P.setupWithTick mode lot tick
+setupWithTick mode lot tick = setupWithPrecision mode lot tick 6
+
+setupWithPrecision : FactoryMode -> Int -> Decimal -> Int -> Script Fixture
+setupWithPrecision mode lot tick precision = script do
+  positions <- P.setupWithPrecision mode lot tick precision
   let a = positions.custody.asset
   root <- submit [a.operator, positions.custody.vault] do
     createCmd OrderRegistry with operator = a.operator; vault = positions.custody.vault; protocolName = "outcomia"; marketIds = []
