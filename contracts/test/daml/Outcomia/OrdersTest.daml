@@ -224,7 +224,7 @@ testExactCutoffAndImmutableMarketTerms = script do
   found <- queryContractId a.operator f.positions.market
   market <- case found of Some value -> pure value; None -> abort "Missing market"
   altered <- submit a.operator do createCmd (market with terms = (market.terms with question = "Different terms"))
-  draft <- submit a.operator do createCmd (market with status = Draft)
+  draft <- submit a.operator do createCmd (market with status = Draft; openedAt = None)
   forA_ [altered, draft] (\cid -> do
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
       exerciseCmd f.book OrderBook_PlaceBuy with owner = a.alice; market = cid; balance = f.positions.balance; outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext; feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)

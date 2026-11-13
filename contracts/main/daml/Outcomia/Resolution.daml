@@ -1,0 +1,85 @@
+-- | Binary outcome proposals and their immutable evidence/time boundary. A
+-- proposal is not a final result or spend authority: no reserve, trader cash,
+-- outcome lot or fee holding is touched by this checkpoint. Binary consumes the
+-- opened market when creating a proposal, preventing duplicate proposal choices
+-- within that configured market lineage. Joint operator/creator trust remains.
+module Outcomia.Resolution where
+
+import DA.Time (addRelTime, seconds)
+import DA.Text qualified as T
+import Outcomia.Types
+import Outcomia.Validation (boundedText, validDigest, termsErrors)
+
+-- | Invalid is distinct from NO. Its redemption formula must be specified and
+-- tested in the later finalization/redemption milestone; no payout exists here.
+data ResolutionOutcome = YesWins | NoWins | Invalid
+  deriving (Eq, Show)
+
+-- | The ledger checks evidence shape and an exact document digest, not the
+-- document's truth or availability. Clients must verify its bytes and criteria.
+data ResolutionEvidence = ResolutionEvidence with
+    summary : Text
+    documentUri : Text
+    documentSha256 : Text
+  deriving (Eq, Show)
+
+template ResolutionProposal
+  with
+    key : MarketKey
+    creator : Party
+    terms : BinaryTerms
+    marketCreatedAt : Time
+    openedAt : Time
+    proposedBy : Party
+    outcome : ResolutionOutcome
+    evidence : ResolutionEvidence
+    proposedAt : Time
+    finalizableAt : Time
+  where
+    signatory key.operator, creator
+    observer proposedBy, fallbackObservers terms
+    ensure key.marketId > 0 && boundedText 64 key.protocolName &&
+      null (termsErrors creator marketCreatedAt terms) &&
+      marketCreatedAt <= openedAt && openedAt < terms.closeAt &&
+      null (evidenceErrors evidence) &&
+      eligibleResolver creator terms proposedBy proposedAt &&
+      finalizableAt == addRelTime proposedAt (seconds terms.resolutionDelaySeconds)
+
+-- | Inputs: immutable terms and proposed ledger time. Result: the earliest
+-- eligible time. Administrative early closure never accelerates this schedule.
+effectiveEarliest : BinaryTerms -> Time
+effectiveEarliest terms = case terms.earliestResolutionAt of
+  None -> terms.closeAt
+  Some timestamp -> timestamp
+
+-- | Inputs: signed creator/terms, proposed resolver and time. Result: whether
+-- that resolver's agreed window is open. Primary ends exactly at fallback
+-- availability. Fallback's optional deadline is exclusive; no deadline means
+-- no expiry. This does NOT grant admin status: Binary checks the live protocol.
+eligibleResolver : Party -> BinaryTerms -> Party -> Time -> Bool
+eligibleResolver creator terms resolver now = now >= effectiveEarliest terms &&
+  (if resolver == creator then case terms.fallback of
+    None -> True
+    Some policy -> now < policy.availableAt
+   else case terms.fallback of
+    None -> False
+    Some policy -> resolver == policy.resolver && now >= policy.availableAt &&
+      (case policy.deadlineAt of None -> True; Some deadline -> now < deadline))
+
+-- | Inputs: evidence summary, URI and digest. Result: all detected format errors.
+-- Evidence cannot be empty; valid shape is not an oracle or a truth guarantee.
+evidenceErrors : ResolutionEvidence -> [Text]
+evidenceErrors evidence =
+  [message | (message, valid) <-
+    [ ("Evidence summary must contain 1 to 4096 characters", boundedText 4096 evidence.summary)
+    , ("Evidence URI must use ar:// or https:// and contain at most 512 characters",
+        boundedText 512 evidence.documentUri &&
+        ((T.isPrefixOf "ar://" evidence.documentUri && T.length evidence.documentUri > 5) ||
+         (T.isPrefixOf "https://" evidence.documentUri && T.length evidence.documentUri > 8)))
+    , ("Evidence hash must be lowercase SHA-256 hex", validDigest evidence.documentSha256)
+    ], not valid]
+
+-- | Inputs: agreed terms. Result: the explicitly nominated fallback observer,
+-- or none. Canton controllers are not automatically granted contract visibility.
+fallbackObservers : BinaryTerms -> [Party]
+fallbackObservers terms = case terms.fallback of None -> []; Some policy -> [policy.resolver]

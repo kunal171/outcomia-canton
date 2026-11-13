@@ -58,8 +58,8 @@ testDirectInvariantsAndCounterLimit = script do
   exhausted <- submit operator do createCmd Protocol with operator; protocolName = "limit"; admins = [operator, creator]; nextMarketId = 9223372036854775807; takerFeeBps = 0; feeRevision = 0
   submitMustFail creator do exerciseCmd exhausted Protocol_CreateBinary with creator; terms
   submitMustFail [operator, creator] do
-    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms = (terms with priceTick = 0.0); createdAt = now; status = Draft; closeReason = None
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms = (terms with priceTick = 0.0); createdAt = now; status = Draft; closeReason = None; openedAt = None
   submitMustFail [operator, creator] do
-    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Closed; closeReason = None
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Closed; closeReason = None; openedAt = None
   submitMustFail [operator, creator] do
-    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Draft; closeReason = Some "not closed"
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Draft; closeReason = Some "not closed"; openedAt = None
