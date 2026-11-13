@@ -82,9 +82,10 @@ after the cutoff. Closing early stops trading but does not move the resolution
 schedule or decide a winner. Opening records `openedAt`; cancelled drafts retain
 no opening history and cannot propose resolution. A proposal consumes the market
 revision and carries a delayed eligibility timestamp. Corrections restart the review delay; operator finalization records the exact
-proposal after that delay. Invalid-market payout rules and redemption need
-separate choices/tests before
-public funding is enabled.
+proposal after that delay. The operator then binds the final snapshot to the reserve; owners redeem their
+positions for collateral. Invalid refunds half per YES or NO. See
+[redemption](binary-redemption.md). Public funding remains gated on deployment
+and actual registry/wallet verification.
 
 ## Visibility and contention
 

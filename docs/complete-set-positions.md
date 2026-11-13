@@ -80,9 +80,9 @@ Any unburned quantities become one remainder lot.
 
 Merge does not require an open market, active admin or live admission. It works
 after closure and cutoff using the saved factory. It cannot overcome an issuer
-freeze or unavailable registry. Final resolution/redemption is not implemented:
-that future transition must consume the reserve and define subsequent merge
-rules. Updating only the lifecycle contract would not disable this merge path.
+freeze or unavailable registry. Binding a final result consumes the live reserve and disables this merge path.
+Its settled successor supports owner redemption instead. Finalization alone
+does not consume the reserve; the operator must bind it.
 
 ## Conservation and authority
 

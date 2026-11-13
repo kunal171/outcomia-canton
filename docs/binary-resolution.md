@@ -2,7 +2,7 @@
 
 Markets support outcome proposals, corrections and delayed finalization. These
 transitions move no reserve collateral, trader cash, positions or fee holdings.
-Redemption is not implemented. Public Canton trading remains gated until
+[Redemption](binary-redemption.md) uses a separate final-reserve transition. Public Canton trading remains gated until
 contracts, registry compatibility and wallet submission are verified.
 
 ## Who decides the outcome
@@ -54,8 +54,7 @@ wall-clock guarantee.
 
 A proposal contains the market key, creator, immutable terms, creation/opening
 times, resolver, outcome, evidence, proposal time, revision and finalization time.
-`YesWins`, `NoWins` and `Invalid` are distinct. Invalid-result payout rules will
-be specified and tested with redemption; a final record alone pays nothing.
+`YesWins`, `NoWins` and `Invalid` are distinct. Invalid pays half a collateral unit per YES or NO during redemption; a final record alone pays nothing.
 
 Evidence requires a 1–4096-character summary, an `https://` or `ar://` URI of at
 most 512 characters, and a 64-character lowercase SHA-256 digest. These checks

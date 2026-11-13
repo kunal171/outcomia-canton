@@ -84,7 +84,7 @@ These are local ledger checks; production DAR validation is a separate check.
   one transaction. A single outcome cannot use this merge path.
 - Before resolution, outstanding YES supply equals outstanding NO supply and
   equals the collateral reserved for complete sets. Trading changes ownership,
-  not total backing. Final redemption needs its own accounting rules.
+  not total backing. [Final redemption](binary-redemption.md) accounts for outstanding outcomes separately.
 - Reusing consumed holdings, positions or old account revisions must fail.
 - New splits require an open market before its cutoff. A pause or cutoff must
   not prevent free withdrawals or otherwise valid complete-set merges.

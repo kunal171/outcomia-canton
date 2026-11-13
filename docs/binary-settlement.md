@@ -138,14 +138,15 @@ Matched traders see the nested settlement transaction, including the fetched
 book/order data. This version does not promise per-order privacy from other
 matching participants. Private clubs will need an explicit disclosure design.
 
-Public-network deployment, actual registry compatibility, read/submission
-services, cross-outcome matching, resolution and redemption remain separate
-milestones. Only the production DAR is deployable; the test DAR includes the
+Resolution and redemption now have locally tested choices and shared UI
+commands. Public-network deployment, actual registry compatibility, live wallet
+verification, a persistent matcher service and cross-outcome matching remain
+separate milestones. Only the production DAR is deployable; the test DAR includes the
 fault-injecting registry and `daml-script`.
 
 ## Verification
 
-`make DPM="$PWD/target/tools/dpm" test` passes 166 Daml scripts, including 20
+`make DPM="$PWD/target/tools/dpm" test` passes 178 Daml scripts, including 20
 settlement scripts, plus four Python dependency checks. Production DAR validation
 passes with 39 packages.
 
