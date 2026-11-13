@@ -9,7 +9,8 @@ permissionless user-created market feature.
 
 The shared UI connects Loop or Console Wallet. Canton contracts have locally
 tested binary creation/open/close, shared per-asset balances, complete-set
-split/merge, funded orders, cancellation and one-pair atomic matching, funded fee collection and operator fee withdrawal. Resolution, reward redemption and multi-outcome markets remain.
+split/merge, funded orders, cancellation and one-pair atomic matching, funded fee collection and operator fee withdrawal. Resolution proposals are locally checked; finalization, reward redemption and
+multi-outcome markets remain.
 No public Canton market deployment or wallet-to-ledger trading is verified.
 
 The current roadmap places clubs/private markets after resolution/redemption
