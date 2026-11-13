@@ -2,7 +2,7 @@
 
 Markets support outcome proposals, corrections and delayed finalization. These
 transitions move no reserve collateral, trader cash, positions or fee holdings.
-Redemption is not implemented. Public Canton trading remains gated until
+[Redemption](binary-redemption.md) uses a separate final-reserve transition. Public Canton trading remains gated until
 contracts, registry compatibility and wallet submission are verified.
 
 ## Who decides the outcome
@@ -54,8 +54,7 @@ wall-clock guarantee.
 
 A proposal contains the market key, creator, immutable terms, creation/opening
 times, resolver, outcome, evidence, proposal time, revision and finalization time.
-`YesWins`, `NoWins` and `Invalid` are distinct. Invalid-result payout rules will
-be specified and tested with redemption; a final record alone pays nothing.
+`YesWins`, `NoWins` and `Invalid` are distinct. Invalid pays half a collateral unit per YES or NO during redemption; a final record alone pays nothing.
 
 Evidence requires a 1–4096-character summary, an `https://` or `ar://` URI of at
 most 512 characters, and a 64-character lowercase SHA-256 digest. These checks
@@ -111,13 +110,14 @@ flowchart LR
   Revised -->|further authorized correction| Revised
   Pending -->|operator; review delay elapsed| Final[Final resolution]
   Revised -->|operator; review delay elapsed| Final
-  Final -. redemption milestone .-> Claim[Collateral-backed claims]
+  Final -->|operator binds reserve| Settled[Settled reserve]
+  Settled -->|owner burns lots| Claim[Collateral-backed claims]
 ```
 
-Owner order cancellation and refunds remain available after proposal or
-finalization. Complete-set merge and wallet withdrawal are unchanged. Redemption
-must bind the final snapshot to the reserve and actual outcome ownership, and
-define the reserve/merge transition before releasing any rewards.
+Owner cancellation and refunds remain available after proposal or finalization.
+Complete-set merge remains available until the operator binds the final snapshot
+and consumes the live reserve. [Redemption](binary-redemption.md) then credits
+owned YES/NO/Invalid payouts to the trader's asset balance.
 
 ## Trust and verification
 
@@ -127,7 +127,7 @@ archive records outside these choices. This is not a permissionless oracle or a
 protection against those signers colluding. Operator finalization provides no
 liveness guarantee if the operator stops submitting.
 
-The full suite passes 166 Daml scripts, including 10 correction/finalization
+The full suite passes 178 Daml scripts, including 10 correction/finalization
 scripts and 13 proposal scripts, plus four Python checks and the independent fee
 arithmetic checks. The production DAR validates with 39 packages, including the
 separate role-interface package.
@@ -139,5 +139,5 @@ compares all cash holding IDs/amounts before and after finalization: nothing mov
 Static IDE-ledger time is used for exact boundary cases.
 
 Run `make DPM="$PWD/target/tools/dpm" test`. The production DAR excludes the test
-registry and daml-script. Next: YES/NO/invalid redemption with reserve and asset-
-conservation tests, followed by verified wallet/UI integration.
+registry and daml-script. The redemption suite also checks YES/NO/Invalid payouts through withdrawal.
+Deployment and live wallet integration testing remain excluded from this feature.

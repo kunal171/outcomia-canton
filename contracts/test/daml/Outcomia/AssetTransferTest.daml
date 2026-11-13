@@ -27,7 +27,10 @@ data Fixture = Fixture with
   deriving (Eq, Show)
 
 setup : FactoryMode -> Script Fixture
-setup mode = script do
+setup mode = setupWithPrecision mode 6
+
+setupWithPrecision : FactoryMode -> Int -> Script Fixture
+setupWithPrecision mode precision = script do
   operator <- allocatePartyByHint (PartyIdHint ("Operator-" <> show mode))
   issuer <- allocatePartyByHint (PartyIdHint ("Issuer-" <> show mode))
   alice <- allocatePartyByHint (PartyIdHint ("Alice-" <> show mode))
@@ -37,7 +40,7 @@ setup mode = script do
   registry <- submit issuer do createCmd TestRegistry with issuer; mode
   let instrument = CollateralInstrument issuer "test-USD"
   admission <- submit (actAs operator <> readAs issuer) do
-    exerciseCmd protocol Protocol_ApproveAsset with instrument; factory = toInterfaceContractId @T.TransferFactory registry; assetDecimals = 6
+    exerciseCmd protocol Protocol_ApproveAsset with instrument; factory = toInterfaceContractId @T.TransferFactory registry; assetDecimals = precision
   input <- submit issuer do
     createCmd TestHolding with issuer; account = H.Account (Some alice) None ""; instrument = H.InstrumentId issuer "test-USD"; amount = 5.0; locked = None
   pure Fixture with operator; issuer; alice; bob; protocol; admission; registry; input; now; instrument

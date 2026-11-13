@@ -34,7 +34,7 @@ be taker in one fill and maker in a later fill.
 
 Placement, cancellation, self-trade prevention, deposits, withdrawals and
 complete-set split/merge do not earn trading fees. Network charges are separate.
-Resolution and redemption are not implemented yet.
+Resolution and redemption also earn no trading fees.
 
 `Protocol_ApproveAsset` records vetted settlement precision `d`, from 0 to 10.
 The smallest transferable unit is `u = 10^-d`. Wallet symbols and display metadata
@@ -184,7 +184,7 @@ trusted and can bypass application accounting, as described in
 
 ## Verification
 
-The full suite passes 166 Daml scripts, including 15 collection/withdrawal
+The full suite passes 178 Daml scripts, including 15 collection/withdrawal
 scripts, plus four Python checks. Production DAR validation passes with 39
 packages. Run `make DPM="$PWD/target/tools/dpm" test` for the ledger suite and independent
 arithmetic checks. The production DAR excludes the test registry and daml-script.
@@ -198,5 +198,5 @@ invariants. Its 308 checked-in fee vectors are verified by
 792 precision/rate/price/quantity/role cases. These do not substitute for the
 registry-backed collection and withdrawal tests.
 
-Deployment, actual registry compatibility and wallet-to-ledger submission remain
-separate work. Local test success must not enable unconfigured public trading.
+The shared UI builds wallet commands, but deployment, actual registry
+compatibility and live wallet-to-ledger verification remain separate work. Local test success must not enable unconfigured public trading.

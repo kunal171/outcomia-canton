@@ -22,8 +22,11 @@ data Fixture = Fixture with
   deriving (Eq, Show)
 
 setup : FactoryMode -> Script Fixture
-setup mode = script do
-  asset <- F.setup mode
+setup mode = setupWithPrecision mode 6
+
+setupWithPrecision : FactoryMode -> Int -> Script Fixture
+setupWithPrecision mode precision = script do
+  asset <- F.setupWithPrecision mode precision
   vault <- allocatePartyByHint (PartyIdHint ("Vault-" <> show mode))
   root <- submit [asset.operator, vault] do
     createCmd VaultAuthority with operator = asset.operator; vault; protocolName = "outcomia"; accounts = []

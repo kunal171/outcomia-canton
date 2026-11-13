@@ -31,8 +31,7 @@ maker-price execution and cancel-newer self-trade behavior. [Atomic settlement](
 cancellation, with signed-order delegation and actual token transfers. The [fee rules and pure arithmetic](fee-accounting.md) are locally tested; fee
 policy, funded fees, atomic collection and operator withdrawal are also checked.
 [Resolution proposals, corrections and delayed finalization](binary-resolution.md)
-are locally checked; collateral-backed redemption remains. No public Canton deployment
-or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
+and [collateral-backed redemption](binary-redemption.md) are locally checked. The shared UI implements typed wallet commands for the binary lifecycle. No public Canton deployment or live wallet smoke test has been performed. See the [lifecycle design](binary-market-lifecycle.md).
 
 The chosen [collateral custody model](collateral-custody.md) uses a dedicated
 vault party with explicit signer trust. Its public-network hosting is not configured.
@@ -60,5 +59,5 @@ reuse a previous party's commands.
 The current contracts have no club membership or invitation gate. Existing
 matching and account-registry disclosure must be redesigned before promising
 private club activity. Member removal must preserve safe exits. The roadmap
-next steps are collateral-backed redemption, multi-outcome,
+next steps are deployment verification, multi-outcome,
 clubs, then governance.
