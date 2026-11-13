@@ -167,7 +167,7 @@ testExactCutoffAndWrongMarket = script do
   -- The lifecycle signer can make a valid alternative contract with the same
   -- numeric identity. The reserve must still reject changed immutable terms.
   altered <- submit a.operator do createCmd (original with terms = (original.terms with question = "Different question"))
-  activeDraft <- submit a.operator do createCmd (original with status = Draft)
+  activeDraft <- submit a.operator do createCmd (original with status = Draft; openedAt = None)
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
     exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = altered; balance = f.balance; quantity = 1; extraArgs = C.registryContext
   forA_ [activeDraft, f.draft] (\market -> do

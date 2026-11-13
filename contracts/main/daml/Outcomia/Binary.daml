@@ -1,5 +1,5 @@
 -- | Authorized binary market creation and lifecycle. This module does not hold
--- funds, place orders, resolve outcomes or redeem positions. Outcomia.Assets
+-- funds, place orders, finalize outcomes or redeem positions. Outcomia.Assets
 -- handles transfers; Outcomia.Custody binds holdings to available balances.
 --
 -- The operator is a trust anchor, not a privileged trader: it approves creator
@@ -12,6 +12,8 @@ import DA.List (unique)
 import qualified DA.Text as T
 import Outcomia.Assets (AssetAdmission(..))
 import Splice.Api.Token.TransferInstructionV2 qualified as T
+import DA.Time (addRelTime, seconds)
+import Outcomia.Resolution qualified as Resolution
 import Outcomia.Types
 import Outcomia.Validation
 
@@ -97,6 +99,7 @@ template Protocol
           terms
           createdAt = now
           status = Draft
+          openedAt = None
           closeReason = None
         pure (next, market)
 
@@ -114,10 +117,15 @@ template BinaryMarket
     createdAt : Time
     status : MarketStatus
     closeReason : Optional Text
+    openedAt : Optional Time
   where
     signatory operator, creator
+    observer Resolution.fallbackObservers terms
     ensure boundedText 64 protocolName && marketId > 0 &&
       null (termsErrors creator createdAt terms) &&
+      (case openedAt of
+        None -> status /= Open
+        Some timestamp -> status /= Draft && createdAt <= timestamp && timestamp < terms.closeAt) &&
       (case (status, closeReason) of
         (Closed, Some reason) -> boundedText 500 reason
         (Closed, None) -> False
@@ -135,7 +143,7 @@ template BinaryMarket
         assertMsg "Only a draft can open" (status == Draft)
         now <- getTime
         assertMsg "Trading cutoff has passed" (now < terms.closeAt)
-        create this with status = Open
+        create this with status = Open; openedAt = Some now
 
     -- | Inputs: current protocol revision and a short closure reason.
     -- Rejects: other callers, revoked admin, wrong/stale protocol, non-Open state
@@ -151,6 +159,42 @@ template BinaryMarket
         assertMsg "Only an open market can close" (status == Open)
         assertMsg "Closure reason must contain 1 to 500 characters" (boundedText 500 reason)
         create this with status = Closed; closeReason = Some reason
+
+    -- | Inputs: live protocol, proposed YES/NO/invalid result and evidence.
+    -- Errors: revoked/non-creator admin, never-opened market, early/expired
+    -- primary window or malformed evidence. Result: consumes this market and
+    -- creates one immutable proposal with a delayed finalization timestamp.
+    -- Closing early does not move the cutoff. No tokens or positions are spent.
+    choice Binary_ProposeResolution : ContractId Resolution.ResolutionProposal
+      with
+        protocol : ContractId Protocol
+        outcome : Resolution.ResolutionOutcome
+        evidence : Resolution.ResolutionEvidence
+      controller creator
+      do
+        checkCreator protocol operator protocolName creator
+        proposeResolution this creator outcome evidence
+
+    -- | Inputs: explicitly nominated fallback, current protocol and evidence.
+    -- Errors: wrong/inactive admin, absent fallback, never-opened market or time
+    -- outside the agreed fallback window. Result: the same one-proposal boundary.
+    -- A fallback needs no new primary signature: signed market terms already
+    -- delegate this exact choice, while current admin status is still required.
+    choice Binary_ProposeFallback : ContractId Resolution.ResolutionProposal
+      with
+        resolver : Party
+        protocol : ContractId Protocol
+        outcome : Resolution.ResolutionOutcome
+        evidence : Resolution.ResolutionEvidence
+      controller resolver
+      do
+        current <- fetch protocol
+        assertMsg "Fallback protocol does not belong to this market"
+          (current.operator == operator && current.protocolName == protocolName)
+        assertMsg "Fallback resolver must be an active admin" (resolver `elem` current.admins)
+        assertMsg "Only the configured fallback resolver may use this choice"
+          (case terms.fallback of None -> False; Some policy -> policy.resolver == resolver)
+        proposeResolution this resolver outcome evidence
 
     -- | Inputs: none. Rejects: other callers or non-Draft state. Result: a Closed
     -- draft marked cancelled. Removed creators can abandon unused drafts without
@@ -178,3 +222,24 @@ checkCreator protocol operator protocolName creator = do
   assertMsg "Protocol does not belong to this market"
     (current.operator == operator && current.protocolName == protocolName)
   assertMsg "Creator must still be an active admin" (creator `elem` current.admins)
+
+-- | Inputs: the consumed market's signed snapshot, authorized resolver and
+-- proposed result/evidence. Errors: never opened, wrong time/resolver or invalid
+-- evidence. Result: delayed proposal retaining every immutable market term.
+-- openedAt is explicit: a cancelled draft cannot become resolvable merely by
+-- giving its closure reason the same text as a formerly open market.
+proposeResolution : BinaryMarket -> Party -> Resolution.ResolutionOutcome -> Resolution.ResolutionEvidence -> Update (ContractId Resolution.ResolutionProposal)
+proposeResolution market resolver outcome evidence = do
+  opened <- case market.openedAt of
+    Some timestamp -> pure timestamp
+    None -> abort "Only a previously opened market can propose resolution"
+  now <- getTime
+  assertMsg "Resolver is outside its agreed resolution window"
+    (Resolution.eligibleResolver market.creator market.terms resolver now)
+  let problems = Resolution.evidenceErrors evidence
+  assertMsg (T.intercalate "; " problems) (null problems)
+  create Resolution.ResolutionProposal with
+    key = MarketKey market.operator market.protocolName market.marketId
+    creator = market.creator; terms = market.terms; marketCreatedAt = market.createdAt
+    openedAt = opened; proposedBy = resolver; outcome; evidence; proposedAt = now
+    finalizableAt = addRelTime now (seconds market.terms.resolutionDelaySeconds)

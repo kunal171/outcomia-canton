@@ -11,7 +11,7 @@ data Outcome = Yes | No
 data OrderSide = Buy | Sell deriving (Eq, Show)
 
 -- | Closed is an administrative trading stop, not an outcome or a payout.
--- There is no reopen transition. Future settlement must use separate states.
+-- There is no reopen transition. Resolution proposals use a separate contract.
 data MarketStatus = Draft | Open | Closed
   deriving (Eq, Show)
 
@@ -52,8 +52,9 @@ data FallbackPolicy = FallbackPolicy with
   deriving (Eq, Show)
 
 -- | All terms are fixed when a draft is created. To correct them, cancel the
--- draft and create a new market. The creator is the primary resolver; fallback
--- terms are recorded now but cannot resolve anything in this lifecycle package.
+-- draft and create a new market. The creator is the primary resolver; a
+-- nominated fallback takes over in its window. Both require active admin status
+-- to propose. Proposal state is separate from finalization and redemption.
 data BinaryTerms = BinaryTerms with
     question : Text
     collateral : CollateralInstrument

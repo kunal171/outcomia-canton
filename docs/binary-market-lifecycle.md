@@ -4,8 +4,9 @@ This checkpoint added Daml contracts for draft creation, opening and administrat
 closure. [Transfers](collateral-transfers.md), [balances](collateral-custody.md)
 and [complete sets](complete-set-positions.md) are separate contract modules.
 [Resting orders](binary-limit-orders.md) add funding/cancellation and
-[atomic matching](binary-settlement.md) settles one pair. Resolution and payouts
-remain unimplemented. The
+[atomic matching](binary-settlement.md) settles one pair.
+[Resolution proposals](binary-resolution.md) are implemented; corrections,
+finalization and payouts remain separate work. The
 shared frontend must keep showing `Market deployment pending` until a deployment
 and wallet-to-ledger integration are verified.
 
@@ -15,6 +16,8 @@ flowchart LR
   Draft -->|creator remains admin; before cutoff| Open
   Draft -->|creator cancels| Closed
   Open -->|creator remains admin; gives reason| Closed
+  Open -->|eligible resolver and time| Proposal[Pending resolution proposal]
+  Closed -->|previously opened; eligible resolver and time| Proposal
 ```
 
 ## Contracts and permissions
@@ -48,9 +51,9 @@ draft. No cancellation or closure here grants access to anyone's funds.
 Each market records its question, collateral instrument's admin/ID, YES/NO/invalid
 criteria, evidence requirements, rules URI/hash, trading cutoff, optional earliest
 resolution time, optional fallback, resolution delay, price tick and quantity lot.
-All remain unchanged across lifecycle transitions. The creator is the planned
-primary resolver. The fallback is recorded now; neither resolver can submit an
-outcome in this checkpoint.
+All remain unchanged across lifecycle transitions. The creator is the primary
+resolver. The explicitly nominated fallback takes over in its agreed time window;
+both require current admin status. See [proposal rules](binary-resolution.md).
 
 Questions are limited to 500 characters; each criteria/evidence field to 4096.
 A rules URI uses `ar://` or `https://` and a lowercase SHA-256 hex digest. Contracts
@@ -76,8 +79,11 @@ wall-clock timestamp. Test cases at exact boundaries use the static IDE ledger.
 The status does not change automatically when time passes. Future trade choices
 must check both `Open` and `now < closeAt`. Manual closure is terminal and may occur
 after the cutoff. Closing early stops trading but does not move the resolution
-schedule or decide a winner. Resolution, invalid-market handling and redemption
-need separate contracts and tests before public funding is enabled.
+schedule or decide a winner. Opening records `openedAt`; cancelled drafts retain
+no opening history and cannot propose resolution. A proposal consumes the market
+revision and carries a delayed eligibility timestamp. Corrections, finalization,
+invalid-market payout rules and redemption need separate choices/tests before
+public funding is enabled.
 
 ## Visibility and contention
 

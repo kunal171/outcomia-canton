@@ -61,9 +61,9 @@ testCreationAuthorization = script do
   submitMustFail (actAs outsider <> readAs operator) do
     exerciseCmd protocol Protocol_CreateBinary with creator; terms
   submitMustFail (actAs creator <> readAs operator) do
-    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Open; closeReason = None
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Open; closeReason = None; openedAt = Some now
   submitMustFail (actAs operator <> readAs creator) do
-    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Open; closeReason = None
+    createCmd BinaryMarket with operator; protocolName = "outcomia"; marketId = 1; creator; terms; createdAt = now; status = Open; closeReason = None; openedAt = Some now
   (_, draft) <- submit creator do exerciseCmd protocol Protocol_CreateBinary with creator; terms
   submitMustFail (actAs creator <> readAs operator) do archiveCmd draft
   submitMustFail (actAs operator <> readAs creator) do archiveCmd draft

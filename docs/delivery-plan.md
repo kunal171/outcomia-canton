@@ -30,7 +30,8 @@ add funded placement and cancellation. The [matching planner](binary-matching.md
 maker-price execution and cancel-newer self-trade behavior. [Atomic settlement](binary-settlement.md) now applies one fill or self-trade
 cancellation, with signed-order delegation and actual token transfers. The [fee rules and pure arithmetic](fee-accounting.md) are locally tested; fee
 policy, funded fees, atomic collection and operator withdrawal are also checked.
-Resolution and redemption remain. No public Canton deployment
+[Resolution proposals](binary-resolution.md) are locally checked; corrections,
+finalization and redemption remain. No public Canton deployment
 or wallet-to-ledger market commands are implemented yet. See the [lifecycle design](binary-market-lifecycle.md).
 
 The chosen [collateral custody model](collateral-custody.md) uses a dedicated
@@ -59,4 +60,5 @@ reuse a previous party's commands.
 The current contracts have no club membership or invitation gate. Existing
 matching and account-registry disclosure must be redesigned before promising
 private club activity. Member removal must preserve safe exits. The roadmap
-next steps are resolution/redemption, multi-outcome, clubs, then governance.
+next steps are resolution corrections/finalization and redemption, multi-outcome,
+clubs, then governance.
