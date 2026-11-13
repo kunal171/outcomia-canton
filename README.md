@@ -30,9 +30,9 @@ price/FIFO pairs and computes partial fills and refunds. The [atomic settlement 
 cancel-newer self-trade action. The [fee rules and pure arithmetic](docs/fee-accounting.md) are locally checked;
 operator policy, funded fees, atomic collection and fee withdrawal are also checked.
 [Resolution proposals, corrections and delayed finalization](docs/binary-resolution.md)
-are locally checked; collateral-backed redemption remains. [Clubs/private markets](docs/clubs-private-markets.md)
+and [collateral-backed redemption](docs/binary-redemption.md) are locally checked. [Clubs/private markets](docs/clubs-private-markets.md)
 are planned and have no implementation yet.
-No Canton markets are deployed yet.
+The shared UI includes wallet commands for the binary lifecycle. Deployment and live wallet testing remain outstanding; transaction controls stay disabled until verified.
 
 ## Contracts
 

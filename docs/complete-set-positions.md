@@ -137,3 +137,11 @@ live registry compatibility or frontend trading is claimed.
 
 Verified in this checkpoint: 48 Daml scripts (17 position scripts), four Python
 dependency tests, and production DAR validation with 38 packages.
+
+## Final settlement
+
+After finalization, the operator binds the final snapshot to the reserve. This
+consumes the live reserve, ends split/merge and enables owner redemption against
+its settled successor. Invalid outcomes pay half per YES or NO; reserve creation
+therefore rejects lots that cannot support exact half payouts in the admitted
+asset precision. See [redemption](binary-redemption.md).
