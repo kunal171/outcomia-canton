@@ -1,0 +1,244 @@
+-- | Correction/finalization tests use live signed role contracts and exact
+-- ledger-time boundaries. A forged interface view is deliberately readable so
+-- missing authorization cannot be confused with lack of contract visibility.
+module Outcomia.FinalizationTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, seconds)
+import Outcomia.Binary
+import Outcomia.CustodyTest qualified as C
+import Outcomia.FeeCollectionTest qualified as Fee
+import Outcomia.LifecycleTest qualified as L
+import Outcomia.Types qualified as Types
+import Outcomia.OrdersTest qualified as O
+import Outcomia.ProtocolRoles qualified as Roles
+import Outcomia.Resolution
+import Outcomia.ResolutionTest qualified as R
+import Outcomia.SettlementTest qualified as S
+import Outcomia.TokenHarness
+
+-- Test-only: any party can advertise an operator/name in its own view. The
+-- production role checker must reject it without the actual operator signature.
+template PretendRoles
+  with
+    signerParty : Party
+    advertisedOperator : Party
+    admins : [Party]
+  where
+    signatory signerParty
+    observer advertisedOperator, admins
+    interface instance Roles.ProtocolRoles for PretendRoles where
+      view = Roles.ProtocolRolesView advertisedOperator "outcomia" admins
+
+correctedEvidence : ResolutionEvidence
+correctedEvidence = R.validEvidence with
+  summary = "Corrected flight records contain no qualifying second orbital launch."
+
+-- | Inputs: fixture, current proposal, actor and changed outcome/evidence.
+-- Result: corrected proposal using current signed protocol roles.
+correct : R.Fixture -> ContractId ResolutionProposal -> Party -> ResolutionOutcome -> ResolutionEvidence -> Script (ContractId ResolutionProposal)
+correct f proposal resolver outcome evidence = submit (actAs resolver <> readAs f.operator) do
+  exerciseCmd proposal ResolutionProposal_Correct with
+    resolver; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+    replacementOutcome = outcome; replacementEvidence = evidence
+
+finalize : R.Fixture -> ContractId ResolutionProposal -> Script (ContractId FinalResolution)
+finalize f proposal = submit f.operator do exerciseCmd proposal ResolutionProposal_Finalize
+
+loadFinal : Party -> ContractId FinalResolution -> Script FinalResolution
+loadFinal actor cid = do
+  found <- queryContractId actor cid
+  case found of Some value -> pure value; None -> abort "Expected visible final resolution"
+
+testCorrectionRestartsFullReviewAndPreservesTerms : Script ()
+testCorrectionRestartsFullReviewAndPreservesTerms = script do
+  f <- R.setup None None
+  setTime f.terms.closeAt
+  first <- R.primary f f.market YesWins
+  initial <- R.loadProposal f.creator first
+  assert (initial.revision == 0)
+  setTime (addRelTime f.terms.closeAt (seconds 100))
+  next <- correct f first f.creator NoWins correctedEvidence
+  updated <- R.loadProposal f.creator next
+  assert (updated.revision == 1 && updated.key == initial.key && updated.terms == initial.terms &&
+    updated.marketCreatedAt == initial.marketCreatedAt && updated.openedAt == initial.openedAt &&
+    updated.proposedBy == f.creator && updated.outcome == NoWins && updated.evidence == correctedEvidence &&
+    updated.finalizableAt == addRelTime updated.proposedAt (seconds f.terms.resolutionDelaySeconds))
+  old <- queryContractId f.creator first
+  assert (old == None)
+  setTime initial.finalizableAt
+  submitMustFail f.operator do exerciseCmd next ResolutionProposal_Finalize
+  setTime updated.finalizableAt
+  cid <- finalize f next
+  result <- loadFinal f.creator cid
+  assert (result.proposal == updated && result.finalizedAt == updated.finalizableAt)
+
+testCorrectionRequiresAdminAndActualResolverRole : Script ()
+testCorrectionRequiresAdminAndActualResolverRole = script do
+  f <- R.setup None None
+  setTime f.terms.closeAt
+  cid <- R.primary f f.market YesWins
+  forA_ [f.operator, f.fallback, f.outsider] (\resolver ->
+    submitMustFail (actAs resolver <> readAs [f.operator, f.creator]) do
+      exerciseCmd cid ResolutionProposal_Correct with
+        resolver; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+        replacementOutcome = NoWins; replacementEvidence = correctedEvidence)
+  _ <- R.loadProposal f.creator cid
+  pure ()
+
+testRevokedAndStaleRolesRejectButDoNotEraseTimelyProposal : Script ()
+testRevokedAndStaleRolesRejectButDoNotEraseTimelyProposal = script do
+  f <- R.setup None None
+  setTime f.terms.closeAt
+  cid <- R.primary f f.market YesWins
+  original <- R.loadProposal f.creator cid
+  revoked <- submit f.operator do
+    exerciseCmd f.protocol Protocol_SetAdmins with replacementAdmins = [f.operator, f.fallback]
+  forA_ [f.protocol, revoked] (\policy ->
+    submitMustFail (actAs f.creator <> readAs f.operator) do
+      exerciseCmd cid ResolutionProposal_Correct with
+        resolver = f.creator; roles = toInterfaceContractId @Roles.ProtocolRoles policy
+        replacementOutcome = NoWins; replacementEvidence = correctedEvidence)
+  setTime original.finalizableAt
+  final <- finalize f cid
+  value <- loadFinal f.creator final
+  assert (value.proposal == original)
+
+testForeignAndUnsignedRoleViewsCannotAuthorizeCorrection : Script ()
+testForeignAndUnsignedRoleViewsCannotAuthorizeCorrection = script do
+  f <- R.setup None None
+  wrongName <- submit f.operator do
+    createCmd Protocol with operator = f.operator; protocolName = "other"; admins = [f.operator, f.creator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  wrongOperator <- submit f.outsider do
+    createCmd Protocol with operator = f.outsider; protocolName = "outcomia"; admins = [f.outsider, f.creator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  fake <- submit f.outsider do
+    createCmd PretendRoles with signerParty = f.outsider; advertisedOperator = f.operator; admins = [f.creator]
+  setTime f.terms.closeAt
+  cid <- R.primary f f.market YesWins
+  let policies = [toInterfaceContractId @Roles.ProtocolRoles wrongName,
+        toInterfaceContractId @Roles.ProtocolRoles wrongOperator, toInterfaceContractId @Roles.ProtocolRoles fake]
+  forA_ policies (\roles ->
+    submitMustFail (actAs f.creator <> readAs [f.operator, f.outsider]) do
+      exerciseCmd cid ResolutionProposal_Correct with
+        resolver = f.creator; roles; replacementOutcome = NoWins; replacementEvidence = correctedEvidence)
+  _ <- R.loadProposal f.creator cid
+  pure ()
+
+testFallbackCanCorrectWithinWindowAndFinalizeAfterDeadline : Script ()
+testFallbackCanCorrectWithinWindowAndFinalizeAfterDeadline = script do
+  f <- R.setup None (Some (10, Some 20))
+  setTime f.terms.closeAt
+  cid <- R.primary f f.market YesWins
+  setTime (addRelTime f.terms.closeAt (seconds 10))
+  next <- correct f cid f.fallback NoWins correctedEvidence
+  updated <- R.loadProposal f.fallback next
+  assert (updated.proposedBy == f.fallback && updated.revision == 1)
+  submitMustFail f.creator do
+    exerciseCmd next ResolutionProposal_Correct with
+      resolver = f.creator; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+      replacementOutcome = YesWins; replacementEvidence = R.validEvidence
+  setTime (addRelTime f.terms.closeAt (seconds 20))
+  submitMustFail f.fallback do
+    exerciseCmd next ResolutionProposal_Correct with
+      resolver = f.fallback; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+      replacementOutcome = Invalid; replacementEvidence = R.validEvidence
+  setTime updated.finalizableAt
+  final <- finalize f next
+  result <- loadFinal f.fallback final
+  assert (result.proposal == updated)
+
+testExactFinalizationBoundaryRejectsCorrections : Script ()
+testExactFinalizationBoundaryRejectsCorrections = script do
+  f <- R.setup None None
+  setTime f.terms.closeAt
+  cid <- R.primary f f.market YesWins
+  value <- R.loadProposal f.creator cid
+  setTime (addRelTime value.finalizableAt (seconds (-1)))
+  submitMustFail f.operator do exerciseCmd cid ResolutionProposal_Finalize
+  setTime value.finalizableAt
+  submitMustFail f.creator do
+    exerciseCmd cid ResolutionProposal_Correct with
+      resolver = f.creator; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+      replacementOutcome = NoWins; replacementEvidence = correctedEvidence
+  _ <- finalize f cid
+  pure ()
+
+testNoopAndInvalidEvidenceCannotResetReview : Script ()
+testNoopAndInvalidEvidenceCannotResetReview = script do
+  f <- R.setup None None
+  setTime f.terms.closeAt
+  cid <- R.primary f f.market YesWins
+  before <- R.loadProposal f.creator cid
+  submitMustFail f.creator do
+    exerciseCmd cid ResolutionProposal_Correct with
+      resolver = f.creator; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+      replacementOutcome = YesWins; replacementEvidence = R.validEvidence
+  submitMustFail f.creator do
+    exerciseCmd cid ResolutionProposal_Correct with
+      resolver = f.creator; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+      replacementOutcome = NoWins; replacementEvidence = correctedEvidence with summary = " "
+  after <- R.loadProposal f.creator cid
+  assert (before == after)
+
+testRevisionExhaustionAndForgedFinalTimeReject : Script ()
+testRevisionExhaustionAndForgedFinalTimeReject = script do
+  f <- R.setup None None
+  setTime f.terms.closeAt
+  cid <- R.primary f f.market YesWins
+  value <- R.loadProposal f.creator cid
+  exhausted <- submit [f.operator, f.creator] do createCmd (value with revision = 9223372036854775807)
+  submitMustFail f.creator do
+    exerciseCmd exhausted ResolutionProposal_Correct with
+      resolver = f.creator; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+      replacementOutcome = NoWins; replacementEvidence = correctedEvidence
+  submitMustFail [f.operator, f.creator] do
+    createCmd FinalResolution with proposal = value; finalizedAt = value.proposedAt
+  finals <- query @FinalResolution f.creator
+  assert (null finals)
+
+testOnlyOperatorFinalizesAndOldProposalCannotReplay : Script ()
+testOnlyOperatorFinalizesAndOldProposalCannotReplay = script do
+  f <- R.setup None (Some (10, None))
+  setTime f.terms.closeAt
+  cid <- R.primary f f.market YesWins
+  value <- R.loadProposal f.creator cid
+  setTime value.finalizableAt
+  forA_ [f.creator, f.fallback, f.outsider] (\caller ->
+    submitMustFail (actAs caller <> readAs [f.operator, f.creator]) do exerciseCmd cid ResolutionProposal_Finalize)
+  final <- finalize f cid
+  submitMustFail f.operator do exerciseCmd cid ResolutionProposal_Finalize
+  submitMustFail f.creator do
+    exerciseCmd cid ResolutionProposal_Correct with
+      resolver = f.creator; roles = toInterfaceContractId @Roles.ProtocolRoles f.protocol
+      replacementOutcome = NoWins; replacementEvidence = correctedEvidence
+  submitMustFail f.creator do archiveCmd final
+  values <- query @FinalResolution f.creator
+  assert (length values == 1)
+
+testFinalizationPreservesBackingAndOwnerCancellation : Script ()
+testFinalizationPreservesBackingAndOwnerCancellation = script do
+  f <- Fee.setup Good 0.01
+  placed <- Fee.cross f True 0.6 5 0.4 3
+  matched <- S.match f.ledger placed Types.Yes
+  let p = f.ledger.orders.positions
+  let c = p.custody
+  -- All cash already includes earned fees and a partially filled buy escrow.
+  holdingsBefore <- query @TestHolding c.asset.issuer
+  market <- L.marketFor c.asset.operator p.market
+  setTime market.terms.closeAt
+  proposal <- submit c.asset.operator do
+    exerciseCmd p.market Binary_ProposeResolution with protocol = f.policy; outcome = YesWins; evidence = R.validEvidence
+  value <- R.loadProposal c.asset.operator proposal
+  setTime value.finalizableAt
+  final <- submit c.asset.operator do exerciseCmd proposal ResolutionProposal_Finalize
+  holdingsAfter <- query @TestHolding c.asset.issuer
+  assert (holdingsBefore == holdingsAfter)
+  _ <- loadFinal c.asset.operator final
+  (ref, _) <- Fee.findOrder f matched.book Types.Buy
+  (buyer, _) <- S.resultAccounts matched
+  cancelled <- O.cancel f.ledger.orders matched.book ref.order (Some buyer)
+  returned <- O.requireReleasedBalance cancelled
+  account <- C.loadAccount c returned
+  assert (account.available == 3.797)
+  S.assertConserved f.ledger cancelled.book
