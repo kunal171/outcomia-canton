@@ -46,8 +46,8 @@ template Protocol
     -- | Inputs: replacement rate in 0..1000 basis points, operator authorization.
     -- Errors: rate outside bounds, unauthorized caller or revision exhaustion.
     -- Result: a consuming successor; old approval quotes cannot use this ID.
-    -- Existing orders retain their signed snapshot. Nonzero placement stays
-    -- disabled until cash reserves, collection and refunds support those fees.
+    -- Existing orders retain their signed snapshot. New orders fund their
+    -- approved fee budget; settlement collects into the market's backed pool.
     choice Protocol_SetTakerFee : ContractId Protocol
       with replacementFeeBps : Int
       controller operator

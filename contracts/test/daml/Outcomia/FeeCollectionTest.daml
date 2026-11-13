@@ -1,0 +1,326 @@
+-- | Nonzero-fee ledger integration. Tests reconcile actual registry holdings,
+-- all trader balances, reserve/outcome supply, buy escrow and the market pool.
+-- Fault modes consume real inputs before lying, so failures prove rollback.
+module Outcomia.FeeCollectionTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import Outcomia.Binary
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Fees qualified as F
+import Outcomia.MarketFees qualified as MF
+import Outcomia.Matching qualified as M
+import Outcomia.Orders
+import Outcomia.OrdersTest qualified as O
+import Outcomia.Positions (PositionLot)
+import Outcomia.PositionsTest qualified as P
+import Outcomia.SettlementTest qualified as S
+import Outcomia.TokenHarness
+import Outcomia.Types
+import Splice.Api.Token.HoldingV2 qualified as H
+
+data Config = Config with
+    ledger : S.Fixture
+    policy : ContractId Protocol
+    revision : Int
+    rate : Int
+  deriving (Eq, Show)
+
+setup : FactoryMode -> Decimal -> Script Config
+setup mode tick = script do
+  ledger <- S.setupWithTick mode tick
+  let a = ledger.orders.positions.custody.asset
+  policy <- submit a.operator do
+    exerciseCmd ledger.orders.positions.protocol Protocol_SetTakerFee with replacementFeeBps = 25
+  pure Config with ledger; policy; revision = 1; rate = 25
+
+-- | Inputs: current configured rate and a new operator-approved rate. Result:
+-- successor configuration for new orders; old orders are deliberately untouched.
+setRate : Config -> Int -> Script Config
+setRate f rate = do
+  next <- submit f.ledger.orders.positions.custody.asset.operator do
+    exerciseCmd f.policy Protocol_SetTakerFee with replacementFeeBps = rate
+  pure f with policy = next; revision = f.revision + 1; rate
+
+placeBuy : Config -> ContractId OrderBook -> ContractId AssetBalance -> Decimal -> Int -> Script PlacementResult
+placeBuy f book balance price quantity = do
+  let p = f.ledger.orders.positions
+  let a = p.custody.asset
+  submit (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd book OrderBook_PlaceBuy with
+      owner = a.alice; market = p.market; balance; outcome = Yes; price; quantity; extraArgs = C.registryContext
+      feePolicy = f.policy; expectedFeeRevision = f.revision; expectedFeeTerms = F.FeeTerms f.rate 6
+
+placeSellFor : Config -> Party -> ContractId OrderBook -> ContractId PositionLot -> Decimal -> Int -> Script PlacementResult
+placeSellFor f owner book position price quantity = do
+  let p = f.ledger.orders.positions
+  let a = p.custody.asset
+  submit (actAs owner <> readAs [a.operator, a.issuer]) do
+    exerciseCmd book OrderBook_PlaceSell with
+      owner; market = p.market; positions = [position]; outcome = Yes; price; quantity
+      feePolicy = f.policy; expectedFeeRevision = f.revision; expectedFeeTerms = F.FeeTerms f.rate 6
+
+placeSell : Config -> ContractId OrderBook -> ContractId PositionLot -> Decimal -> Int -> Script PlacementResult
+placeSell f = placeSellFor f f.ledger.orders.positions.custody.asset.bob
+
+cross : Config -> Bool -> Decimal -> Int -> Decimal -> Int -> Script S.Crossed
+cross f sellFirst buyPrice buyQty sellPrice sellQty = do
+  let g = f.ledger
+  if sellFirst then do
+    ask <- placeSell f g.orders.book g.position sellPrice sellQty
+    bid <- placeBuy f ask.book g.buyerBalance buyPrice buyQty
+    buyerBalance <- O.requireBalance bid
+    pure S.Crossed with book = bid.book; buy = bid.order; sell = ask.order; buyerBalance; sellerBalance = g.sellerBalance
+  else do
+    bid <- placeBuy f g.orders.book g.buyerBalance buyPrice buyQty
+    ask <- placeSell f bid.book g.position sellPrice sellQty
+    buyerBalance <- O.requireBalance bid
+    pure S.Crossed with book = ask.book; buy = bid.order; sell = ask.order; buyerBalance; sellerBalance = g.sellerBalance
+
+findOrder : Config -> ContractId OrderBook -> OrderSide -> Script (OrderReference, LimitOrder)
+findOrder f book side = do
+  index <- O.loadBook f.ledger.orders book
+  case filter (\ref -> ref.side == side) index.orders of
+    [ref] -> do
+      order <- O.loadOrder f.ledger.orders ref.order
+      pure (ref, order)
+    _ -> abort "Expected exactly one order on this side"
+
+-- | Inputs: completed result and exact independently calculated amounts.
+-- Result: receipt and pool checks plus conservation of all ten funded units.
+assertFee : Config -> SettlementResult -> Decimal -> Decimal -> Decimal -> Script ()
+assertFee f result fee refund remaining = do
+  cid <- case result.receipt of Some value -> pure value; None -> abort "Expected fill receipt"
+  found <- queryContractId f.ledger.orders.positions.custody.asset.alice cid
+  receipt <- case found of Some value -> pure value; None -> abort "Missing visible receipt"
+  assert (receipt.feeAmount == fee && receipt.buyerRefund == refund && receipt.remainingBuyEscrow == remaining)
+  S.assertConserved f.ledger result.book
+
+withdraw : Config -> ContractId OrderBook -> Decimal -> Script FeeWithdrawalResult
+withdraw f book amount = do
+  let c = f.ledger.orders.positions.custody
+  submit (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd book OrderBook_WithdrawFees with amount; extraArgs = C.registryContext
+
+testBuyTakerPaysFeeAndCancelsOnlyUnearnedReserve : Script ()
+testBuyTakerPaysFeeAndCancelsOnlyUnearnedReserve = script do
+  f <- setup Good 0.01
+  placed <- cross f True 0.6 5 0.4 3
+  funded <- S.loadBalance f.ledger placed.buyerBalance
+  assert (funded.available == 1.9925)
+  result <- S.match f.ledger placed Yes
+  assertFee f result 0.003 0.6015 1.203
+  (buyer, seller) <- S.resultAccounts result
+  b <- S.loadBalance f.ledger buyer
+  s <- S.loadBalance f.ledger seller
+  assert (b.available == 2.594 && s.available == 3.2)
+  (ref, order) <- findOrder f result.book Buy
+  assert (order.originalQuantity == 5 && order.quantity == 2 && order.takerNotional == 1.2 && order.paidFee == 0.003)
+  cancelled <- O.cancel f.ledger.orders result.book ref.order (Some buyer)
+  returned <- O.requireReleasedBalance cancelled
+  final <- S.loadBalance f.ledger returned
+  index <- O.loadBook f.ledger.orders cancelled.book
+  assert (final.available == 3.797 && index.fees.amount == 0.003)
+  S.assertConserved f.ledger cancelled.book
+
+testSellTakerPaysFromProceedsAndMakerBuyReleasesFeeBudget : Script ()
+testSellTakerPaysFromProceedsAndMakerBuyReleasesFeeBudget = script do
+  f <- setup Good 0.01
+  placed <- cross f False 0.6 1 0.4 3
+  result <- S.match f.ledger placed Yes
+  assertFee f result 0.0015 0.0015 0.0
+  (buyer, seller) <- S.resultAccounts result
+  b <- S.loadBalance f.ledger buyer
+  s <- S.loadBalance f.ledger seller
+  assert (b.available == 4.4 && s.available == 2.5985)
+  (_, order) <- findOrder f result.book Sell
+  assert (order.originalQuantity == 3 && order.quantity == 2 && order.takerNotional == 0.6 && order.paidFee == 0.0015)
+
+testUnfilledBuyCancellationReturnsFullFeeBudget : Script ()
+testUnfilledBuyCancellationReturnsFullFeeBudget = script do
+  f <- setup Good 0.01
+  placed <- placeBuy f f.ledger.orders.book f.ledger.buyerBalance 0.6 5
+  balance <- O.requireBalance placed
+  cancelled <- O.cancel f.ledger.orders placed.book placed.order (Some balance)
+  restored <- O.requireReleasedBalance cancelled
+  account <- S.loadBalance f.ledger restored
+  index <- O.loadBook f.ledger.orders cancelled.book
+  assert (account.available == 5.0 && index.fees == MF.FeePoolState 0.0 None)
+  S.assertConserved f.ledger cancelled.book
+
+testBuyCannotSpendFullBalanceWithoutItsFeeReserve : Script ()
+testBuyCannotSpendFullBalanceWithoutItsFeeReserve = script do
+  f <- setup Good 0.01
+  let p = f.ledger.orders.positions
+  let a = p.custody.asset
+  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.ledger.orders.book OrderBook_PlaceBuy with
+      owner = a.alice; market = p.market; balance = f.ledger.buyerBalance
+      outcome = Yes; price = 0.5; quantity = 10; extraArgs = C.registryContext
+      feePolicy = f.policy; expectedFeeRevision = 1; expectedFeeTerms = F.FeeTerms 25 6
+  index <- O.loadBook f.ledger.orders f.ledger.orders.book
+  assert (index.nextOrderId == 1 && null index.orders)
+  S.assertConserved f.ledger f.ledger.orders.book
+
+testPartialFillsAccumulateFeesAndCanonicalPool : Script ()
+testPartialFillsAccumulateFeesAndCanonicalPool = script do
+  f <- setup Good 0.01
+  firstAsk <- placeSell f f.ledger.orders.book f.ledger.position 0.4 1
+  remainder <- O.requirePosition firstAsk.remainder
+  secondAsk <- placeSell f firstAsk.book remainder 0.5 1
+  bid <- placeBuy f secondAsk.book f.ledger.buyerBalance 0.6 3
+  buyerBalance <- O.requireBalance bid
+  first <- S.match f.ledger (S.Crossed bid.book bid.order firstAsk.order buyerBalance f.ledger.sellerBalance) Yes
+  firstIndex <- O.loadBook f.ledger.orders first.book
+  (buyRef, _) <- findOrder f first.book Buy
+  (buyer, seller) <- S.resultAccounts first
+  second <- S.match f.ledger (S.Crossed first.book buyRef.order secondAsk.order buyer seller) Yes
+  assertFee f second 0.00125 0.10025 0.6015
+  index <- O.loadBook f.ledger.orders second.book
+  (_, order) <- findOrder f second.book Buy
+  assert (index.fees.amount == 0.00225 && order.takerNotional == 0.9 && order.paidFee == 0.00225 && order.quantity == 1)
+  holdings <- query @TestHolding f.ledger.orders.positions.custody.asset.issuer
+  assert (not (any (\(cid, _) -> Some (toInterfaceContractId @H.Holding cid) == firstIndex.fees.cash) holdings))
+
+testNewSellUsesNewRateAndOldMakerBuyPaysNoFee : Script ()
+testNewSellUsesNewRateAndOldMakerBuyPaysNoFee = script do
+  f <- setup Good 0.01
+  bid <- placeBuy f f.ledger.orders.book f.ledger.buyerBalance 0.6 1
+  updated <- setRate f 100
+  ask <- placeSell updated bid.book f.ledger.position 0.4 1
+  balance <- O.requireBalance bid
+  result <- S.match f.ledger (S.Crossed ask.book bid.order ask.order balance f.ledger.sellerBalance) Yes
+  assertFee f result 0.006 0.0015 0.0
+  index <- O.loadBook f.ledger.orders result.book
+  assert (index.fees.amount == 0.006)
+
+testExistingTakerKeepsRateAfterPolicyUpdate : Script ()
+testExistingTakerKeepsRateAfterPolicyUpdate = script do
+  f <- setup Good 0.01
+  placed <- cross f True 0.6 5 0.4 3
+  _ <- setRate f 100
+  result <- S.match f.ledger placed Yes
+  assertFee f result 0.003 0.6015 1.203
+
+testTinySellCanPayEntireGrossWithoutZeroTransfer : Script ()
+testTinySellCanPayEntireGrossWithoutZeroTransfer = script do
+  f <- setup Good 0.000001
+  bid1 <- placeBuy f f.ledger.orders.book f.ledger.buyerBalance 0.000399 1
+  balance1 <- O.requireBalance bid1
+  bid2 <- placeBuy f bid1.book balance1 0.000001 1
+  balance2 <- O.requireBalance bid2
+  ask <- placeSell f bid2.book f.ledger.position 0.000001 2
+  first <- S.match f.ledger (S.Crossed ask.book bid1.order ask.order balance2 f.ledger.sellerBalance) Yes
+  assertFee f first 0.0 0.0 0.0
+  (askRef, partial) <- findOrder f first.book Sell
+  assert (partial.takerNotional == 0.000399 && partial.paidFee == 0.0)
+  (buyer, seller) <- S.resultAccounts first
+  second <- S.match f.ledger (S.Crossed first.book bid2.order askRef.order buyer seller) Yes
+  assertFee f second 0.000001 0.0 0.0
+  (_, unchangedSeller) <- S.resultAccounts second
+  assert (unchangedSeller == seller)
+  index <- O.loadBook f.ledger.orders second.book
+  assert (null index.orders && index.fees.amount == 0.000001)
+
+testFeeCollectionFailureRollsBackSellerCredit : Script ()
+testFeeCollectionFailureRollsBackSellerCredit = runFailedMatch ShortFeeCollection
+
+testBuyerRefundFailureRollsBackCollectedFee : Script ()
+testBuyerRefundFailureRollsBackCollectedFee = runFailedMatch ShortFeeRefund
+
+runFailedMatch : FactoryMode -> Script ()
+runFailedMatch mode = script do
+  f <- setup mode 0.01
+  placed <- cross f True 0.6 5 0.4 3
+  let p = f.ledger.orders.positions
+  let c = p.custody
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd placed.book OrderBook_MatchBest with
+      market = p.market; outcome = Yes
+      buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+  S.assertUnchanged f.ledger placed
+
+testWithdrawalAuthorizationBoundsAndReplay : Script ()
+testWithdrawalAuthorizationBoundsAndReplay = script do
+  f <- setup Good 0.01
+  placed <- cross f True 0.6 5 0.4 3
+  result <- S.match f.ledger placed Yes
+  let c = f.ledger.orders.positions.custody
+  forA_ [c.asset.alice, c.asset.bob, c.vault] (\caller ->
+    submitMustFail (actAs caller <> readAs [c.asset.operator, c.vault, c.asset.issuer]) do
+      exerciseCmd result.book OrderBook_WithdrawFees with amount = 0.003; extraArgs = C.registryContext)
+  forA_ [0.0, -0.001, 0.004, 0.0000001] (\amount ->
+    submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+      exerciseCmd result.book OrderBook_WithdrawFees with amount; extraArgs = C.registryContext)
+  first <- withdraw f result.book 0.001
+  index <- O.loadBook f.ledger.orders first.book
+  assert (index.fees.amount == 0.002 && length first.walletHoldings == 1)
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd result.book OrderBook_WithdrawFees with amount = 0.001; extraArgs = C.registryContext
+  -- Trading closure never locks legitimately earned fees in the vault.
+  _ <- submit c.asset.operator do
+    exerciseCmd f.ledger.orders.positions.market Binary_Close with protocol = f.policy; reason = "Fee withdrawal test"
+  final <- withdraw f first.book 0.002
+  empty <- O.loadBook f.ledger.orders final.book
+  assert (empty.fees == MF.FeePoolState 0.0 None)
+  holdings <- query @TestHolding c.asset.operator
+  assert (sum [h.amount | (_, h) <- holdings, h.account.owner == Some c.asset.operator] == 0.003)
+  S.assertConserved f.ledger final.book
+
+testEmptyPoolCannotWithdrawTraderBacking : Script ()
+testEmptyPoolCannotWithdrawTraderBacking = script do
+  f <- setup Good 0.01
+  let c = f.ledger.orders.positions.custody
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd f.ledger.orders.book OrderBook_WithdrawFees with amount = 0.001; extraArgs = C.registryContext
+  S.assertConserved f.ledger f.ledger.orders.book
+
+testWithdrawalFailureRestoresPoolAndHoldings : Script ()
+testWithdrawalFailureRestoresPoolAndHoldings = script do
+  f <- setup ShortFeeWithdrawal 0.01
+  placed <- cross f True 0.6 5 0.4 3
+  result <- S.match f.ledger placed Yes
+  before <- O.loadBook f.ledger.orders result.book
+  let c = f.ledger.orders.positions.custody
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd result.book OrderBook_WithdrawFees with amount = 0.003; extraArgs = C.registryContext
+  after <- O.loadBook f.ledger.orders result.book
+  assert (before == after)
+  S.assertConserved f.ledger result.book
+
+testCorruptPoolCannotWithdrawOtherEscrow : Script ()
+testCorruptPoolCannotWithdrawOtherEscrow = script do
+  f <- setup Good 0.01
+  placed <- cross f True 0.6 5 0.4 3
+  result <- S.match f.ledger placed Yes
+  index <- O.loadBook f.ledger.orders result.book
+  (_, buy) <- findOrder f result.book Buy
+  cash <- case buy.backing of CashEscrow cid -> pure cid; _ -> abort "Missing buy escrow"
+  let c = f.ledger.orders.positions.custody
+  bad <- submit [c.asset.operator, c.vault] do
+    createCmd (index with fees = MF.FeePoolState 0.003 (Some cash))
+  submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
+    exerciseCmd bad OrderBook_WithdrawFees with amount = 0.003; extraArgs = C.registryContext
+  -- A raw operator/vault forged an extra index for this negative test. Remove
+  -- it jointly; genuine book and all real backing are still untouched.
+  submit [c.asset.operator, c.vault] do archiveCmd bad
+  S.assertConserved f.ledger result.book
+
+testSelfTradeRefundsBuyFeeBudgetWithoutCollecting : Script ()
+testSelfTradeRefundsBuyFeeBudgetWithoutCollecting = script do
+  f <- setup Good 0.01
+  let p = f.ledger.orders.positions
+  let c = p.custody
+  split <- P.split p f.ledger.reserve f.ledger.buyerBalance 1
+  let g = f with ledger = f.ledger with reserve = split.reserve
+  ask <- placeSellFor g c.asset.alice g.ledger.orders.book split.position 0.4 1
+  bid <- placeBuy g ask.book split.balance 0.6 1
+  balance <- O.requireBalance bid
+  result <- S.match g.ledger (S.Crossed bid.book bid.order ask.order balance balance) Yes
+  assert (result.decision == M.CancelSelfTrade 2 && result.receipt == None)
+  index <- O.loadBook g.ledger.orders result.book
+  assert (index.fees == MF.FeePoolState 0.0 None)
+  account <- case result.balances of [cid] -> S.loadBalance g.ledger cid; _ -> abort "Expected self account"
+  assert (account.available == 4.0)
+  S.assertConserved g.ledger result.book

@@ -100,26 +100,28 @@ testForeignPoliciesReject = script do
         feePolicy = policy; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)
   O.assertConserved f f.book f.positions.reserve f.positions.balance
 
-testNonzeroRateBlocksBothSidesAndPreservesBacking : Script ()
-testNonzeroRateBlocksBothSidesAndPreservesBacking = script do
+testNonzeroRateFundsBothSidesWithApprovedSnapshots : Script ()
+testNonzeroRateFundsBothSidesWithApprovedSnapshots = script do
   f <- O.setup Good 1
   let a = f.positions.custody.asset
   split <- P.split f.positions f.positions.reserve f.positions.balance 2
   high <- setRate f f.positions.protocol 25
-  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
+  bid <- submit (actAs a.alice <> readAs [a.operator, a.issuer]) do
     exerciseCmd f.book OrderBook_PlaceBuy with
       owner = a.alice; market = f.positions.market; balance = split.balance
       outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
       feePolicy = high; expectedFeeRevision = 1; expectedFeeTerms = Fees.FeeTerms 25 6
-  submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.book OrderBook_PlaceSell with
+  ask <- submit (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd bid.book OrderBook_PlaceSell with
       owner = a.alice; market = f.positions.market; positions = [split.position]
       outcome = Yes; price = 0.4; quantity = 1
       feePolicy = high; expectedFeeRevision = 1; expectedFeeTerms = Fees.FeeTerms 25 6
-  O.assertConserved f f.book split.reserve split.balance
-  index <- O.loadBook f f.book
-  lot <- P.loadLot f.positions split.position
-  assert (index.nextOrderId == 1 && null index.orders && lot.yes == 2 && lot.no == 2)
+  balance <- O.requireBalance bid
+  O.assertConserved f ask.book split.reserve balance
+  account <- C.loadAccount f.positions.custody balance
+  buy <- O.loadOrder f bid.order
+  sell <- O.loadOrder f ask.order
+  assert (account.available == 2.599 && buy.feeTerms == Fees.FeeTerms 25 6 && sell.feeTerms == buy.feeTerms)
 
 testExistingOrdersSettleAndPartialSnapshotsSurviveUpdate : Script ()
 testExistingOrdersSettleAndPartialSnapshotsSurviveUpdate = script do

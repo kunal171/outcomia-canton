@@ -35,7 +35,9 @@ priority and prevents a self-cross from becoming a trade or fee-generating fill.
 ## Amounts
 
 Fill the smaller remaining quantity. Both quantities must follow the market lot,
-so their minimum and remainders also follow it. Fees are zero in this checkpoint.
+so their minimum and remainders also follow it. This pure planner returns gross
+amounts; [settlement](binary-settlement.md) adds the signed taker fee, fee-budget
+refunds and fee-inclusive remaining escrow.
 
 For a buy of 5 at 0.60 against an older sell of 3 at 0.40:
 

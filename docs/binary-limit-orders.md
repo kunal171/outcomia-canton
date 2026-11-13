@@ -20,11 +20,12 @@ flowchart LR
 
 ## Funding
 
-A buy for 3 YES at 0.40 locks exactly 1.20 collateral in a separate vault holding.
-The available balance falls by 1.20. Both old backing and account revisions are
+A buy for 3 YES at 0.40 and 25 bps locks 1.203 collateral in a separate vault
+holding: 1.20 trade cost plus 0.003 fee budget. The available balance falls by
+1.203. Both old backing and account revisions are
 consumed in that transaction. An empty account has no holding; it can still
-receive a cancellation refund. Orders snapshot the approved fee terms, but only
-zero-rate placement is enabled until fee funding and collection are complete.
+receive a cancellation refund. Orders snapshot the approved fee terms and unused fee budget returns on fill
+or cancellation.
 
 A sell for 3 YES consumes the supplied position lots and records 3 YES inside
 the signed order. Remaining YES and all NO return in one available lot. The
@@ -32,7 +33,7 @@ selected contracts cannot also be merged or sold again: their old lots no longer
 exist. The market's complete-set reserve stays unchanged.
 
 ```text
-actual vault cash = available balances + complete-set reserves + buy escrows
+actual vault cash = available balances + complete-set reserves + buy escrows + fee pools
 outstanding YES = available YES lots + YES sell escrows
 outstanding NO  = available NO lots  + NO sell escrows
 ```
@@ -50,7 +51,7 @@ lots from the same owner, vault and market.
 Tick checks use exact scaled integers. Decimal has ten fractional digits; prices
 below one scale to fewer than 10^10 integer units. Integer remainder avoids
 division rounding accepting a price just off tick, such as 0.4000000001 on a
-0.01 tick. `price × quantity` then determines the exact collateral escrow.
+0.01 tick. The funding helper then adds the maximum remaining fee budget to trade escrow.
 
 ## Initialization and identity
 
@@ -79,8 +80,8 @@ Each buy/sell supplies the current protocol ID and expected fee revision, rate
 and asset precision. A changed or archived approval rejects before escrow.
 Only the operator changes the rate; orders and partial successors retain their
 original snapshot. Orders also retain original size and cumulative taker spending;
-funding/refund helpers validate that history against actual escrow. New nonzero-rate
-orders are blocked. See [fee accounting](fee-accounting.md).
+funding/refund helpers validate that history against actual escrow. Atomic
+settlement collects the taker fee; maker fills release unused budget. See [fee accounting](fee-accounting.md).
 
 ## Cancellation
 
@@ -123,7 +124,8 @@ partial-fill amounts and cancel-newer self-trade behavior. The
 [atomic settlement path](binary-settlement.md) now recomputes that plan from the
 current book and fetched orders, then updates cash, outcome ownership, partial
 orders and references together. Partial orders retain their original priority.
-Fees, bounded fill batches and cross-outcome matching remain separate work.
+The [fee path](fee-accounting.md) collects into a backed market pool in that
+transaction. Bounded fill batches and cross-outcome matching remain separate work.
 
 ## Verification and deployment limits
 

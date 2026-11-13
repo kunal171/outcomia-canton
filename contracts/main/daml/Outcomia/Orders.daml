@@ -15,6 +15,7 @@ import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Outcomia.Assets (AssetAdmission(..), holdingTotal)
 import Outcomia.Fees qualified as Fees
+import Outcomia.MarketFees qualified as MarketFees
 import Outcomia.Binary
 import Outcomia.Custody
 import Outcomia.Positions
@@ -22,7 +23,7 @@ import Outcomia.Matching qualified as Matching
 import Outcomia.Types
 import Outcomia.Validation (boundedText, termsErrors)
 
--- | A buy's exact price*quantity holding or a sell's quantity of its selected
+-- | A buy's exact trade-and-fee holding or a sell's quantity of its selected
 -- outcome. Sell backing is represented directly in the signed order, not by a
 -- reusable reference to an unlocked position lot.
 data OrderBacking = CashEscrow (ContractId H.Holding) | OutcomeEscrow
@@ -41,6 +42,12 @@ data PlacementResult = PlacementResult with
     order : ContractId LimitOrder
     balance : Optional (ContractId AssetBalance)
     remainder : Optional (ContractId PositionLot)
+  deriving (Eq, Show)
+
+-- | Fee withdrawal replaces the book revision and returns real wallet cash.
+data FeeWithdrawalResult = FeeWithdrawalResult with
+    book : ContractId OrderBook
+    walletHoldings : [ContractId H.Holding]
   deriving (Eq, Show)
 
 data ReleasedBacking = ReleasedBacking with
@@ -77,6 +84,10 @@ template TradeFill
     instrument : CollateralInstrument
     plan : Matching.FillPlan
     executedAt : Time
+    feeTerms : Fees.FeeTerms
+    feeAmount : Decimal
+    buyerRefund : Decimal
+    remainingBuyEscrow : Decimal
   where
     signatory key.operator, vault
     observer buyer, seller
@@ -87,7 +98,10 @@ template TradeFill
       plan.quantity > 0 && plan.price > 0.0 && plan.price < 1.0 &&
       plan.sellerProceeds == plan.price * intToDecimal plan.quantity &&
       plan.buyerRefund >= 0.0 && plan.buyerEscrowRemaining >= 0.0 &&
-      plan.buyerRemaining >= 0 && plan.sellerRemaining >= 0
+      plan.buyerRemaining >= 0 && plan.sellerRemaining >= 0 &&
+      feeTerms.takerFeeBps >= 0 && feeTerms.takerFeeBps <= 1000 &&
+      feeTerms.assetDecimals >= 0 && feeTerms.assetDecimals <= 10 &&
+      feeAmount >= 0.0 && feeAmount <= plan.sellerProceeds && buyerRefund >= 0.0 && remainingBuyEscrow >= 0.0
 
 -- | One configured order-registry lineage, separate from account/reserve roots.
 -- Joint operator/vault signers can bootstrap another root, so services must pin
@@ -149,6 +163,7 @@ template OrderRegistry
           assetDecimals = asset.assetDecimals
           nextOrderId = 1
           orders = []
+          fees = MarketFees.FeePoolState 0.0 None
         pure (next, book)
 
 -- | One bounded committed index per market, covering YES/NO and both sides.
@@ -165,6 +180,7 @@ template OrderBook
     assetDecimals : Int
     nextOrderId : Int
     orders : [OrderReference]
+    fees : MarketFees.FeePoolState
   where
     signatory key.operator, vault
     observer creator
@@ -172,16 +188,31 @@ template OrderBook
       null (termsErrors creator marketCreatedAt terms) && nextOrderId > 0 &&
       assetDecimals >= 0 && assetDecimals <= 10 &&
       Numeric.roundNumeric assetDecimals Numeric.RoundingDown (terms.priceTick * intToDecimal terms.quantityLot) == terms.priceTick * intToDecimal terms.quantityLot &&
+      MarketFees.validPool assetDecimals fees &&
       length orders <= 128 && unique (map (\r -> r.orderId) orders) &&
       unique (map (\r -> r.order) orders) &&
       all (\r -> r.orderId > 0 && r.orderId < nextOrderId && validPrice terms.priceTick r.price) orders
 
+    -- | Inputs: positive fee amount and registry context, authorized by operator.
+    -- Errors: another caller, excess/off-quantum amount, stale backing or faulty
+    -- registry. Result: operator-wallet tokens and a book with the remaining
+    -- pool. Works after closure/cutoff; never debits trader or reserve holdings.
+    choice OrderBook_WithdrawFees : FeeWithdrawalResult
+      with
+        amount : Decimal
+        extraArgs : ExtraArgs
+      controller key.operator
+      do
+        moved <- MarketFees.withdrawFees key.operator vault terms.collateral factory assetDecimals fees amount extraArgs
+        next <- create this with fees = moved.pool
+        pure FeeWithdrawalResult with book = next; walletHoldings = moved.walletHoldings
+
     -- | Inputs: owner, current Open market, enrolled account, outcome, price,
     -- quantity, approved fee revision/terms and registry context. Rejects stale
-    -- fee quotes, nonzero rates, cutoff, off-tick/lot values,
+    -- fee quotes, cutoff, off-tick/lot values,
     -- foreign/insufficient account, capacity or sequence exhaustion.
-    -- Result: price*quantity collateral escrow, account successor and new book.
-    -- Example: 3 YES at 0.40 locks exactly 1.20 collateral, before future fees.
+    -- Result: trade plus maximum fee escrow, account successor and new book.
+    -- Example: 3 YES at 0.40 and 25 bps locks 1.203 collateral.
     choice OrderBook_PlaceBuy : PlacementResult
       with
         owner : Party
@@ -219,7 +250,7 @@ template OrderBook
         pure PlacementResult with book = next; order; balance = Some partition.balance; remainder = None
 
     -- | Inputs: owner, current market, 1..16 lots, order terms and fee quote.
-    -- Rejects: stale/nonzero fee quote, invalid market/price/quantity,
+    -- Rejects: stale fee quote, invalid market/price/quantity,
     -- wrong owner/market/vault or shortage
     -- of the selected outcome. Result: exactly quantity contracts in escrow;
     -- all other quantities remain in a successor lot. Reserve backing is unchanged.
@@ -346,7 +377,7 @@ template LimitOrder
     ensure vault /= key.operator && owner /= vault && key.marketId > 0 &&
       boundedText 64 key.protocolName && boundedText 128 instrument.id &&
       price > 0.0 && price < 1.0 && quantity > 0 && orderId > 0 &&
-      feeRevision >= 0 && feeTerms.takerFeeBps == 0 &&
+      feeRevision >= 0 && feeTerms.takerFeeBps >= 0 && feeTerms.takerFeeBps <= 1000 &&
       feeTerms.assetDecimals >= 0 && feeTerms.assetDecimals <= 10 &&
       validOrderFeeHistory this &&
       (case (side, backing) of (Buy, CashEscrow _) -> True; (Sell, OutcomeEscrow) -> True; _ -> False)
@@ -409,27 +440,33 @@ template LimitOrder
           plan.price plan.quantity (plan.takerId == buy.orderId))
         sellMovement <- checkedFee (Fees.sellFillFunding feeTerms takerNotional paidFee
           plan.sellerProceeds (plan.takerId == orderId))
-        -- Policy and template guards already restrict orders to zero bps. Keep
-        -- settlement fail-closed too: removing a placement guard alone must not
-        -- debit a fee before a separately backed collection pool exists.
-        assertMsg "Nonzero settlement fees require atomic collection support"
-          (buyMovement.feeCharged == 0.0 && sellMovement.accrual.charge == 0.0)
         assertMsg "Fee movement must agree with the verified fill gross"
-          (buyMovement.tradeCost == plan.sellerProceeds && sellMovement.netProceeds == plan.sellerProceeds)
+          (buyMovement.tradeCost == plan.sellerProceeds &&
+           sellMovement.netProceeds + sellMovement.accrual.charge == plan.sellerProceeds)
+        let feeAmount = buyMovement.feeCharged + sellMovement.accrual.charge
+        let takerTerms = if plan.takerId == buy.orderId then buy.feeTerms else feeTerms
         let originalCash = funding.totalEscrow
         total <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") [cash]
         assertMsg "Buy escrow amount is incorrect" (total == originalCash)
         -- Seller's account consumes the buy escrow AND its own backing. Its
         -- available credit rises only by proceeds; all change still belongs to
         -- this buy. Example: 3.00 escrow minus 1.20 proceeds leaves 1.80.
-        paid <- exercise sellerBalance AssetBalance_Repartition with
-          otherCash = Some cash; otherAmount = originalCash; delta = sellMovement.netProceeds; extraArgs
+        -- A rounding carry can make a tiny seller's entire gross become fee.
+        -- Custody rejects zero transfers, so preserve that account ID unchanged.
+        (nextSellerBalance, afterSellerCash) <- if sellMovement.netProceeds > 0.0 then do
+          paid <- exercise sellerBalance AssetBalance_Repartition with
+            otherCash = Some cash; otherAmount = originalCash; delta = sellMovement.netProceeds; extraArgs
+          pure (paid.balance, paid.otherCash)
+          else pure (sellerBalance, Some cash)
         let afterPayment = originalCash - sellMovement.netProceeds
+        collected <- MarketFees.collectFees vault instrument factory index.assetDecimals index.fees
+          feeAmount afterSellerCash afterPayment extraArgs
+        let afterFees = afterPayment - feeAmount
         (nextBuyerBalance, remainingCash) <- if buyMovement.refund > 0.0 then do
           refunded <- exercise buyerBalance AssetBalance_Repartition with
-            otherCash = paid.otherCash; otherAmount = afterPayment; delta = buyMovement.refund; extraArgs
+            otherCash = collected.remainingCash; otherAmount = afterFees; delta = buyMovement.refund; extraArgs
           pure (refunded.balance, refunded.otherCash)
-          else pure (buyerBalance, paid.otherCash)
+          else pure (buyerBalance, collected.remainingCash)
         left <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") (optionalHoldings remainingCash)
         assertMsg "Remaining buy escrow is incorrect" (left == buyMovement.funding.totalEscrow)
         -- The inner sell has buyer authority as an explicit controller and
@@ -456,12 +493,17 @@ template LimitOrder
           pure (Some cid)
         refs <- mapA referenceFor (optionalHoldings buyRemainder ++ optionalHoldings sellRemainder)
         exercise book Archive
-        next <- create index with orders = filter (\r -> r.order /= buyOrder && r.order /= self) index.orders ++ refs
+        next <- create index with
+          orders = filter (\r -> r.order /= buyOrder && r.order /= self) index.orders ++ refs
+          fees = collected.pool
         now <- getTime
-        receipt <- create TradeFill with key; vault; buyer; instrument; plan; executedAt = now; seller = owner
+        receipt <- create TradeFill with
+          key; vault; buyer; instrument; plan; executedAt = now; seller = owner
+          feeTerms = takerTerms; feeAmount; buyerRefund = buyMovement.refund
+          remainingBuyEscrow = buyMovement.funding.totalEscrow
         pure SettlementResult with
           book = next; decision = Matching.Fill plan
-          balances = [nextBuyerBalance, paid.balance]; position; receipt = Some receipt
+          balances = [nextBuyerBalance, nextSellerBalance]; position; receipt = Some receipt
 
     -- | Inputs: live book/market, outcome and the one owner's refund account.
     -- Rejects anything except the recomputed newer self-cross. Result: escrow
@@ -603,7 +645,7 @@ createRemainder key vault owner yes no = if yes == 0 && no == 0 then pure None e
 
 -- | Inputs: committed references and selected outcome/side. Result: best price,
 -- then lowest acceptance ID. Ledger time is informational; equal timestamps do
--- not tie priority. This helper defines selection but does not yet settle trades.
+-- not tie priority. This helper only selects; settlement verifies the full plan.
 bestOrderReference : [OrderReference] -> Outcome -> OrderSide -> Optional OrderReference
 bestOrderReference references outcome side =
   case sortOn (\r -> Matching.priorityKey side r.price r.orderId)
@@ -612,7 +654,7 @@ bestOrderReference references outcome side =
     first :: _ -> Some first
 
 -- | Inputs: book precision, live protocol ID and the trader-approved revision/terms.
--- Errors: stale/foreign policy, changed quote or nonzero rate before fee funding.
+-- Errors: stale/foreign policy or changed quote.
 -- Result: the exact immutable snapshot for the new order, before any funds move.
 -- Fetching the consuming protocol revision makes concurrent updates conflict.
 -- It also means admin/market creation updates require a fresh protocol ID even
@@ -626,8 +668,6 @@ checkFeeQuote book policy expectedRevision expectedTerms = do
   let actual = Fees.FeeTerms current.takerFeeBps book.assetDecimals
   assertMsg "Fee approval quote is stale or has wrong asset precision"
     (current.feeRevision == expectedRevision && expectedTerms == actual)
-  assertMsg "Nonzero fees require funded escrow and collection support"
-    (actual.takerFeeBps == 0)
   pure actual
 
 -- | Inputs: signed buy order. Result: the arithmetic view of its immutable
@@ -640,12 +680,12 @@ buyFeeState order = Fees.BuyFeeState order.originalQuantity order.quantity order
 -- possible. Sellers can execute above their own limit, so their bound is filled
 -- contracts times the maximum one-unit payout, not their sell limit. Buys have
 -- the stricter limit-price bound enforced by buyFunding. History must respect
--- asset precision. paidFee remains zero under this milestone's zero-rate guard.
+-- asset precision, and paidFee must equal the cumulative rounded charge.
 validOrderFeeHistory : LimitOrder -> Bool
 validOrderFeeHistory order =
   order.originalQuantity >= order.quantity && order.takerNotional >= 0.0 &&
   order.takerNotional <= intToDecimal (order.originalQuantity - order.quantity) &&
-  order.paidFee == 0.0 &&
+  Fees.cumulativeFee order.feeTerms order.takerNotional == Right order.paidFee &&
   Numeric.roundNumeric order.feeTerms.assetDecimals Numeric.RoundingDown order.takerNotional == order.takerNotional &&
   (case order.side of
     Sell -> True
