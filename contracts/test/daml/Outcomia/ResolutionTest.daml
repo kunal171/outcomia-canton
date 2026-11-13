@@ -1,0 +1,251 @@
+-- | Proposal authorization/time/evidence boundaries. No test treats a pending
+-- proposal as a final outcome or a spendable payout. The funded case verifies
+-- that consuming the market does not strand an owner's cancellable order.
+module Outcomia.ResolutionTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, seconds)
+import Outcomia.Binary
+import Outcomia.CustodyTest qualified as C
+import Outcomia.FeeCollectionTest qualified as Fee
+import Outcomia.LifecycleTest qualified as L
+import Outcomia.OrdersTest qualified as O
+import Outcomia.Resolution
+import Outcomia.SettlementTest qualified as S
+import Outcomia.TokenHarness (FactoryMode(..))
+import Outcomia.Types
+
+data Fixture = Fixture with
+    operator : Party
+    creator : Party
+    fallback : Party
+    outsider : Party
+    protocol : ContractId Protocol
+    market : ContractId BinaryMarket
+    terms : BinaryTerms
+    createdAt : Time
+  deriving (Eq, Show)
+
+-- | Inputs: optional earliest offset and fallback (availability, deadline)
+-- offsets relative to cutoff. Result: a real opened market with both resolvers
+-- enrolled as admins. Each script gets its own ledger and fixed party hints.
+setup : Optional Int -> Optional (Int, Optional Int) -> Script Fixture
+setup earliest window = script do
+  (operator, creator, outsider, initial, (createdAt, original)) <- L.setup ()
+  fallback <- allocatePartyByHint (PartyIdHint "Fallback")
+  enabled <- submit operator do
+    exerciseCmd initial Protocol_SetAdmins with replacementAdmins = [operator, creator, fallback]
+  let at offset = addRelTime original.closeAt (seconds offset)
+  let terms = original with
+        earliestResolutionAt = fmap at earliest
+        fallback = fmap (\(available, deadline) -> FallbackPolicy fallback (at available) (fmap at deadline)) window
+  (protocol, draft) <- submit creator do exerciseCmd enabled Protocol_CreateBinary with creator; terms
+  market <- submit creator do exerciseCmd draft Binary_Open with protocol
+  pure Fixture with operator; creator; fallback; outsider; protocol; market; terms; createdAt
+
+validEvidence : ResolutionEvidence
+validEvidence = ResolutionEvidence with
+  summary = "The flight records identify two qualifying launches by the same booster."
+  documentUri = "https://example.com/flight-records.json"
+  documentSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+primary : Fixture -> ContractId BinaryMarket -> ResolutionOutcome -> Script (ContractId ResolutionProposal)
+primary f market outcome = submit f.creator do
+  exerciseCmd market Binary_ProposeResolution with protocol = f.protocol; outcome; evidence = validEvidence
+
+fallbackProposal : Fixture -> Script (ContractId ResolutionProposal)
+fallbackProposal f = submit f.fallback do
+  exerciseCmd f.market Binary_ProposeFallback with
+    resolver = f.fallback; protocol = f.protocol; outcome = NoWins; evidence = validEvidence
+
+loadProposal : Party -> ContractId ResolutionProposal -> Script ResolutionProposal
+loadProposal actor cid = do
+  found <- queryContractId actor cid
+  case found of Some value -> pure value; None -> abort "Expected visible pending proposal"
+
+testPrimaryExactCutoffAndDuplicatePrevention : Script ()
+testPrimaryExactCutoffAndDuplicatePrevention = script do
+  f <- setup None None
+  setTime (addRelTime f.terms.closeAt (seconds (-1)))
+  submitMustFail f.creator do
+    exerciseCmd f.market Binary_ProposeResolution with protocol = f.protocol; outcome = YesWins; evidence = validEvidence
+  setTime f.terms.closeAt
+  cid <- primary f f.market YesWins
+  value <- loadProposal f.creator cid
+  assert (value.key == MarketKey f.operator "outcomia" 1 && value.terms == f.terms &&
+    value.openedAt == f.createdAt && value.proposedAt == f.terms.closeAt &&
+    value.proposedBy == f.creator && value.outcome == YesWins && value.evidence == validEvidence &&
+    value.finalizableAt == addRelTime value.proposedAt (seconds f.terms.resolutionDelaySeconds))
+  old <- queryContractId f.creator f.market
+  assert (old == None)
+  submitMustFail f.creator do
+    exerciseCmd f.market Binary_ProposeResolution with protocol = f.protocol; outcome = NoWins; evidence = validEvidence
+  submitMustFail f.creator do archiveCmd cid
+  submitMustFail f.creator do createCmd value
+
+testEarlyClosureCannotAccelerateOptionalEarliest : Script ()
+testEarlyClosureCannotAccelerateOptionalEarliest = script do
+  f <- setup (Some 10) None
+  closed <- submit f.creator do
+    exerciseCmd f.market Binary_Close with protocol = f.protocol; reason = "Stop trading early"
+  submitMustFail f.creator do
+    exerciseCmd closed Binary_ProposeResolution with protocol = f.protocol; outcome = Invalid; evidence = validEvidence
+  setTime f.terms.closeAt
+  submitMustFail f.creator do
+    exerciseCmd closed Binary_ProposeResolution with protocol = f.protocol; outcome = Invalid; evidence = validEvidence
+  setTime (addRelTime f.terms.closeAt (seconds 10))
+  cid <- primary f closed Invalid
+  value <- loadProposal f.creator cid
+  assert (value.outcome == Invalid && value.openedAt == f.createdAt)
+
+testNeverOpenedAndCancelledDraftCannotPropose : Script ()
+testNeverOpenedAndCancelledDraftCannotPropose = script do
+  f <- setup None None
+  (protocol, draft) <- submit f.creator do
+    exerciseCmd f.protocol Protocol_CreateBinary with creator = f.creator; terms = f.terms
+  setTime f.terms.closeAt
+  submitMustFail f.creator do
+    exerciseCmd draft Binary_ProposeResolution with protocol; outcome = YesWins; evidence = validEvidence
+  cancelled <- submit f.creator do exerciseCmd draft Binary_CancelDraft
+  submitMustFail f.creator do
+    exerciseCmd cancelled Binary_ProposeResolution with protocol; outcome = YesWins; evidence = validEvidence
+  snapshot <- L.marketFor f.creator cancelled
+  -- Even trusted signers changing a text reason cannot manufacture opening
+  -- history. The legitimate cancelled revision remains active throughout.
+  renamed <- submit [f.operator, f.creator] do createCmd (snapshot with closeReason = Some "Administrative stop")
+  submitMustFail f.creator do
+    exerciseCmd renamed Binary_ProposeResolution with protocol; outcome = YesWins; evidence = validEvidence
+
+testPrimaryAuthorizationAndAdminRevocation : Script ()
+testPrimaryAuthorizationAndAdminRevocation = script do
+  f <- setup None None
+  setTime f.terms.closeAt
+  forA_ [f.operator, f.fallback, f.outsider] (\caller ->
+    submitMustFail (actAs caller <> readAs [f.operator, f.creator]) do
+      exerciseCmd f.market Binary_ProposeResolution with protocol = f.protocol; outcome = YesWins; evidence = validEvidence)
+  revoked <- submit f.operator do
+    exerciseCmd f.protocol Protocol_SetAdmins with replacementAdmins = [f.operator, f.fallback]
+  submitMustFail (actAs f.creator <> readAs f.operator) do
+    exerciseCmd f.market Binary_ProposeResolution with protocol = revoked; outcome = YesWins; evidence = validEvidence
+  next <- submit f.operator do
+    exerciseCmd revoked Protocol_SetAdmins with replacementAdmins = [f.operator, f.creator, f.fallback]
+  _ <- primary (f with protocol = next) f.market YesWins
+  pure ()
+
+testForeignProtocolCannotAuthorizeResolution : Script ()
+testForeignProtocolCannotAuthorizeResolution = script do
+  f <- setup None None
+  wrongName <- submit f.operator do
+    createCmd Protocol with operator = f.operator; protocolName = "other"; admins = [f.operator, f.creator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  wrongOperator <- submit f.outsider do
+    createCmd Protocol with operator = f.outsider; protocolName = "outcomia"; admins = [f.outsider, f.creator]; nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  setTime f.terms.closeAt
+  forA_ [wrongName, wrongOperator] (\protocol -> submitMustFail f.creator do
+    exerciseCmd f.market Binary_ProposeResolution with protocol; outcome = YesWins; evidence = validEvidence)
+  _ <- L.marketFor f.creator f.market
+  pure ()
+
+testBadEvidenceRollsBackMarketConsumption : Script ()
+testBadEvidenceRollsBackMarketConsumption = script do
+  f <- setup None None
+  setTime f.terms.closeAt
+  forA_ [(validEvidence with summary = " "), (validEvidence with documentUri = "ftp://records"),
+         (validEvidence with documentUri = "https://"), (validEvidence with documentSha256 = "BAD")] (\evidence ->
+    submitMustFail f.creator do
+      exerciseCmd f.market Binary_ProposeResolution with protocol = f.protocol; outcome = YesWins; evidence)
+  proposals <- query @ResolutionProposal f.creator
+  assert (null proposals)
+  _ <- L.marketFor f.creator f.market
+  _ <- primary f f.market YesWins
+  pure ()
+
+testFallbackExactHandoverAndResolverBinding : Script ()
+testFallbackExactHandoverAndResolverBinding = script do
+  f <- setup None (Some (10, Some 20))
+  -- Explicit nomination makes the market visible without impersonating its
+  -- operator. Visibility alone still grants no primary or early fallback right.
+  _ <- L.marketFor f.fallback f.market
+  setTime (addRelTime f.terms.closeAt (seconds 9))
+  submitMustFail f.fallback do
+    exerciseCmd f.market Binary_ProposeFallback with resolver = f.fallback; protocol = f.protocol; outcome = NoWins; evidence = validEvidence
+  setTime (addRelTime f.terms.closeAt (seconds 10))
+  submitMustFail f.creator do
+    exerciseCmd f.market Binary_ProposeResolution with protocol = f.protocol; outcome = YesWins; evidence = validEvidence
+  forA_ [f.operator, f.creator, f.outsider] (\caller ->
+    submitMustFail (actAs caller <> readAs f.operator) do
+      exerciseCmd f.market Binary_ProposeFallback with resolver = caller; protocol = f.protocol; outcome = NoWins; evidence = validEvidence)
+  cid <- fallbackProposal f
+  value <- loadProposal f.fallback cid
+  assert (value.proposedBy == f.fallback && value.proposedAt == addRelTime f.terms.closeAt (seconds 10))
+
+testFallbackDeadlineIsExclusive : Script ()
+testFallbackDeadlineIsExclusive = script do
+  f <- setup None (Some (10, Some 20))
+  setTime (addRelTime f.terms.closeAt (seconds 20))
+  submitMustFail f.fallback do
+    exerciseCmd f.market Binary_ProposeFallback with resolver = f.fallback; protocol = f.protocol; outcome = NoWins; evidence = validEvidence
+  submitMustFail f.creator do
+    exerciseCmd f.market Binary_ProposeResolution with protocol = f.protocol; outcome = YesWins; evidence = validEvidence
+  _ <- L.marketFor f.creator f.market
+  pure ()
+
+testAbsentFallbackDeadlineDoesNotInventExpiry : Script ()
+testAbsentFallbackDeadlineDoesNotInventExpiry = script do
+  f <- setup None (Some (10, None))
+  setTime (addRelTime f.terms.closeAt (seconds 1000000))
+  cid <- fallbackProposal f
+  value <- loadProposal f.creator cid
+  assert (value.proposedBy == f.fallback)
+
+testFallbackRequiresCurrentAdminStatus : Script ()
+testFallbackRequiresCurrentAdminStatus = script do
+  f <- setup None (Some (0, None))
+  revoked <- submit f.operator do
+    exerciseCmd f.protocol Protocol_SetAdmins with replacementAdmins = [f.operator, f.creator]
+  setTime f.terms.closeAt
+  submitMustFail (actAs f.fallback <> readAs f.operator) do
+    exerciseCmd f.market Binary_ProposeFallback with resolver = f.fallback; protocol = revoked; outcome = NoWins; evidence = validEvidence
+  enabled <- submit f.operator do
+    exerciseCmd revoked Protocol_SetAdmins with replacementAdmins = [f.operator, f.creator, f.fallback]
+  _ <- fallbackProposal (f with protocol = enabled)
+  pure ()
+
+testProposalRejectsForgedTimeAndResolverEvenWithBothSigners : Script ()
+testProposalRejectsForgedTimeAndResolverEvenWithBothSigners = script do
+  f <- setup None None
+  setTime f.terms.closeAt
+  cid <- primary f f.market YesWins
+  value <- loadProposal f.creator cid
+  forA_ [(value with finalizableAt = value.proposedAt), (value with proposedBy = f.outsider),
+         (value with openedAt = f.terms.closeAt), (value with evidence = validEvidence with summary = "")] (\bad ->
+    submitMustFail [f.operator, f.creator] do createCmd bad)
+  active <- query @ResolutionProposal f.creator
+  assert (length active == 1)
+
+testFundedOrderCanCancelAfterMarketBecomesProposal : Script ()
+testFundedOrderCanCancelAfterMarketBecomesProposal = script do
+  f <- Fee.setup Good 0.01
+  placed <- Fee.cross f True 0.6 5 0.4 3
+  let p = f.ledger.orders.positions
+  let c = p.custody
+  market <- L.marketFor c.asset.operator p.market
+  setTime market.terms.closeAt
+  proposal <- submit c.asset.operator do
+    exerciseCmd p.market Binary_ProposeResolution with protocol = f.policy; outcome = YesWins; evidence = validEvidence
+  S.assertConserved f.ledger placed.book
+  cancelled <- O.cancel f.ledger.orders placed.book placed.buy (Some placed.buyerBalance)
+  returned <- O.requireReleasedBalance cancelled
+  account <- C.loadAccount c returned
+  assert (account.available == 5.0)
+  _ <- loadProposal c.asset.operator proposal
+  S.assertConserved f.ledger cancelled.book
+
+testUnconfiguredFallbackCannotClaimAuthority : Script ()
+testUnconfiguredFallbackCannotClaimAuthority = script do
+  f <- setup None None
+  setTime (addRelTime f.terms.closeAt (seconds 1000000))
+  submitMustFail (actAs f.fallback <> readAs f.operator) do
+    exerciseCmd f.market Binary_ProposeFallback with resolver = f.fallback; protocol = f.protocol; outcome = NoWins; evidence = validEvidence
+  _ <- primary f f.market YesWins
+  pure ()
