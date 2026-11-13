@@ -1,31 +1,39 @@
-# Binary resolution proposals
+# Binary resolution
 
-This checkpoint creates pending outcome proposals. It does not finalize a winner,
-pay rewards, burn positions or move reserve collateral. Public Canton trading
-remains gated until deployment and wallet submission are verified.
+Markets support outcome proposals, corrections and delayed finalization. These
+transitions move no reserve collateral, trader cash, positions or fee holdings.
+Redemption is not implemented. Public Canton trading remains gated until
+contracts, registry compatibility and wallet submission are verified.
 
-## Who can propose
+## Who decides the outcome
 
-The market creator is the primary resolver and must still be an active protocol
-admin. The operator or another admin cannot propose in the creator's place.
+The market creator is the primary resolver and must be an active protocol admin
+to propose or correct. The operator or another admin cannot choose a result in
+the creator's place.
 
-A fallback must be explicitly nominated in the immutable market terms and must
-also be an active admin when proposing. Nomination alone does not grant admin
-status. The operator must enroll that party; revocation blocks its proposal
-choice. No nomination means no fallback, including no implicit operator fallback.
-The configured fallback observes the market/proposal so it can access its role
-without impersonating another party. Visibility does not itself authorize a call.
+A fallback must be explicitly nominated in the immutable terms and must also be
+an active admin when acting. Nomination does not grant admin status. No nomination
+means no fallback, including no implicit operator fallback. The configured
+fallback observes market/proposal/final contracts so it can access its role;
+visibility alone grants no permission.
 
-Both choices fetch a current matching protocol revision. Wrong operator/name,
-stale IDs, revoked membership and missing resolver signatures reject atomically.
-As elsewhere, services pin the intended protocol lineage. Joint operator/creator
-signers remain trusted and could create alternative state outside these choices.
+Proposal choices use the current protocol revision. Corrections use its
+read-only `ProtocolRoles` interface, verifying the actual operator signature,
+namespace and membership. A view claiming an operator or admin list is not
+proof of authorization. Stale IDs and unsigned/foreign views reject atomically.
 
-## Opening history and timing
+The interface lives in `contracts/roles`, separate from template implementations
+in `contracts/main`. This avoids a protocol/resolution module cycle and preserves
+the compiler's upgrade-safety check. Clients convert the current Protocol ID
+with `toInterfaceContractId @ProtocolRoles`; they must not cache an old revision.
+The interface package should keep its view stable across implementation upgrades.
+
+## Opening history and resolver windows
 
 `BinaryMarket.openedAt` records successful opening. It is absent on drafts and
 cancelled drafts and survives administrative closure. A never-opened market
-cannot propose an outcome, regardless of its closure-reason text.
+cannot propose, regardless of its closure-reason text. An early administrative
+close stops trading but does not accelerate the resolution schedule.
 
 ```text
 earliest proposal = earliestResolutionAt, if supplied; otherwise closeAt
@@ -34,70 +42,102 @@ fallback window   = [fallback.availableAt, fallback.deadlineAt)
 ```
 
 Without a fallback, the primary has no end time. Without a fallback deadline,
-the fallback has no expiry. Exact availability belongs to fallback; the deadline
-is exclusive. An administrative early close does not accelerate these times.
-Comparisons use ledger effective time, not an exact wall-clock guarantee.
+the fallback has no expiry. Exact availability belongs to fallback; its deadline
+is exclusive. Resolver windows apply to proposals and corrections, not to
+finalizing an existing timely proposal.
 
-A deadline can leave a market unresolved if nobody submits in time. This
-checkpoint does not silently extend the deadline, select a winner or void it.
-The configured fallback is only used if no proposal has already consumed the
-market. Proposal correction/replacement and finalization are later work; the
-fallback cannot yet override an existing primary proposal.
+A missed deadline can leave a market unresolved. No choice silently extends it,
+chooses a winner or voids it. Comparisons use ledger effective time, not a precise
+wall-clock guarantee.
 
-## Proposal contents
+## Proposals and evidence
 
-A proposal records:
+A proposal contains the market key, creator, immutable terms, creation/opening
+times, resolver, outcome, evidence, proposal time, revision and finalization time.
+`YesWins`, `NoWins` and `Invalid` are distinct. Invalid-result payout rules will
+be specified and tested with redemption; a final record alone pays nothing.
 
-- Stable market key, creator, immutable terms, creation time and opening time.
-- Proposing resolver and `YesWins`, `NoWins` or `Invalid`.
-- Evidence summary, URI and SHA-256 digest.
-- Proposal time and `finalizableAt = proposedAt + resolutionDelaySeconds`.
+Evidence requires a 1–4096-character summary, an `https://` or `ar://` URI of at
+most 512 characters, and a 64-character lowercase SHA-256 digest. These checks
+cannot establish truth or remote availability. Clients must verify document
+bytes and their consistency with the pre-agreed criteria.
 
-The summary must contain 1–4096 characters. The URI uses `https://` or `ar://`
-and has at most 512 characters. The digest must be 64 lowercase hexadecimal
-characters. These are format checks: the contract cannot fetch the document or
-verify that its contents prove the result. Clients must verify document bytes
-and their consistency with the pre-agreed criteria.
+A successful proposal consumes the market revision and starts at revision zero:
 
-`Invalid` is distinct from NO. Its payout formula is not implemented by this
-checkpoint. A pending proposal grants no redemption right, including after its
-`finalizableAt` timestamp; there is no finalization choice yet.
+```text
+finalizableAt = proposedAt + resolutionDelaySeconds
+```
 
-## One proposal and preserved exits
+Reusing the old market ID fails. Invalid evidence or another failed check rolls
+back consumption, leaving the original market active.
+
+## Corrections and review delay
+
+`ResolutionProposal_Correct` requires all of the following:
+
+- The caller is the current active admin who is eligible under the resolver window.
+- Ledger time has not moved backward and is strictly before `finalizableAt`.
+- The outcome or evidence actually changes, with valid evidence format.
+- The revision counter has not reached Int64 maximum.
+
+The choice consumes the old proposal, preserves market identity/terms/opening
+history, increments revision and starts a full new review delay from ledger time.
+Old correction and finalization IDs cannot replay. Failed and identical-payload
+corrections do not reset the timer.
+
+A configured fallback can replace a pending primary proposal after handover,
+but only before the current review deadline and its own optional deadline.
+A primary proposal may become finalizable before fallback availability; the
+fallback is not guaranteed a later appeal period. Terms must reflect the intended
+schedule. With no fixed expiry, a trusted resolver can repeatedly make substantive
+corrections; no overall correction-count/time cap exists beyond revision bounds.
+
+## Finalization
+
+Only the operator can call `ResolutionProposal_Finalize`, at or after the current
+`finalizableAt`. Exact equality is allowed; corrections are no longer allowed at
+that boundary. The operator supplies no replacement outcome or evidence.
+
+Finalization consumes the current proposal and creates `FinalResolution` with
+its exact snapshot and finalization time. No choice changes its outcome or
+reopens it. An elapsed fallback deadline or later resolver revocation does not
+erase an earlier valid proposal or prevent operator finalization. Revocation
+blocks new decisions; it is not an automatic dispute or veto over old decisions.
 
 ```mermaid
 flowchart LR
-  Draft -->|creator remains admin| Open
-  Draft -->|cancel| Cancelled[Closed without opening history]
-  Open -->|administrative stop| Closed[Closed with opening history]
-  Open -->|eligible resolver and time| Proposal[Pending resolution proposal]
-  Closed -->|eligible resolver and time| Proposal
-  Proposal -. later milestone .-> Final[Final outcome]
-  Final -. later milestone .-> Claim[Position redemption]
+  Market[Previously opened market] -->|eligible resolver/time| Pending[Pending proposal]
+  Pending -->|changed decision before deadlines| Revised[Corrected proposal; new full delay]
+  Revised -->|further authorized correction| Revised
+  Pending -->|operator; review delay elapsed| Final[Final resolution]
+  Revised -->|operator; review delay elapsed| Final
+  Final -. redemption milestone .-> Claim[Collateral-backed claims]
 ```
 
-A successful proposal consumes the active market revision and creates one signed
-`ResolutionProposal`. Reusing the old market ID fails, so two proposal choices
-cannot succeed through that same revision. An invalid proposal rolls back market
-consumption. No separate independently created registry is introduced here.
+Owner order cancellation and refunds remain available after proposal or
+finalization. Complete-set merge and wallet withdrawal are unchanged. Redemption
+must bind the final snapshot to the reserve and actual outcome ownership, and
+define the reserve/merge transition before releasing any rewards.
 
-Consuming the market prevents further market-dependent commands. Owner order
-cancellation still requires neither market nor protocol, so it remains available
-and refunds all unearned fee budget. Existing complete-set merge and wallet
-withdrawal paths are unchanged. Finalization will need an explicit reserve/merge
-transition before any redemption can be considered safe.
+## Trust and verification
 
-## Verification and remaining work
+Services pin the intended protocol/market lineage. Joint operator/creator
+signers remain trusted: they could directly create alternative state or jointly
+archive records outside these choices. This is not a permissionless oracle or a
+protection against those signers colluding. Operator finalization provides no
+liveness guarantee if the operator stops submitting.
 
-The full suite passes 156 Daml scripts, including 13 proposal scripts, plus four
-Python dependency checks and the independent fee arithmetic checks. Production
-DAR validation passes with 38 packages.
+The full suite passes 166 Daml scripts, including 10 correction/finalization
+scripts and 13 proposal scripts, plus four Python checks and the independent fee
+arithmetic checks. The production DAR validates with 39 packages, including the
+separate role-interface package.
 
-The tests cover exact cutoff/earliest/handover/deadline boundaries, absent optional
-times, primary/fallback authorization and revocation, cancelled drafts, evidence
-rollback, duplicate proposals, forged snapshots and funded owner cancellation.
-The IDE ledger uses static time for exact boundary cases.
+The suite covers exact time boundaries, primary/fallback handover, revocation,
+foreign/stale/forged role policies, correction rollback, replay, revision limits,
+finalization permissions and preserved funded exits. A registry-backed test
+compares all cash holding IDs/amounts before and after finalization: nothing moves.
+Static IDE-ledger time is used for exact boundary cases.
 
-Next: proposal corrections and delayed finalization, followed by collateral-backed
-YES/NO/invalid redemption and asset-conservation tests. The shared UI must expose
-these as working actions only after their contracts and wallet flow are verified.
+Run `make DPM="$PWD/target/tools/dpm" test`. The production DAR excludes the test
+registry and daml-script. Next: YES/NO/invalid redemption with reserve and asset-
+conservation tests, followed by verified wallet/UI integration.

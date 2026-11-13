@@ -1,0 +1,29 @@
+-- | Read-only role boundary shared by protocol and resolution contracts. The
+-- interface avoids a module cycle: Binary creates proposals, while corrections
+-- need current protocol membership. A self-reported view is not authorization;
+-- callers also verify the actual operator signature and deployment namespace.
+module Outcomia.ProtocolRoles where
+
+data ProtocolRolesView = ProtocolRolesView with
+    operator : Party
+    protocolName : Text
+    admins : [Party]
+  deriving (Eq, Show)
+
+interface ProtocolRoles where
+  viewtype ProtocolRolesView
+
+-- | Inputs: live role-contract ID, pinned operator/namespace and proposed actor.
+-- Errors: stale ID, unsigned/foreign policy or inactive admin. Result: checked
+-- membership only; resolution choices independently enforce resolver/time roles.
+-- As with the existing protocol checks, services pin the intended lineage and
+-- trust the operator not to sign another conflicting root for that namespace.
+checkAdmin : ContractId ProtocolRoles -> Party -> Text -> Party -> Update ()
+checkAdmin roles expectedOperator expectedName actor = do
+  contract <- fetch roles
+  let policy = view contract
+  assertMsg "Role policy is not signed by the expected operator"
+    (expectedOperator `elem` signatory contract)
+  assertMsg "Role policy belongs to another protocol"
+    (policy.operator == expectedOperator && policy.protocolName == expectedName)
+  assertMsg "Resolver must be a current protocol admin" (actor `elem` policy.admins)

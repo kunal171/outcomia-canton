@@ -1,4 +1,5 @@
 sdk-version: 3.7.1
 packages:
+  - ./roles
   - ./main
   - ./test

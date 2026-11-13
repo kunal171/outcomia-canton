@@ -14,6 +14,7 @@ import Outcomia.Assets (AssetAdmission(..))
 import Splice.Api.Token.TransferInstructionV2 qualified as T
 import DA.Time (addRelTime, seconds)
 import Outcomia.Resolution qualified as Resolution
+import Outcomia.ProtocolRoles qualified as Roles
 import Outcomia.Types
 import Outcomia.Validation
 
@@ -33,6 +34,9 @@ template Protocol
     observer admins
     ensure boundedText 64 protocolName && validAdmins operator admins && nextMarketId > 0 &&
       takerFeeBps >= 0 && takerFeeBps <= 1000 && feeRevision >= 0
+
+    interface instance Roles.ProtocolRoles for Protocol where
+      view = Roles.ProtocolRolesView operator protocolName admins
 
     -- | Inputs: replacement admin list, including the operator.
     -- Rejects: non-operator authorization, duplicates, empty/oversized lists or
@@ -243,3 +247,4 @@ proposeResolution market resolver outcome evidence = do
     creator = market.creator; terms = market.terms; marketCreatedAt = market.createdAt
     openedAt = opened; proposedBy = resolver; outcome; evidence; proposedAt = now
     finalizableAt = addRelTime now (seconds market.terms.resolutionDelaySeconds)
+    revision = 0

@@ -5,8 +5,8 @@ closure. [Transfers](collateral-transfers.md), [balances](collateral-custody.md)
 and [complete sets](complete-set-positions.md) are separate contract modules.
 [Resting orders](binary-limit-orders.md) add funding/cancellation and
 [atomic matching](binary-settlement.md) settles one pair.
-[Resolution proposals](binary-resolution.md) are implemented; corrections,
-finalization and payouts remain separate work. The
+[Resolution proposals, corrections and delayed finalization](binary-resolution.md)
+are implemented; collateral-backed payouts remain separate work. The
 shared frontend must keep showing `Market deployment pending` until a deployment
 and wallet-to-ledger integration are verified.
 
@@ -81,8 +81,9 @@ must check both `Open` and `now < closeAt`. Manual closure is terminal and may o
 after the cutoff. Closing early stops trading but does not move the resolution
 schedule or decide a winner. Opening records `openedAt`; cancelled drafts retain
 no opening history and cannot propose resolution. A proposal consumes the market
-revision and carries a delayed eligibility timestamp. Corrections, finalization,
-invalid-market payout rules and redemption need separate choices/tests before
+revision and carries a delayed eligibility timestamp. Corrections restart the review delay; operator finalization records the exact
+proposal after that delay. Invalid-market payout rules and redemption need
+separate choices/tests before
 public funding is enabled.
 
 ## Visibility and contention

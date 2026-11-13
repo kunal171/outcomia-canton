@@ -1,17 +1,18 @@
--- | Binary outcome proposals and their immutable evidence/time boundary. A
+-- | Binary proposals, corrections and delayed final outcome records. A
 -- proposal is not a final result or spend authority: no reserve, trader cash,
--- outcome lot or fee holding is touched by this checkpoint. Binary consumes the
+-- outcome lot or fee holding is spent by these transitions. Binary consumes the
 -- opened market when creating a proposal, preventing duplicate proposal choices
 -- within that configured market lineage. Joint operator/creator trust remains.
 module Outcomia.Resolution where
 
 import DA.Time (addRelTime, seconds)
 import DA.Text qualified as T
+import Outcomia.ProtocolRoles qualified as Roles
 import Outcomia.Types
 import Outcomia.Validation (boundedText, validDigest, termsErrors)
 
 -- | Invalid is distinct from NO. Its redemption formula must be specified and
--- tested in the later finalization/redemption milestone; no payout exists here.
+-- tested in the redemption milestone; no payout exists here.
 data ResolutionOutcome = YesWins | NoWins | Invalid
   deriving (Eq, Show)
 
@@ -35,15 +36,77 @@ template ResolutionProposal
     evidence : ResolutionEvidence
     proposedAt : Time
     finalizableAt : Time
+    revision : Int
   where
     signatory key.operator, creator
     observer proposedBy, fallbackObservers terms
-    ensure key.marketId > 0 && boundedText 64 key.protocolName &&
-      null (termsErrors creator marketCreatedAt terms) &&
-      marketCreatedAt <= openedAt && openedAt < terms.closeAt &&
-      null (evidenceErrors evidence) &&
-      eligibleResolver creator terms proposedBy proposedAt &&
-      finalizableAt == addRelTime proposedAt (seconds terms.resolutionDelaySeconds)
+    ensure validProposal this
+
+    -- | Inputs: active resolver, current signed roles, corrected outcome/evidence.
+    -- Errors: stale/unsigned/foreign role policy, revoked or wrong resolver,
+    -- expired window/review period, unchanged payload or revision exhaustion.
+    -- Result: one successor proposal with the full delay restarted; no collateral
+    -- moves. Consuming the old proposal makes stale corrections/finalization fail.
+    choice ResolutionProposal_Correct : ContractId ResolutionProposal
+      with
+        resolver : Party
+        roles : ContractId Roles.ProtocolRoles
+        replacementOutcome : ResolutionOutcome
+        replacementEvidence : ResolutionEvidence
+      controller resolver
+      do
+        Roles.checkAdmin roles key.operator key.protocolName resolver
+        now <- getTime
+        assertMsg "Correction time cannot precede the current proposal" (now >= proposedAt)
+        assertMsg "Corrections stop at the current finalization time" (now < finalizableAt)
+        assertMsg "Resolver is outside its agreed correction window"
+          (eligibleResolver creator terms resolver now)
+        assertMsg "Correction must change the outcome or evidence"
+          (replacementOutcome /= outcome || replacementEvidence /= evidence)
+        assertMsg "Proposal revision limit reached" (revision < 9223372036854775807)
+        let problems = evidenceErrors replacementEvidence
+        assertMsg (T.intercalate "; " problems) (null problems)
+        create this with
+          proposedBy = resolver; outcome = replacementOutcome; evidence = replacementEvidence
+          proposedAt = now
+          finalizableAt = addRelTime now (seconds terms.resolutionDelaySeconds)
+          revision = revision + 1
+
+    -- | Inputs: none; operator authorization and ledger time are authoritative.
+    -- Errors: another caller, stale proposal or now before finalizableAt.
+    -- Result: consumes the proposal and records exactly its final outcome and
+    -- evidence. The operator cannot choose a new winner through this choice.
+    -- Resolver revocation/expiry does not erase an earlier valid proposal.
+    choice ResolutionProposal_Finalize : ContractId FinalResolution
+      controller key.operator
+      do
+        now <- getTime
+        assertMsg "Resolution review delay has not elapsed" (now >= finalizableAt)
+        create FinalResolution with proposal = this; finalizedAt = now
+
+-- | Authoritative final snapshot; not a token or a claim receipt. There is no
+-- choice to change outcome or reopen it. Joint operator/creator archival remains
+-- trusted. A later redemption path must bind this exact snapshot to reserve,
+-- outcome ownership and remaining backing before it can release any collateral.
+template FinalResolution
+  with
+    proposal : ResolutionProposal
+    finalizedAt : Time
+  where
+    signatory proposal.key.operator, proposal.creator
+    observer proposal.proposedBy, fallbackObservers proposal.terms
+    ensure validProposal proposal && finalizedAt >= proposal.finalizableAt
+
+-- | Inputs: proposed signed snapshot. Result: valid market history, resolver
+-- window, evidence, nonnegative revision and exact review-delay calculation.
+-- Current admin membership is checked in choices, not re-evaluated on old state.
+validProposal : ResolutionProposal -> Bool
+validProposal proposal = proposal.key.marketId > 0 && boundedText 64 proposal.key.protocolName &&
+  null (termsErrors proposal.creator proposal.marketCreatedAt proposal.terms) &&
+  proposal.marketCreatedAt <= proposal.openedAt && proposal.openedAt < proposal.terms.closeAt &&
+  null (evidenceErrors proposal.evidence) && proposal.revision >= 0 &&
+  eligibleResolver proposal.creator proposal.terms proposal.proposedBy proposal.proposedAt &&
+  proposal.finalizableAt == addRelTime proposal.proposedAt (seconds proposal.terms.resolutionDelaySeconds)
 
 -- | Inputs: immutable terms and proposed ledger time. Result: the earliest
 -- eligible time. Administrative early closure never accelerates this schedule.
