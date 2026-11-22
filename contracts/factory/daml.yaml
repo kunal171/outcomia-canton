@@ -1,0 +1,13 @@
+sdk-version: 3.7.1
+name: canton-market-factory
+version: 0.1.0
+source: daml
+# Open market-factory standard (Apache-2.0): interfaces and shared types only.
+# It depends on no implementation, so applications and indexers can pin it
+# while implementations (such as Outcomia's) upgrade independently.
+dependencies:
+  - daml-prim
+  - daml-stdlib
+build-options:
+  - --target=2.1
+  - --ghc-option=-Werror

@@ -1,0 +1,228 @@
+-- | Open market-factory standard. Every market is created through a
+-- 'MarketFactory'; markets expose a 'Market' view with stable references; and
+-- restricted markets consult a pluggable 'EligibilityPolicy' on entry actions.
+--
+-- This package holds interfaces, shared types and pure checks only. Views are
+-- self-reported: callers must also verify the actual signatories they trust
+-- (see 'checkEligibility'). Contract IDs change on every consuming choice, so
+-- 'FactoryRef' and 'MarketRef' are the stable identities.
+module Canton.MarketFactory where
+
+import DA.List (unique)
+import DA.Text qualified as T
+
+-- | One factory instance, unique within its operator's namespace.
+data FactoryRef = FactoryRef with
+    operator : Party
+    namespace : Text
+    factoryId : Text
+  deriving (Eq, Ord, Show)
+
+-- | One market: the issuing factory and its number within that factory.
+data MarketRef = MarketRef with
+    factory : FactoryRef
+    number : Int
+  deriving (Eq, Ord, Show)
+
+-- | One eligibility policy, unique within its operator's namespace.
+data PolicyRef = PolicyRef with
+    operator : Party
+    namespace : Text
+    policyId : Text
+  deriving (Eq, Ord, Show)
+
+-- | Collateral token identity (token-standard instrument admin and ID).
+data InstrumentRef = InstrumentRef with
+    admin : Party
+    id : Text
+  deriving (Eq, Ord, Show)
+
+-- | Common terms every implementation accepts. Binary markets use exactly two
+-- outcomes; implementations validate these and map them to their own types.
+data MarketTerms = MarketTerms with
+    question : Text
+    outcomes : [Text]
+    -- | One criterion per outcome, in outcome order.
+    outcomeCriteria : [Text]
+    invalidCriteria : Text
+    evidenceRequirements : Text
+    rulesUri : Text
+    -- | Lowercase SHA-256 hex digest of the rules document.
+    rulesHash : Text
+    collateral : InstrumentRef
+    closeAt : Time
+    earliestResolutionAt : Optional Time
+    resolutionDelaySeconds : Int
+    priceTick : Decimal
+    quantityLot : Int
+  deriving (Eq, Show)
+
+-- | Who may trade: anyone eligible under the implementation, or parties a
+-- referenced policy admits.
+data Access = Public | Restricted PolicyRef
+  deriving (Eq, Show)
+
+-- | Who may create markets through one factory instance.
+data CreationPolicy
+  = AdminsOnly [Party]
+  | Allowlist [Party]
+  | AnyParty
+  deriving (Eq, Show)
+
+-- | Actions that add exposure. Exits (cancel, merge, withdraw, redeem) never
+-- consult eligibility.
+data EntryAction = Place | Split | Fill
+  deriving (Eq, Show)
+
+data MarketStatus = Draft | Open | Closed | ResolutionPending | Resolved
+  deriving (Eq, Show)
+
+data FactoryView = FactoryView with
+    ref : FactoryRef
+    creationPolicy : CreationPolicy
+    nextNumber : Int
+    minOutcomes : Int
+    maxOutcomes : Int
+  deriving (Eq, Show)
+
+data MarketView = MarketView with
+    ref : MarketRef
+    creator : Party
+    question : Text
+    outcomes : [Text]
+    closeAt : Time
+    status : MarketStatus
+    access : Access
+  deriving (Eq, Show)
+
+data PolicyView = PolicyView with
+    ref : PolicyRef
+    kind : Text
+  deriving (Eq, Show)
+
+data EvidenceView = EvidenceView with
+    policy : PolicyRef
+    holder : Party
+  deriving (Eq, Show)
+
+-- | Result of one creation: the next factory revision and the new market.
+data MarketCreated = MarketCreated with
+    factory : ContractId MarketFactory
+    market : ContractId Market
+    ref : MarketRef
+  deriving (Eq, Show)
+
+interface Market where
+  viewtype MarketView
+
+-- | A credential a party presents to an eligibility policy, such as a club
+-- membership. Policies decide which evidence they accept.
+interface EligibilityEvidence where
+  viewtype EvidenceView
+
+interface EligibilityPolicy where
+  viewtype PolicyView
+  -- | Implementation check; abort to deny. Must not depend on the caller's
+  -- knowledge of unrelated contracts.
+  admit : Party -> EntryAction -> [ContractId EligibilityEvidence] -> Update ()
+
+  nonconsuming choice EligibilityPolicy_Check : ()
+    with
+      party : Party
+      action : EntryAction
+      evidence : [ContractId EligibilityEvidence]
+    controller (view this).ref.operator
+    do admit this party action evidence
+
+interface MarketFactory where
+  viewtype FactoryView
+  -- | Implementation: check the creation policy and terms, create the market
+  -- (and any companion contracts) and the next factory revision atomically.
+  create' : Party -> MarketTerms -> Access -> Update MarketCreated
+
+  choice MarketFactory_Create : MarketCreated
+    with
+      creator : Party
+      terms : MarketTerms
+      access : Access
+    controller creator
+    do create' this creator terms access
+
+-- | Inputs: creation policy and prospective creator.
+-- Result: whether the policy admits that creator.
+mayCreate : CreationPolicy -> Party -> Bool
+mayCreate (AdminsOnly parties) creator = creator `elem` parties
+mayCreate (Allowlist parties) creator = creator `elem` parties
+mayCreate AnyParty _ = True
+
+-- | Inputs: limit and text. Result: True for text that is not blank (after
+-- treating tabs and line breaks as spaces) and at most `limit` characters.
+nonBlank : Int -> Text -> Bool
+nonBlank limit text =
+  T.trim (T.replace "\t" " " (T.replace "\n" " " (T.replace "\r" " " text))) /= "" &&
+  T.length text <= limit
+
+-- | Like 'nonBlank', and also without outer spaces: used for identifiers and labels.
+boundedLabel : Int -> Text -> Bool
+boundedLabel limit text = nonBlank limit text && T.trim text == text
+
+-- | Inputs: a digest. Result: True only for 64 lowercase hexadecimal characters.
+validDigest : Text -> Bool
+validDigest value = T.length value == 64 && all hex (T.toCodePoints value)
+  where hex c = (48 <= c && c <= 57) || (97 <= c && c <= 102)
+
+validFactoryRef : FactoryRef -> Bool
+validFactoryRef ref = boundedLabel 64 ref.namespace && boundedLabel 64 ref.factoryId
+
+validPolicyRef : PolicyRef -> Bool
+validPolicyRef ref = boundedLabel 64 ref.namespace && boundedLabel 64 ref.policyId
+
+-- | Inputs: the implementation's supported outcome range and proposed terms.
+-- Result: implementation-independent problems; empty when the shape is valid.
+-- Implementations add their own economic and timing checks.
+termsShapeErrors : Int -> Int -> MarketTerms -> [Text]
+termsShapeErrors minOutcomes maxOutcomes terms =
+  [ "Question must be 1-500 characters and not blank" | not (nonBlank 500 terms.question) ] <>
+  [ "Outcome count is outside this factory's range"
+  | length terms.outcomes < minOutcomes || length terms.outcomes > maxOutcomes ] <>
+  [ "Outcome labels must be unique, trimmed and 1-64 characters"
+  | not (all (boundedLabel 64) terms.outcomes && unique terms.outcomes) ] <>
+  [ "Each outcome needs exactly one criterion of 1-4096 characters"
+  | length terms.outcomeCriteria /= length terms.outcomes ||
+    not (all (nonBlank 4096) terms.outcomeCriteria) ] <>
+  [ "Invalid criteria and evidence requirements must be 1-4096 characters"
+  | not (nonBlank 4096 terms.invalidCriteria && nonBlank 4096 terms.evidenceRequirements) ] <>
+  [ "Rules URI must use ar:// or https://"
+  | not ((T.isPrefixOf "ar://" terms.rulesUri && T.length terms.rulesUri > 5) ||
+         (T.isPrefixOf "https://" terms.rulesUri && T.length terms.rulesUri > 8)) ||
+    T.length terms.rulesUri > 2048 ] <>
+  [ "Rules hash must be 64 lowercase hex characters"
+  | not (validDigest terms.rulesHash) ] <>
+  [ "Earliest resolution cannot precede the trading cutoff"
+  | optional False (< terms.closeAt) terms.earliestResolutionAt ] <>
+  [ "Price tick must be positive and quantity lot at least one"
+  | terms.priceTick <= 0.0 || terms.quantityLot < 1 ] <>
+  [ "Collateral instrument ID must be 1-64 characters"
+  | not (boundedLabel 64 terms.collateral.id) ]
+
+-- | Inputs: the current policy contract, the reference the market stores, the
+-- operator the caller trusts, the party, action and presented evidence.
+-- Errors: stale or foreign policy (wrong reference or signatory) or denial.
+-- Result: admission. The operator's signature, not the self-reported view,
+-- binds the policy to the market's deployment.
+checkEligibility
+  : ContractId EligibilityPolicy -> PolicyRef -> Party -> EntryAction
+  -> [ContractId EligibilityEvidence] -> Update ()
+checkEligibility policy expected party action evidence = do
+  contract <- fetch policy
+  assertMsg "Eligibility policy is not signed by the market operator"
+    (expected.operator `elem` signatory contract)
+  assertMsg "Eligibility policy does not match the market's reference"
+    ((view contract).ref == expected)
+  exercise policy EligibilityPolicy_Check with party; action; evidence
+
+-- | True when the terms restrict trading to a policy.
+restricted : Access -> Bool
+restricted access = case access of
+  Public -> False
+  Restricted _ -> True
