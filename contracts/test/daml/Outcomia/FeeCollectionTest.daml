@@ -50,7 +50,7 @@ placeBuy f book balance price quantity = do
   submit (actAs a.alice <> readAs [a.operator, a.issuer]) do
     exerciseCmd book OrderBook_PlaceBuy with
       owner = a.alice; market = p.market; balance; outcome = Yes; price; quantity; extraArgs = C.registryContext
-      feePolicy = f.policy; expectedFeeRevision = f.revision; expectedFeeTerms = F.FeeTerms f.rate 6
+      feePolicy = f.policy; expectedFeeRevision = f.revision; expectedFeeTerms = F.FeeTerms f.rate 6; eligibility = None
 
 placeSellFor : Config -> Party -> ContractId OrderBook -> ContractId PositionLot -> Decimal -> Int -> Script PlacementResult
 placeSellFor f owner book position price quantity = do
@@ -59,7 +59,7 @@ placeSellFor f owner book position price quantity = do
   submit (actAs owner <> readAs [a.operator, a.issuer]) do
     exerciseCmd book OrderBook_PlaceSell with
       owner; market = p.market; positions = [position]; outcome = Yes; price; quantity
-      feePolicy = f.policy; expectedFeeRevision = f.revision; expectedFeeTerms = F.FeeTerms f.rate 6
+      feePolicy = f.policy; expectedFeeRevision = f.revision; expectedFeeTerms = F.FeeTerms f.rate 6; eligibility = None
 
 placeSell : Config -> ContractId OrderBook -> ContractId PositionLot -> Decimal -> Int -> Script PlacementResult
 placeSell f = placeSellFor f f.ledger.orders.positions.custody.asset.bob
@@ -158,7 +158,7 @@ testBuyCannotSpendFullBalanceWithoutItsFeeReserve = script do
     exerciseCmd f.ledger.orders.book OrderBook_PlaceBuy with
       owner = a.alice; market = p.market; balance = f.ledger.buyerBalance
       outcome = Yes; price = 0.5; quantity = 10; extraArgs = C.registryContext
-      feePolicy = f.policy; expectedFeeRevision = 1; expectedFeeTerms = F.FeeTerms 25 6
+      feePolicy = f.policy; expectedFeeRevision = 1; expectedFeeTerms = F.FeeTerms 25 6; eligibility = None
   index <- O.loadBook f.ledger.orders f.ledger.orders.book
   assert (index.nextOrderId == 1 && null index.orders)
   S.assertConserved f.ledger f.ledger.orders.book
@@ -238,7 +238,7 @@ runFailedMatch mode = script do
   submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
     exerciseCmd placed.book OrderBook_MatchBest with
       market = p.market; outcome = Yes
-      buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+      buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   S.assertUnchanged f.ledger placed
 
 testWithdrawalAuthorizationBoundsAndReplay : Script ()

@@ -55,7 +55,7 @@ setupWithTick mode tick = script do
       admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0; extraArgs = C.registryContext
   split <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
     exerciseCmd orders.positions.reserve MarketReserve_Split with
-      owner = a.bob; market = orders.positions.market; balance = funded.balance; quantity = 3; extraArgs = C.registryContext
+      owner = a.bob; market = orders.positions.market; balance = funded.balance; quantity = 3; extraArgs = C.registryContext; eligibility = None
   pure Fixture with orders; buyerBalance = orders.positions.balance
                     sellerBalance = split.balance; reserve = split.reserve; position = split.position
 
@@ -63,7 +63,7 @@ placeSell : Fixture -> ContractId OrderBook -> [ContractId PositionLot] -> Outco
 placeSell f book positions outcome price quantity = do
   let a = f.orders.positions.custody.asset
   submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
-    exerciseCmd book OrderBook_PlaceSell with owner = a.bob; market = f.orders.positions.market; positions; outcome; price; quantity; feePolicy = f.orders.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
+    exerciseCmd book OrderBook_PlaceSell with owner = a.bob; market = f.orders.positions.market; positions; outcome; price; quantity; feePolicy = f.orders.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6; eligibility = None
 
 cross : Fixture -> Bool -> Outcome -> Decimal -> Int -> Decimal -> Int -> Script Crossed
 cross f sellFirst outcome buyPrice buyQty sellPrice sellQty = do
@@ -84,7 +84,7 @@ match f placed outcome = do
   submit (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
     exerciseCmd placed.book OrderBook_MatchBest with
       market = f.orders.positions.market; outcome; buyerBalance = placed.buyerBalance
-      sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+      sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
 
 loadBalance : Fixture -> ContractId AssetBalance -> Script AssetBalance
 loadBalance f cid = do
@@ -203,7 +203,7 @@ testEqualPriceFullFillAndReplay = script do
   assert (b.available == 3.50 && s.available == 3.50)
   let c = f.orders.positions.custody
   submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-    exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+    exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   assertConserved f result.book
 
 testWrongAccountsLeaveBackingLive : Script ()
@@ -214,7 +214,7 @@ testWrongAccountsLeaveBackingLive = script do
   forA_ [(placed.sellerBalance, placed.sellerBalance), (placed.buyerBalance, placed.buyerBalance),
          (f.buyerBalance, placed.sellerBalance)] (\(buyerBalance, sellerBalance) ->
     submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance; sellerBalance; extraArgs = C.registryContext)
+      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance; sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None)
   assertUnchanged f placed
 
 testNoCrossLeavesBackingLive : Script ()
@@ -223,7 +223,7 @@ testNoCrossLeavesBackingLive = script do
   unCrossed <- cross g True No 0.30 2 0.40 3
   let d = g.orders.positions.custody
   submitMustFail (actAs d.asset.operator <> readAs [d.vault, d.asset.issuer]) do
-    exerciseCmd unCrossed.book OrderBook_MatchBest with market = g.orders.positions.market; outcome = No; buyerBalance = unCrossed.buyerBalance; sellerBalance = unCrossed.sellerBalance; extraArgs = C.registryContext
+    exerciseCmd unCrossed.book OrderBook_MatchBest with market = g.orders.positions.market; outcome = No; buyerBalance = unCrossed.buyerBalance; sellerBalance = unCrossed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   assertUnchanged g unCrossed
 
 testInternalAndBookAuthorization : Script ()
@@ -234,7 +234,7 @@ testInternalAndBookAuthorization = script do
   let a = c.asset
   forA_ [a.alice, a.bob, c.vault] (\caller ->
     submitMustFail (actAs caller <> readAs [a.operator, a.alice, a.bob, c.vault, a.issuer]) do
-      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext)
+      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None)
   forA_ [a.operator, c.vault, a.alice, a.bob] (\caller -> do
     submitMustFail (actAs caller <> readAs [a.operator, a.alice, a.bob, c.vault, a.issuer]) do
       exerciseCmd placed.buy LimitOrder_SettleBuy with book = placed.book; market = f.orders.positions.market; sellOrder = placed.sell; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
@@ -253,7 +253,7 @@ testRegistryRollbackAtBothCreditStages = script do
     let c = f.orders.positions.custody
     before <- query @TestHolding c.asset.issuer
     submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+      exerciseCmd placed.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
     after <- query @TestHolding c.asset.issuer
     assert (length before == length after && all (\value -> value `elem` before) after)
     assertUnchanged f placed)
@@ -277,7 +277,7 @@ runClosedMatch close = script do
       setTime index.terms.closeAt
       pure p.market
   submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-    exerciseCmd placed.book OrderBook_MatchBest with market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+    exerciseCmd placed.book OrderBook_MatchBest with market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   assertUnchanged f placed
   cancelled <- O.cancel f.orders placed.book placed.buy (Some placed.buyerBalance)
   restored <- O.requireReleasedBalance cancelled
@@ -312,7 +312,7 @@ runSelfTrade sellFirst = script do
       pure (ask.book, bid.order, ask.order, balance)
   let c = f.orders.positions.custody
   result <- submit (actAs a.operator <> readAs [c.vault, a.issuer]) do
-    exerciseCmd book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = balance; sellerBalance = balance; extraArgs = C.registryContext
+    exerciseCmd book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = balance; sellerBalance = balance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   assert (result.decision == M.CancelSelfTrade 2 && result.receipt == None)
   index <- O.loadBook f.orders result.book
   assert (length index.orders == 1 && index.nextOrderId == 3)
@@ -348,7 +348,7 @@ testFifoPartialContinuationAndNonBestRejection = script do
   assert (partial.orderId == 3 && partial.quantity == 1 && original.orderId == 2)
   setTime (addRelTime partial.acceptedAt (seconds 1))
   submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-    exerciseCmd result.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = balance; sellerBalance; extraArgs = C.registryContext
+    exerciseCmd result.book OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = balance; sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   assertConserved f result.book
   last <- match f (Crossed result.book nextBuy.order second.order buyerBalance sellerBalance) Yes
   case last.decision of M.Fill plan -> assert (plan.sellId == 2 && plan.buyId == 3); _ -> abort "Expected second FIFO sell"
@@ -378,7 +378,7 @@ testEmptySellerBalanceReceivesProceeds = script do
   f <- setup Good
   let a = f.orders.positions.custody.asset
   zero <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.reserve MarketReserve_Split with owner = a.bob; market = f.orders.positions.market; balance = f.sellerBalance; quantity = 2; extraArgs = C.registryContext
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.bob; market = f.orders.positions.market; balance = f.sellerBalance; quantity = 2; extraArgs = C.registryContext; eligibility = None
   let g = f with sellerBalance = zero.balance; reserve = zero.reserve
   placed <- cross g True Yes 0.60 1 0.40 3
   result <- match g placed Yes
@@ -430,14 +430,14 @@ testEmptyWrongOutcomeAndForeignMarket = script do
   let p = f.orders.positions
   let c = p.custody
   submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-    exerciseCmd f.orders.book OrderBook_MatchBest with market = p.market; outcome = Yes; buyerBalance = f.buyerBalance; sellerBalance = f.sellerBalance; extraArgs = C.registryContext
+    exerciseCmd f.orders.book OrderBook_MatchBest with market = p.market; outcome = Yes; buyerBalance = f.buyerBalance; sellerBalance = f.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   placed <- cross f True Yes 0.60 5 0.40 3
   current <- queryContractId c.asset.operator p.market
   terms <- case current of Some value -> pure value.terms; None -> abort "Missing market"
   (_, otherMarket) <- submit c.asset.operator do exerciseCmd p.protocol Protocol_CreateBinary with creator = c.asset.operator; terms
   forA_ [(p.market, No), (otherMarket, Yes)] (\(market, outcome) ->
     submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-      exerciseCmd placed.book OrderBook_MatchBest with market; outcome; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext)
+      exerciseCmd placed.book OrderBook_MatchBest with market; outcome; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None)
   assertUnchanged f placed
 
 testFalseBuyerAndForcedSelfCancelRejected : Script ()
@@ -463,7 +463,7 @@ testAlteredReferenceAndIncorrectEscrowRejected = script do
   wrongReference <- submit [c.asset.operator, c.vault] do
     createCmd (index with orders = map (\r -> if r.order == placed.buy then r with price = 0.70 else r) index.orders)
   submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-    exerciseCmd wrongReference OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+    exerciseCmd wrongReference OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   submit [c.asset.operator, c.vault] do archiveCmd wrongReference
   buy <- O.loadOrder f.orders placed.buy
   seller <- loadBalance f placed.sellerBalance
@@ -472,7 +472,7 @@ testAlteredReferenceAndIncorrectEscrowRejected = script do
   wrongEscrow <- submit [c.asset.operator, c.vault] do
     createCmd (index with orders = map (\r -> if r.order == placed.buy then r with order = badBuy else r) index.orders)
   submitMustFail (actAs c.asset.operator <> readAs [c.vault, c.asset.issuer]) do
-    exerciseCmd wrongEscrow OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext
+    exerciseCmd wrongEscrow OrderBook_MatchBest with market = f.orders.positions.market; outcome = Yes; buyerBalance = placed.buyerBalance; sellerBalance = placed.sellerBalance; extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
   submit [c.asset.alice, c.vault] do archiveCmd badBuy
   submit [c.asset.operator, c.vault] do archiveCmd wrongEscrow
   assertUnchanged f placed

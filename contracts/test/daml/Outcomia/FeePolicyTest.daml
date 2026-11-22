@@ -30,7 +30,7 @@ quotedBuy f policy revision terms = do
     exerciseCmd f.book OrderBook_PlaceBuy with
       owner = a.alice; market = f.positions.market; balance = f.positions.balance
       outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
-      feePolicy = policy; expectedFeeRevision = revision; expectedFeeTerms = terms
+      feePolicy = policy; expectedFeeRevision = revision; expectedFeeTerms = terms; eligibility = None
 
 testPolicyDefaultsAndOperatorOnlyUpdates : Script ()
 testPolicyDefaultsAndOperatorOnlyUpdates = script do
@@ -72,13 +72,13 @@ testStaleRevisionAndChangedQuoteRejectWithoutSpending = script do
     exerciseCmd f.book OrderBook_PlaceBuy with
       owner = a.alice; market = f.positions.market; balance = f.positions.balance
       outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
-      feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
+      feePolicy = f.positions.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6; eligibility = None
   forA_ [(0, Fees.FeeTerms 0 6), (1, Fees.FeeTerms 25 6), (1, Fees.FeeTerms 0 10)] (\(revision, terms) ->
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
       exerciseCmd f.book OrderBook_PlaceBuy with
         owner = a.alice; market = f.positions.market; balance = f.positions.balance
         outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
-        feePolicy = next; expectedFeeRevision = revision; expectedFeeTerms = terms)
+        feePolicy = next; expectedFeeRevision = revision; expectedFeeTerms = terms; eligibility = None)
   O.assertConserved f f.book f.positions.reserve f.positions.balance
   accepted <- quotedBuy f next 1 (Fees.FeeTerms 0 6)
   order <- O.loadOrder f accepted.order
@@ -97,7 +97,7 @@ testForeignPoliciesReject = script do
       exerciseCmd f.book OrderBook_PlaceBuy with
         owner = a.alice; market = f.positions.market; balance = f.positions.balance
         outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
-        feePolicy = policy; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6)
+        feePolicy = policy; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6; eligibility = None)
   O.assertConserved f f.book f.positions.reserve f.positions.balance
 
 testNonzeroRateFundsBothSidesWithApprovedSnapshots : Script ()
@@ -110,12 +110,12 @@ testNonzeroRateFundsBothSidesWithApprovedSnapshots = script do
     exerciseCmd f.book OrderBook_PlaceBuy with
       owner = a.alice; market = f.positions.market; balance = split.balance
       outcome = Yes; price = 0.4; quantity = 1; extraArgs = C.registryContext
-      feePolicy = high; expectedFeeRevision = 1; expectedFeeTerms = Fees.FeeTerms 25 6
+      feePolicy = high; expectedFeeRevision = 1; expectedFeeTerms = Fees.FeeTerms 25 6; eligibility = None
   ask <- submit (actAs a.alice <> readAs [a.operator, a.issuer]) do
     exerciseCmd bid.book OrderBook_PlaceSell with
       owner = a.alice; market = f.positions.market; positions = [split.position]
       outcome = Yes; price = 0.4; quantity = 1
-      feePolicy = high; expectedFeeRevision = 1; expectedFeeTerms = Fees.FeeTerms 25 6
+      feePolicy = high; expectedFeeRevision = 1; expectedFeeTerms = Fees.FeeTerms 25 6; eligibility = None
   balance <- O.requireBalance bid
   O.assertConserved f ask.book split.reserve balance
   account <- C.loadAccount f.positions.custody balance
@@ -208,7 +208,7 @@ testSellQuoteMismatchDoesNotConsumePosition = script do
       exerciseCmd f.book OrderBook_PlaceSell with
         owner = a.alice; market = f.positions.market; positions = [split.position]
         outcome = Yes; price = 0.4; quantity = 1
-        feePolicy = f.positions.protocol; expectedFeeRevision = revision; expectedFeeTerms = terms)
+        feePolicy = f.positions.protocol; expectedFeeRevision = revision; expectedFeeTerms = terms; eligibility = None)
   O.assertConserved f f.book split.reserve split.balance
   placed <- O.sell f f.book [split.position] Yes 0.4 1
   value <- O.loadOrder f placed.order

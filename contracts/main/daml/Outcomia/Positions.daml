@@ -15,6 +15,7 @@ import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Outcomia.Assets
 import Outcomia.Binary
+import Canton.MarketFactory qualified as MF
 import Outcomia.Custody
 import Outcomia.Types
 import Outcomia.Validation (boundedText, termsErrors)
@@ -46,6 +47,7 @@ template PositionRegistry
       controller creator
       do
         current <- fetch market
+        assertMsg "Factory markets already include their reserve and book" (current.factory == None)
         assertMsg "Market does not belong to this registry/creator"
           (current.operator == operator && current.protocolName == protocolName && current.creator == creator)
         checkCreator protocol operator protocolName creator
@@ -61,7 +63,7 @@ template PositionRegistry
           (Numeric.roundNumeric admitted.assetDecimals Numeric.RoundingDown (0.5 * intToDecimal current.terms.quantityLot) == 0.5 * intToDecimal current.terms.quantityLot)
         next <- create this with marketIds = current.marketId :: marketIds
         reserve <- create MarketReserve with
-          key = MarketKey operator protocolName current.marketId
+          key = MarketKey operator protocolName current.marketId None
           vault; creator
           terms = current.terms
           createdAt = current.createdAt
@@ -158,13 +160,17 @@ template MarketReserve
         balance : ContractId AssetBalance
         quantity : Int
         extraArgs : ExtraArgs
+        -- | Required for restricted markets: splitting adds exposure.
+        eligibility : Optional EligibilityProof
       controller owner
       do
         current <- fetch market
         assertMsg "Market identity or immutable terms do not match reserve"
           (current.operator == key.operator && current.protocolName == key.protocolName &&
-           current.marketId == key.marketId && current.creator == creator &&
+           current.marketId == key.marketId && current.factory == key.scope &&
+           current.creator == creator &&
            current.createdAt == createdAt && current.terms == terms)
+        requireEligible current owner MF.Split eligibility
         now <- getTime
         assertMsg "Splitting requires an open market before cutoff"
           (current.status == Open && now < terms.closeAt)

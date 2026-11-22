@@ -1,0 +1,171 @@
+-- | Restricted (invite-only) factory markets: entry actions need a proof from
+-- the market's own policy; fills re-check both parties; exits never do.
+module Outcomia.EligibilityTest where
+
+import Canton.MarketFactory qualified as MF
+import DA.Assert ((===))
+import Daml.Script
+import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.Binary
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Factory
+import Outcomia.FactoryTest qualified as FT
+import Outcomia.Fees qualified as Fees
+import Outcomia.Orders
+import Outcomia.Positions
+import Outcomia.TokenHarness
+import Outcomia.Types
+
+data Fixture = Fixture with
+    base : FT.Fixture
+    list : ContractId InviteListPolicy
+    listRef : MF.PolicyRef
+    market : ContractId BinaryMarket
+    reserve : ContractId MarketReserve
+    book : ContractId OrderBook
+    aliceBalance : ContractId AssetBalance
+    bobBalance : ContractId AssetBalance
+  deriving (Eq, Show)
+
+proofFor : ContractId InviteListPolicy -> Optional EligibilityProof
+proofFor list = Some EligibilityProof with policy = toInterfaceContractId list; evidence = []
+
+everyone : FT.Fixture -> [Party]
+everyone f = let a = FT.asset f in [a.operator, a.issuer, f.custody.vault, f.admin]
+
+-- | A restricted market whose invite list starts with Bob only; Alice and Bob
+-- both hold 5.0 of shared cash.
+setup : Script Fixture
+setup = script do
+  base <- FT.setup
+  let a = FT.asset base
+      c = base.custody
+  alice <- C.deposit c c.balance 5.0 [toInterfaceContractId @H.Holding a.input]
+  (_, bobAccount) <- submit (actAs a.bob <> readAs a.operator) do
+    exerciseCmd c.authority VaultAuthority_OpenBalance with owner = a.bob; admission = a.admission
+  input <- submit a.issuer do
+    createCmd TestHolding with
+      issuer = a.issuer; account = H.Account (Some a.bob) None ""
+      instrument = H.InstrumentId a.issuer "test-USD"; amount = 5.0; locked = None
+  bob <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
+    exerciseCmd bobAccount AssetBalance_Deposit with
+      admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0
+      extraArgs = C.registryContext
+  (factory, list) <- submit (actAs base.admin <> readAs (everyone base)) do
+    exerciseCmd base.factory OutcomiaFactory_CreateInviteList with manager = base.admin; parties = [a.bob]
+  Some policy <- queryContractId a.operator list
+  created <- submit (actAs base.admin <> readAs (everyone base)) do
+    exerciseCmd (toInterfaceContractId @MF.MarketFactory factory) MF.MarketFactory_Create with
+      creator = base.admin; terms = FT.standardTerms a; access = MF.Restricted policy.ref
+  [(reserve, _)] <- query @MarketReserve c.vault
+  [(book, _)] <- query @OrderBook c.vault
+  pure Fixture with
+    base; list; listRef = policy.ref; market = fromInterfaceContractId created.market
+    reserve; book; aliceBalance = alice.balance; bobBalance = bob.balance
+
+split : Fixture -> Party -> ContractId MarketReserve -> ContractId AssetBalance -> Int -> Optional EligibilityProof -> Commands SplitResult
+split f owner reserve balance quantity eligibility =
+  exerciseCmd reserve MarketReserve_Split with
+    owner; market = f.market; balance; quantity; extraArgs = C.registryContext; eligibility
+
+asParty : Fixture -> Party -> Commands a -> Script a
+asParty f party cmds = submit (actAs party <> readAs (everyone f.base)) cmds
+
+failsAs : Fixture -> Party -> Commands a -> Script ()
+failsAs f party cmds = submitMustFail (actAs party <> readAs (everyone f.base)) cmds
+
+test_invite_lists_are_numbered_and_policy_gated : Script ()
+test_invite_lists_are_numbered_and_policy_gated = script do
+  f <- setup
+  let a = FT.asset f.base
+  f.listRef.policyId === "invite/public/1"
+  f.listRef.operator === a.operator
+  Some market <- queryContractId a.operator f.market
+  market.access === Some f.listRef
+  Some marketView <- queryInterfaceContractId a.operator (toInterfaceContractId @MF.Market f.market)
+  marketView.access === MF.Restricted f.listRef
+  -- The creation policy is admins only, so an outsider cannot issue lists.
+  [(factory, _)] <- query @OutcomiaMarketFactory a.operator
+  failsAs f f.base.outsider do
+    exerciseCmd factory OutcomiaFactory_CreateInviteList with manager = f.base.outsider; parties = []
+  (_, second) <- asParty f f.base.admin do
+    exerciseCmd factory OutcomiaFactory_CreateInviteList with manager = f.base.admin; parties = []
+  Some value <- queryContractId a.operator second
+  value.ref.policyId === "invite/public/2"
+
+test_entry_requires_the_markets_policy_and_an_invitation : Script ()
+test_entry_requires_the_markets_policy_and_an_invitation = script do
+  f <- setup
+  let a = FT.asset f.base
+  -- No proof, or a proof from a list Alice is not on, is rejected.
+  failsAs f a.alice (split f a.alice f.reserve f.aliceBalance 1 None)
+  failsAs f a.alice (split f a.alice f.reserve f.aliceBalance 1 (proofFor f.list))
+  -- A different list that names Alice is not this market's policy.
+  [(factory, _)] <- query @OutcomiaMarketFactory a.operator
+  (_, other) <- asParty f f.base.admin do
+    exerciseCmd factory OutcomiaFactory_CreateInviteList with manager = f.base.admin; parties = [a.alice]
+  failsAs f a.alice (split f a.alice f.reserve f.aliceBalance 1 (proofFor other))
+  -- Once invited, Alice may split.
+  updated <- asParty f f.base.admin do
+    exerciseCmd f.list InviteList_Set with replacementParties = [a.bob, a.alice]
+  result <- asParty f a.alice (split f a.alice f.reserve f.aliceBalance 2 (proofFor updated))
+  Some lot <- queryContractId f.base.custody.vault result.position
+  (lot.yes, lot.no) === (2, 2)
+
+test_fills_recheck_both_parties_and_exits_need_no_proof : Script ()
+test_fills_recheck_both_parties_and_exits_need_no_proof = script do
+  f <- setup
+  let a = FT.asset f.base
+      vault = f.base.custody.vault
+  list <- asParty f f.base.admin do
+    exerciseCmd f.list InviteList_Set with replacementParties = [a.bob, a.alice]
+  sellerSplit <- asParty f a.bob (split f a.bob f.reserve f.bobBalance 3 (proofFor list))
+  ask <- asParty f a.bob do
+    exerciseCmd f.book OrderBook_PlaceSell with
+      owner = a.bob; market = f.market; positions = [sellerSplit.position]; outcome = Yes
+      price = 0.4; quantity = 2; feePolicy = a.protocol; expectedFeeRevision = 0
+      expectedFeeTerms = Fees.FeeTerms 0 6; eligibility = proofFor list
+  -- Placement needs the proof too.
+  failsAs f a.alice do
+    exerciseCmd ask.book OrderBook_PlaceBuy with
+      owner = a.alice; market = f.market; balance = f.aliceBalance; outcome = Yes; price = 0.6
+      quantity = 1; feePolicy = a.protocol; expectedFeeRevision = 0
+      expectedFeeTerms = Fees.FeeTerms 0 6; extraArgs = C.registryContext; eligibility = None
+  bid <- asParty f a.alice do
+    exerciseCmd ask.book OrderBook_PlaceBuy with
+      owner = a.alice; market = f.market; balance = f.aliceBalance; outcome = Yes; price = 0.6
+      quantity = 1; feePolicy = a.protocol; expectedFeeRevision = 0
+      expectedFeeTerms = Fees.FeeTerms 0 6; extraArgs = C.registryContext; eligibility = proofFor list
+  Some buyerBalance <- pure bid.balance
+  let match book policy buyer seller = submit (actAs a.operator <> readAs [vault, a.issuer, a.alice, a.bob, f.base.admin]) do
+        exerciseCmd book OrderBook_MatchBest with
+          market = f.market; outcome = Yes; buyerBalance = buyer; sellerBalance = seller
+          extraArgs = C.registryContext; buyerEligibility = proofFor policy; sellerEligibility = proofFor policy
+      matchFails book policy buyer seller = submitMustFail (actAs a.operator <> readAs [vault, a.issuer, a.alice, a.bob, f.base.admin]) do
+        exerciseCmd book OrderBook_MatchBest with
+          market = f.market; outcome = Yes; buyerBalance = buyer; sellerBalance = seller
+          extraArgs = C.registryContext; buyerEligibility = proofFor policy; sellerEligibility = proofFor policy
+  -- Both parties invited: the fill settles.
+  filled <- match bid.book list buyerBalance sellerSplit.balance
+  -- Alice bids again; then Bob is removed from the list.
+  [(account, _)] <- query @AssetBalance a.alice
+  again <- asParty f a.alice do
+    exerciseCmd filled.book OrderBook_PlaceBuy with
+      owner = a.alice; market = f.market; balance = account; outcome = Yes; price = 0.6
+      quantity = 1; feePolicy = a.protocol; expectedFeeRevision = 0
+      expectedFeeTerms = Fees.FeeTerms 0 6; extraArgs = C.registryContext; eligibility = proofFor list
+  Some againBalance <- pure again.balance
+  reduced <- asParty f f.base.admin do
+    exerciseCmd list InviteList_Set with replacementParties = [a.alice]
+  [(sellerAccount, _)] <- query @AssetBalance a.bob
+  -- Bob's resting sell can no longer be filled, even with the current list.
+  matchFails again.book reduced againBalance sellerAccount
+  -- Bob still exits: cancellation needs no proof.
+  Some current <- queryContractId vault again.book
+  let [sellRef] = filter (\r -> r.side == Sell) current.orders
+  cancelled <- asParty f a.bob do
+    exerciseCmd again.book OrderBook_Cancel with
+      owner = a.bob; order = sellRef.order; balance = None; extraArgs = C.registryContext
+  Some after <- queryContractId vault cancelled.book
+  length (filter (\r -> r.side == Sell) after.orders) === 0

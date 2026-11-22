@@ -73,7 +73,7 @@ testPrimaryExactCutoffAndDuplicatePrevention = script do
   setTime f.terms.closeAt
   cid <- primary f f.market YesWins
   value <- loadProposal f.creator cid
-  assert (value.key == MarketKey f.operator "outcomia" 1 && value.terms == f.terms &&
+  assert (value.key == MarketKey f.operator "outcomia" 1 None && value.terms == f.terms &&
     value.openedAt == f.createdAt && value.proposedAt == f.terms.closeAt &&
     value.proposedBy == f.creator && value.outcome == YesWins && value.evidence == validEvidence &&
     value.finalizableAt == addRelTime value.proposedAt (seconds f.terms.resolutionDelaySeconds))

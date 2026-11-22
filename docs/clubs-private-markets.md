@@ -109,6 +109,11 @@ active membership in members-only markets.
 
 ## Market creation (Phase B factory)
 
+The general factory standard (interfaces, numbering, eligibility and the
+reference implementation) is specified in [market factory](market-factory.md);
+the club factory is one instance of it.
+
+
 `Protocol_CreateBinary` consumes the single `Protocol` contract for every
 market, which serialises all creation. Phase B keeps it unchanged for public
 markets (existing tests must pass untouched) and adds `ClubMarketFactory`.
@@ -119,14 +124,18 @@ resolution checks current club adminship.
 
 ## Delivery phases
 
-| Phase | Contracts | Gate |
-| --- | --- | --- |
-| A — Define | This document | Reviewed |
-| B — Factory | `MarketKey.scope`, `ClubMarketFactory` skeleton; public creation unchanged | Existing binary tests unchanged; upgrade-compatibility check |
-| C — Clubs | `ClubRegistry`, `Club`, `ClubAdmin`, `ClubInvitation`, `ClubMembership`, club market creation | Club lifecycle works without trading; negative authorization tests |
-| D — Lineage | Factory exercise → market evidence; LocalNet scripts | CantonGrid M2 verified-tree and M3 declared-link acceptance |
-| E — Trading | Membership on orders, matching checks, `ClubRemoval`, `OrderBook_CancelDeparted`, club resolution | Removal/fill race, exit and multi-party disclosure tests |
-| F — Harden | Club fee share, deployment, multi-outcome clubs | Controlled-network acceptance |
+Each phase ships its contracts **and** the matching UI in the shared app
+(`kunal171/outcomia`, `app/canton`) together. Live trading stays behind the
+existing deployment gate until Phase F.
+
+| Phase | Contracts | UI (same phase) | Gate |
+| --- | --- | --- | --- |
+| A — Define | This document | — | Reviewed |
+| B — Factory | Standard package, `MarketKey.scope`, Outcomia factory, eligibility, invite lists; public creation unchanged | Create markets through the factory (policy shown, public or invite-only access), factory-admin close/propose, eligibility evidence on orders and splits | Existing binary tests unchanged; factory and UI command tests |
+| C — Clubs | `ClubRegistry`, `Club`, `ClubAdmin`, `ClubInvitation`, `ClubMembership`, club factory instances | Club pages: create, invite/accept/decline, members and roles, club market creation | Club lifecycle works without trading; negative authorization tests |
+| D — Lineage | Factory exercise → market evidence; LocalNet scripts | Market and club provenance shown from indexed data | CantonGrid M2 verified-tree and M3 declared-link acceptance |
+| E — Trading | Membership on orders, matching checks, `ClubRemoval`, `OrderBook_CancelDeparted`, club resolution | Membership-aware trading, departed-member state, club resolution | Removal/fill race, exit and multi-party disclosure tests |
+| F — Harden | Club fee share, deployment, multi-outcome clubs | Remove the deployment gate after a wallet smoke test | Controlled-network acceptance |
 
 ## Acceptance tests (minimum)
 

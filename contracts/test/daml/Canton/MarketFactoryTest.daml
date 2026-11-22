@@ -1,0 +1,170 @@
+-- | The standard is usable without Outcomia: this module implements it with
+-- minimal toy templates and checks the shared rules (creation policy, numbering,
+-- term shape and eligibility binding).
+module Canton.MarketFactoryTest where
+
+import Canton.MarketFactory
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+-- | Toy market: just the standard view.
+template ToyMarket
+  with
+    operator : Party
+    ref : MarketRef
+    creator : Party
+    terms : MarketTerms
+    access : Access
+  where
+    signatory operator, creator
+    interface instance Market for ToyMarket where
+      view = MarketView with
+        ref; creator; question = terms.question; outcomes = terms.outcomes
+        closeAt = terms.closeAt; status = Draft; access
+
+-- | Toy factory with a per-instance counter and creation policy.
+template ToyFactory
+  with
+    operator : Party
+    ref : FactoryRef
+    policy : CreationPolicy
+    nextNumber : Int
+  where
+    signatory operator
+    ensure validFactoryRef ref && ref.operator == operator && nextNumber > 0
+    interface instance MarketFactory for ToyFactory where
+      view = FactoryView with
+        ref; creationPolicy = policy; nextNumber; minOutcomes = 2; maxOutcomes = 2
+      create' creator terms access = do
+        assertMsg "Creator is not allowed by this factory" (mayCreate policy creator)
+        let problems = termsShapeErrors 2 2 terms
+        assertMsg (show problems) (null problems)
+        next <- create this with nextNumber = nextNumber + 1
+        let marketRef = MarketRef with factory = ref; number = nextNumber
+        market <- create ToyMarket with operator; ref = marketRef; creator; terms; access
+        pure MarketCreated with
+          factory = toInterfaceContractId next
+          market = toInterfaceContractId market
+          ref = marketRef
+
+-- | Toy invite list policy.
+template ToyInviteList
+  with
+    operator : Party
+    ref : PolicyRef
+    parties : [Party]
+  where
+    signatory operator
+    interface instance EligibilityPolicy for ToyInviteList where
+      view = PolicyView with ref; kind = "invite-list"
+      admit party _ _ = assertMsg "Party is not invited" (party `elem` parties)
+
+-- | Toy book: entry requires the market's stored policy to admit the trader.
+template ToyBook
+  with
+    operator : Party
+    policyRef : PolicyRef
+  where
+    signatory operator
+    nonconsuming choice ToyBook_Enter : ()
+      with
+        trader : Party
+        policy : ContractId EligibilityPolicy
+      controller trader
+      do checkEligibility policy policyRef trader Place []
+
+termsAt : Party -> Time -> MarketTerms
+termsAt admin now = MarketTerms with
+  question = "Will it rain?"
+  outcomes = ["YES", "NO"]
+  outcomeCriteria = ["Rain is recorded", "No rain is recorded"]
+  invalidCriteria = "The station reports no data"
+  evidenceRequirements = "Official station report"
+  rulesUri = "ar://rules"
+  rulesHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  collateral = InstrumentRef with admin; id = "USD"
+  closeAt = addRelTime now (hours 24)
+  earliestResolutionAt = None
+  resolutionDelaySeconds = 3600
+  priceTick = 0.01
+  quantityLot = 1
+
+test_terms_shape : Script ()
+test_terms_shape = script do
+  admin <- allocateParty "Admin"
+  now <- getTime
+  let terms = termsAt admin now
+  assertMsg "Valid terms pass" (null (termsShapeErrors 2 2 terms))
+  let bad = [ terms with outcomes = ["YES"], outcomeCriteria = ["x"]
+            , terms with outcomes = ["YES", "YES"]
+            , terms with outcomeCriteria = ["only one"]
+            , terms with question = "   "
+            , terms with rulesUri = "http://insecure"
+            , terms with rulesHash = "ABC"
+            , terms with earliestResolutionAt = Some now
+            , terms with priceTick = 0.0
+            , terms with quantityLot = 0
+            , terms with outcomes = [" YES", "NO"] ]
+  forA_ bad \t -> assertMsg ("Rejected: " <> show t.outcomes) (not (null (termsShapeErrors 2 2 t)))
+  assertMsg "Three outcomes exceed a binary range"
+    (not (null (termsShapeErrors 2 2 terms with outcomes = ["A", "B", "C"], outcomeCriteria = ["a", "b", "c"])))
+
+test_creation_policy : Script ()
+test_creation_policy = script do
+  [a, b] <- mapA allocateParty ["A", "B"]
+  assertMsg "Admins only" (mayCreate (AdminsOnly [a]) a && not (mayCreate (AdminsOnly [a]) b))
+  assertMsg "Allowlist" (mayCreate (Allowlist [b]) b && not (mayCreate (Allowlist [b]) a))
+  assertMsg "Any party" (mayCreate AnyParty b)
+
+test_factory_numbers_markets_through_the_interface : Script ()
+test_factory_numbers_markets_through_the_interface = script do
+  operator <- allocateParty "Operator"
+  admin <- allocateParty "Admin"
+  outsider <- allocateParty "Outsider"
+  now <- getTime
+  let ref = FactoryRef with operator; namespace = "toy"; factoryId = "public"
+  factory <- submit operator do
+    createCmd ToyFactory with operator; ref; policy = AdminsOnly [admin]; nextNumber = 1
+  let iface = toInterfaceContractId @MarketFactory factory
+  submitMustFail outsider do
+    exerciseCmd iface MarketFactory_Create with creator = outsider; terms = termsAt admin now; access = Public
+  first <- submit (actAs admin <> readAs operator) do
+    exerciseCmd iface MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public
+  second <- submit (actAs admin <> readAs operator) do
+    exerciseCmd first.factory MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public
+  first.ref === MarketRef with factory = ref; number = 1
+  second.ref === MarketRef with factory = ref; number = 2
+  Some market <- queryInterfaceContractId admin second.market
+  market.ref === second.ref
+  market.outcomes === ["YES", "NO"]
+  -- The old factory revision is spent; reusing it fails.
+  submitMustFail (actAs admin <> readAs operator) do
+    exerciseCmd first.factory MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public
+
+test_eligibility_binds_policy_reference_and_operator : Script ()
+test_eligibility_binds_policy_reference_and_operator = script do
+  operator <- allocateParty "Operator"
+  rival <- allocateParty "Rival"
+  invited <- allocateParty "Invited"
+  stranger <- allocateParty "Stranger"
+  let ref = PolicyRef with operator; namespace = "toy"; policyId = "invite-1"
+  policy <- submit operator do
+    createCmd ToyInviteList with operator; ref; parties = [invited]
+  book <- submit operator do createCmd ToyBook with operator; policyRef = ref
+  let iface = toInterfaceContractId @EligibilityPolicy policy
+  submit (actAs invited <> readAs operator) do
+    exerciseCmd book ToyBook_Enter with trader = invited; policy = iface
+  submitMustFail (actAs stranger <> readAs operator) do
+    exerciseCmd book ToyBook_Enter with trader = stranger; policy = iface
+  -- A policy with a different reference does not admit into this book.
+  other <- submit operator do
+    createCmd ToyInviteList with operator; ref = (ref with policyId = "invite-2"); parties = [stranger]
+  submitMustFail (actAs stranger <> readAs operator) do
+    exerciseCmd book ToyBook_Enter with trader = stranger; policy = toInterfaceContractId other
+  -- A look-alike policy signed by another operator is rejected.
+  forged <- submit rival do
+    createCmd ToyInviteList with operator = rival; ref; parties = [stranger]
+  submitMustFail (actAs stranger <> readAs operator <> readAs rival) do
+    exerciseCmd book ToyBook_Enter with trader = stranger; policy = toInterfaceContractId forged

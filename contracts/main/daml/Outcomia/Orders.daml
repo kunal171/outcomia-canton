@@ -17,6 +17,7 @@ import Outcomia.Assets (AssetAdmission(..), holdingTotal)
 import Outcomia.Fees qualified as Fees
 import Outcomia.MarketFees qualified as MarketFees
 import Outcomia.Binary
+import Canton.MarketFactory qualified as MF
 import Outcomia.Custody
 import Outcomia.Positions
 import Outcomia.Matching qualified as Matching
@@ -145,9 +146,11 @@ template OrderRegistry
            pool.vault == vault && pool.creator == creator)
         checkCreator protocol operator protocolName creator
         current <- fetch market
+        assertMsg "Factory markets already include their reserve and book" (current.factory == None)
         assertMsg "Market does not match the registered reserve"
           (current.operator == operator && current.protocolName == protocolName &&
-           current.marketId == pool.key.marketId && current.creator == creator &&
+           current.marketId == pool.key.marketId && current.factory == pool.key.scope &&
+           current.creator == creator &&
            current.createdAt == pool.createdAt && current.terms == pool.terms)
         now <- getTime
         assertMsg "Book requires an unexpired Draft or Open market"
@@ -225,9 +228,13 @@ template OrderBook
         expectedFeeRevision : Int
         expectedFeeTerms : Fees.FeeTerms
         extraArgs : ExtraArgs
+        -- | Required for restricted markets; ignored for public ones.
+        eligibility : Optional EligibilityProof
       controller owner
       do
         checkPlacement this market price quantity
+        current <- fetch market
+        requireEligible current owner MF.Place eligibility
         feeTerms <- checkFeeQuote this feePolicy expectedFeeRevision expectedFeeTerms
         checkOrderAccount key vault terms.collateral factory owner balance
         funding <- checkedFee (Fees.buyFunding feeTerms (Fees.BuyFeeState quantity quantity price 0.0 0.0))
@@ -265,9 +272,13 @@ template OrderBook
         feePolicy : ContractId Protocol
         expectedFeeRevision : Int
         expectedFeeTerms : Fees.FeeTerms
+        -- | Required for restricted markets; ignored for public ones.
+        eligibility : Optional EligibilityProof
       controller owner
       do
         checkPlacement this market price quantity
+        current <- fetch market
+        requireEligible current owner MF.Place eligibility
         feeTerms <- checkFeeQuote this feePolicy expectedFeeRevision expectedFeeTerms
         assertMsg "Sell requires 1 to 16 unique position lots"
           (not (null positions) && length positions <= 16 && unique positions)
@@ -313,6 +324,10 @@ template OrderBook
         buyerBalance : ContractId AssetBalance
         sellerBalance : ContractId AssetBalance
         extraArgs : ExtraArgs
+        -- | Required for restricted markets: both parties of a fill must still
+        -- be eligible, so revoked access stops resting orders from filling.
+        buyerEligibility : Optional EligibilityProof
+        sellerEligibility : Optional EligibilityProof
       controller key.operator
       do
         checkTrading this market
@@ -324,8 +339,12 @@ template OrderBook
           assertMsg "Self-trade cancellation uses one owner account" (buyerBalance == sellerBalance)
           let newer = if buyRef.orderId > sellRef.orderId then buyRef.order else sellRef.order
           exercise newer LimitOrder_CancelSelfTrade with book = self; market; outcome; balance = buyerBalance; extraArgs
-        else exercise buyRef.order LimitOrder_SettleBuy with
-          book = self; market; sellOrder = sellRef.order; buyerBalance; sellerBalance; extraArgs
+        else do
+          current <- fetch market
+          requireEligible current buy.owner MF.Fill buyerEligibility
+          requireEligible current sell.owner MF.Fill sellerEligibility
+          exercise buyRef.order LimitOrder_SettleBuy with
+            book = self; market; sellOrder = sellRef.order; buyerBalance; sellerBalance; extraArgs
 
     -- | Inputs: owner, exact active order reference, optional buy refund account
     -- and registry context. Rejects: foreign/unindexed order, another owner or
@@ -587,7 +606,8 @@ checkTrading book market = do
   current <- fetch market
   assertMsg "Market identity or terms do not match order book"
     (current.operator == book.key.operator && current.protocolName == book.key.protocolName &&
-     current.marketId == book.key.marketId && current.creator == book.creator &&
+     current.marketId == book.key.marketId && current.factory == book.key.scope &&
+     current.creator == book.creator &&
      current.createdAt == book.marketCreatedAt && current.terms == book.terms)
   now <- getTime
   assertMsg "Orders require an Open market before cutoff" (current.status == Open && now < book.terms.closeAt)

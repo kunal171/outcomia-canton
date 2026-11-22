@@ -4,6 +4,7 @@
 module Outcomia.FinalizationTest where
 
 import Daml.Script
+import DA.List (sortOn)
 import DA.Foldable (forA_)
 import DA.Time (addRelTime, seconds)
 import Outcomia.Binary
@@ -29,7 +30,7 @@ template PretendRoles
     signatory signerParty
     observer advertisedOperator, admins
     interface instance Roles.ProtocolRoles for PretendRoles where
-      view = Roles.ProtocolRolesView advertisedOperator "outcomia" admins
+      view = Roles.ProtocolRolesView advertisedOperator "outcomia" admins None
 
 correctedEvidence : ResolutionEvidence
 correctedEvidence = R.validEvidence with
@@ -233,7 +234,8 @@ testFinalizationPreservesBackingAndOwnerCancellation = script do
   setTime value.finalizableAt
   final <- submit c.asset.operator do exerciseCmd proposal ResolutionProposal_Finalize
   holdingsAfter <- query @TestHolding c.asset.issuer
-  assert (holdingsBefore == holdingsAfter)
+  -- Query order is not guaranteed; compare the holdings as sets.
+  assert (sortOn fst holdingsBefore == sortOn fst holdingsAfter)
   _ <- loadFinal c.asset.operator final
   (ref, _) <- Fee.findOrder f matched.book Types.Buy
   (buyer, _) <- S.resultAccounts matched

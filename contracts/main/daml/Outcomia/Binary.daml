@@ -16,6 +16,9 @@ import DA.Time (addRelTime, seconds)
 import Outcomia.Resolution qualified as Resolution
 import Outcomia.ProtocolRoles qualified as Roles
 import Outcomia.Types
+import Canton.MarketFactory (FactoryRef)
+import Canton.MarketFactory qualified as MF
+import DA.Optional (isSome)
 import Outcomia.Validation
 
 -- | One operator-approved protocol lineage. Discovery/services must pin its
@@ -36,7 +39,7 @@ template Protocol
       takerFeeBps >= 0 && takerFeeBps <= 1000 && feeRevision >= 0
 
     interface instance Roles.ProtocolRoles for Protocol where
-      view = Roles.ProtocolRolesView operator protocolName admins
+      view = Roles.ProtocolRolesView operator protocolName admins None
 
     -- | Inputs: replacement admin list, including the operator.
     -- Rejects: non-operator authorization, duplicates, empty/oversized lists or
@@ -105,6 +108,8 @@ template Protocol
           status = Draft
           openedAt = None
           closeReason = None
+          factory = None
+          access = None
         pure (next, market)
 
 -- | Immutable terms plus explicit lifecycle state. Both operator and creator
@@ -122,6 +127,10 @@ template BinaryMarket
     status : MarketStatus
     closeReason : Optional Text
     openedAt : Optional Time
+    -- | Issuing factory instance, or `None` for protocol-root markets.
+    factory : Optional FactoryRef
+    -- | Eligibility policy for entry actions, or `None` for public markets.
+    access : Optional MF.PolicyRef
   where
     signatory operator, creator
     observer Resolution.fallbackObservers terms
@@ -136,6 +145,50 @@ template BinaryMarket
         (_, None) -> True
         (_, Some _) -> False)
 
+    interface instance MF.Market for BinaryMarket where
+      view = MF.MarketView with
+        ref = MF.MarketRef with
+          factory = optional (protocolScope operator protocolName) identity factory
+          number = marketId
+        creator; question = terms.question; outcomes = ["YES", "NO"]
+        closeAt = terms.closeAt
+        status = case status of
+          Draft -> MF.Draft
+          Open -> MF.Open
+          Closed -> MF.Closed
+        access = optional MF.Public MF.Restricted access
+
+    -- | Factory markets: any current admin of the issuing factory instance.
+    -- Inputs: actor, that factory's role contract and a closure reason.
+    -- Rejects: protocol-root markets, a role contract for another scope or
+    -- operator, a non-admin, non-Open state or a blank/oversized reason.
+    choice Binary_FactoryClose : ContractId BinaryMarket
+      with
+        actor : Party
+        roles : ContractId Roles.ProtocolRoles
+        reason : Text
+      controller actor
+      do
+        assertMsg "Only factory markets are managed by factory admins" (isSome factory)
+        Roles.checkAdmin roles operator protocolName factory actor
+        assertMsg "Only an open market can close" (status == Open)
+        assertMsg "Closure reason must contain 1 to 500 characters" (boundedText 500 reason)
+        create this with status = Closed; closeReason = Some reason
+
+    -- | Factory markets: any current factory admin proposes once the earliest
+    -- resolution time has passed. Same proposal boundary as protocol markets.
+    choice Binary_FactoryPropose : ContractId Resolution.ResolutionProposal
+      with
+        actor : Party
+        roles : ContractId Roles.ProtocolRoles
+        outcome : Resolution.ResolutionOutcome
+        evidence : Resolution.ResolutionEvidence
+      controller actor
+      do
+        assertMsg "Only factory markets are managed by factory admins" (isSome factory)
+        Roles.checkAdmin roles operator protocolName factory actor
+        proposeResolution this actor outcome evidence
+
     -- | Inputs: the current protocol revision for this operator/name.
     -- Rejects: other callers, revoked admin, wrong/stale protocol, non-Draft state
     -- or now >= cutoff. Result: an Open successor with exactly the same terms.
@@ -143,6 +196,7 @@ template BinaryMarket
       with protocol : ContractId Protocol
       controller creator
       do
+        assertMsg "Factory markets are managed through their factory" (factory == None)
         checkCreator protocol operator protocolName creator
         assertMsg "Only a draft can open" (status == Draft)
         now <- getTime
@@ -159,6 +213,7 @@ template BinaryMarket
         reason : Text
       controller creator
       do
+        assertMsg "Factory markets are managed through their factory" (factory == None)
         checkCreator protocol operator protocolName creator
         assertMsg "Only an open market can close" (status == Open)
         assertMsg "Closure reason must contain 1 to 500 characters" (boundedText 500 reason)
@@ -176,6 +231,7 @@ template BinaryMarket
         evidence : Resolution.ResolutionEvidence
       controller creator
       do
+        assertMsg "Factory markets are managed through their factory" (factory == None)
         checkCreator protocol operator protocolName creator
         proposeResolution this creator outcome evidence
 
@@ -192,6 +248,7 @@ template BinaryMarket
         evidence : Resolution.ResolutionEvidence
       controller resolver
       do
+        assertMsg "Factory markets are managed through their factory" (factory == None)
         current <- fetch protocol
         assertMsg "Fallback protocol does not belong to this market"
           (current.operator == operator && current.protocolName == protocolName)
@@ -208,6 +265,30 @@ template BinaryMarket
       do
         assertMsg "Only a draft can be cancelled" (status == Draft)
         create this with status = Closed; closeReason = Some "Draft cancelled"
+
+-- | The current policy contract and any evidence a party presents for an
+-- entry action in a restricted market.
+data EligibilityProof = EligibilityProof with
+    policy : ContractId MF.EligibilityPolicy
+    evidence : [ContractId MF.EligibilityEvidence]
+  deriving (Eq, Show)
+
+-- | Inputs: the live market, the acting party, the entry action and a proof.
+-- Public markets admit everyone. Restricted markets require a proof whose
+-- policy matches the market's stored reference and is signed by its operator,
+-- and that policy must admit the party. Exits never call this.
+requireEligible : BinaryMarket -> Party -> MF.EntryAction -> Optional EligibilityProof -> Update ()
+requireEligible market party action proof = case market.access of
+  None -> pure ()
+  Some expected -> case proof of
+    None -> abort "This market is restricted: present an eligibility proof"
+    Some value -> MF.checkEligibility value.policy expected party action value.evidence
+
+-- | Standard reference for protocol-root markets. Factory instances may not
+-- use the reserved `protocol` ID, so the two never collide.
+protocolScope : Party -> Text -> MF.FactoryRef
+protocolScope operator protocolName =
+  MF.FactoryRef with operator; namespace = protocolName; factoryId = "protocol"
 
 -- | Inputs: operator and full proposed admin list. Result: whether it is valid.
 -- Bound the list before duplicate checking. The operator is always an
@@ -239,11 +320,11 @@ proposeResolution market resolver outcome evidence = do
     None -> abort "Only a previously opened market can propose resolution"
   now <- getTime
   assertMsg "Resolver is outside its agreed resolution window"
-    (Resolution.eligibleResolver market.creator market.terms resolver now)
+    (Resolution.eligibleResolverFor market.factory market.creator market.terms resolver now)
   let problems = Resolution.evidenceErrors evidence
   assertMsg (T.intercalate "; " problems) (null problems)
   create Resolution.ResolutionProposal with
-    key = MarketKey market.operator market.protocolName market.marketId
+    key = MarketKey market.operator market.protocolName market.marketId market.factory
     creator = market.creator; terms = market.terms; marketCreatedAt = market.createdAt
     openedAt = opened; proposedBy = resolver; outcome; evidence; proposedAt = now
     finalizableAt = addRelTime now (seconds market.terms.resolutionDelaySeconds)
