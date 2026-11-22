@@ -6,8 +6,8 @@
 -- and order book in one transaction; any failure rolls all of them back.
 -- Factory markets carry their 'FactoryRef' as scope, so their numbers never
 -- collide with protocol-root markets, and only this instance's current admins
--- manage them (close, propose, correct). Club and invite-only access arrive
--- with eligibility enforcement; this revision accepts public markets only.
+-- manage them (close, propose, correct). Markets are public or restricted to
+-- an eligibility policy, such as an invite list created through this factory.
 module Outcomia.Factory where
 
 import Canton.MarketFactory qualified as MF
@@ -43,12 +43,15 @@ template OutcomiaMarketFactory
     policy : MF.CreationPolicy
     assets : [FactoryAsset]
     nextNumber : Int
+    -- | Counter for policy references issued by this factory (invite lists).
+    nextPolicyNumber : Int
   where
     signatory operator, vault
     observer admins
     ensure operator /= vault && boundedText 64 protocolName && MF.validFactoryRef ref &&
       ref.operator == operator && ref.namespace == protocolName &&
       ref.factoryId /= "protocol" && validFactoryAdmins admins && nextNumber > 0 &&
+      nextPolicyNumber > 0 &&
       length assets <= 64 && unique (map (\a -> a.instrument) assets) &&
       validPolicy policy
 
@@ -60,6 +63,24 @@ template OutcomiaMarketFactory
     -- Lets resolution corrections verify current admins of this exact scope.
     interface instance Roles.ProtocolRoles for OutcomiaMarketFactory where
       view = Roles.ProtocolRolesView operator protocolName admins (Some ref)
+
+    -- | Inputs: the list manager (who must pass the creation policy) and the
+    -- invited parties. Result: an invite list with the next stable policy
+    -- reference of this factory, usable as `Restricted` access for markets.
+    choice OutcomiaFactory_CreateInviteList : (ContractId OutcomiaMarketFactory, ContractId InviteListPolicy)
+      with
+        manager : Party
+        parties : [Party]
+      controller manager
+      do
+        assertMsg "Manager is not allowed by this factory's creation policy" (MF.mayCreate policy manager)
+        assertMsg "Policy number limit reached" (nextPolicyNumber < 9223372036854775807)
+        let policyRef = MF.PolicyRef with
+              operator; namespace = protocolName
+              policyId = "invite/" <> ref.factoryId <> "/" <> show nextPolicyNumber
+        next <- create this with nextPolicyNumber = nextPolicyNumber + 1
+        list <- create InviteListPolicy with operator; manager; ref = policyRef; parties
+        pure (next, list)
 
     -- | Inputs: replacement admin list. Rejects: another caller or an invalid
     -- list. Result: a new revision; removed admins lose management at once.
@@ -88,6 +109,36 @@ template OutcomiaMarketFactory
         assertMsg "Admitted assets must be unique and at most 64"
           (length replacementAssets <= 64 && unique (map (\a -> a.instrument) replacementAssets))
         create this with assets = replacementAssets
+
+-- | Invite-only access: the manager and listed parties may enter. Invitees
+-- observe the list so they can present it; the manager edits it.
+template InviteListPolicy
+  with
+    operator : Party
+    manager : Party
+    ref : MF.PolicyRef
+    parties : [Party]
+  where
+    signatory operator, manager
+    observer parties
+    ensure MF.validPolicyRef ref && ref.operator == operator && validInvitees parties
+
+    interface instance MF.EligibilityPolicy for InviteListPolicy where
+      view = MF.PolicyView with ref; kind = "invite-list"
+      admit party _ _ = assertMsg "Party is not on this market's invite list"
+        (party == manager || party `elem` parties)
+
+    -- | Inputs: replacement invitees. Result: a new revision with the same
+    -- reference; removed parties can no longer place, split or be filled.
+    choice InviteList_Set : ContractId InviteListPolicy
+      with replacementParties : [Party]
+      controller manager
+      do
+        assertMsg "Invite lists hold at most 256 unique parties" (validInvitees replacementParties)
+        create this with parties = replacementParties
+
+validInvitees : [Party] -> Bool
+validInvitees parties = length parties <= 256 && unique parties
 
 -- | Party lists in a creation policy are bounded and unique.
 validPolicy : MF.CreationPolicy -> Bool
@@ -123,7 +174,7 @@ toBinaryTerms terms instrument =
     quantityLot = terms.quantityLot
 
 -- | Inputs: the current factory, creator, standard terms and access.
--- Rejects: a creator outside the policy, restricted access (not yet supported),
+-- Rejects: a creator outside the policy, a restriction foreign to this deployment,
 -- terms that are not a valid YES/NO market, unadmitted collateral, increments
 -- that cannot settle in the asset's precision, an elapsed cutoff or counter
 -- exhaustion. Result: next factory revision plus an Open market, its empty
@@ -132,8 +183,13 @@ createBundle : OutcomiaMarketFactory -> Party -> MF.MarketTerms -> MF.Access -> 
 createBundle factory creator terms access = do
   assertMsg "Creator is not allowed by this factory's creation policy"
     (MF.mayCreate factory.policy creator)
-  assertMsg "Restricted access requires eligibility support in a later release"
-    (access == MF.Public)
+  restriction <- case access of
+    MF.Public -> pure None
+    MF.Restricted policyRef -> do
+      assertMsg "Access policy must belong to this factory's operator and namespace"
+        (MF.validPolicyRef policyRef && policyRef.operator == factory.operator &&
+         policyRef.namespace == factory.protocolName)
+      pure (Some policyRef)
   let shape = MF.termsShapeErrors 2 2 terms
   assertMsg (T.intercalate "; " shape) (null shape)
   assertMsg "Binary factory markets use the outcomes YES and NO" (terms.outcomes == ["YES", "NO"])
@@ -165,7 +221,7 @@ createBundle factory creator terms access = do
     operator = factory.operator; protocolName = factory.protocolName
     marketId = number; creator; terms = binary; createdAt = now
     status = Open; closeReason = None; openedAt = Some now
-    factory = Some factory.ref
+    factory = Some factory.ref; access = restriction
   _ <- create MarketReserve with
     key; vault = factory.vault; creator; terms = binary; createdAt = now
     factory = admitted.factory; assetDecimals = admitted.assetDecimals

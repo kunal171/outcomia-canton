@@ -15,6 +15,7 @@ import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Outcomia.Assets
 import Outcomia.Binary
+import Canton.MarketFactory qualified as MF
 import Outcomia.Custody
 import Outcomia.Types
 import Outcomia.Validation (boundedText, termsErrors)
@@ -159,6 +160,8 @@ template MarketReserve
         balance : ContractId AssetBalance
         quantity : Int
         extraArgs : ExtraArgs
+        -- | Required for restricted markets: splitting adds exposure.
+        eligibility : Optional EligibilityProof
       controller owner
       do
         current <- fetch market
@@ -167,6 +170,7 @@ template MarketReserve
            current.marketId == key.marketId && current.factory == key.scope &&
            current.creator == creator &&
            current.createdAt == createdAt && current.terms == terms)
+        requireEligible current owner MF.Split eligibility
         now <- getTime
         assertMsg "Splitting requires an open market before cutoff"
           (current.status == Open && now < terms.closeAt)

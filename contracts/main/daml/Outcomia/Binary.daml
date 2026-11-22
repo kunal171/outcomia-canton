@@ -109,6 +109,7 @@ template Protocol
           openedAt = None
           closeReason = None
           factory = None
+          access = None
         pure (next, market)
 
 -- | Immutable terms plus explicit lifecycle state. Both operator and creator
@@ -128,6 +129,8 @@ template BinaryMarket
     openedAt : Optional Time
     -- | Issuing factory instance, or `None` for protocol-root markets.
     factory : Optional FactoryRef
+    -- | Eligibility policy for entry actions, or `None` for public markets.
+    access : Optional MF.PolicyRef
   where
     signatory operator, creator
     observer Resolution.fallbackObservers terms
@@ -153,7 +156,7 @@ template BinaryMarket
           Draft -> MF.Draft
           Open -> MF.Open
           Closed -> MF.Closed
-        access = MF.Public
+        access = optional MF.Public MF.Restricted access
 
     -- | Factory markets: any current admin of the issuing factory instance.
     -- Inputs: actor, that factory's role contract and a closure reason.
@@ -262,6 +265,24 @@ template BinaryMarket
       do
         assertMsg "Only a draft can be cancelled" (status == Draft)
         create this with status = Closed; closeReason = Some "Draft cancelled"
+
+-- | The current policy contract and any evidence a party presents for an
+-- entry action in a restricted market.
+data EligibilityProof = EligibilityProof with
+    policy : ContractId MF.EligibilityPolicy
+    evidence : [ContractId MF.EligibilityEvidence]
+  deriving (Eq, Show)
+
+-- | Inputs: the live market, the acting party, the entry action and a proof.
+-- Public markets admit everyone. Restricted markets require a proof whose
+-- policy matches the market's stored reference and is signed by its operator,
+-- and that policy must admit the party. Exits never call this.
+requireEligible : BinaryMarket -> Party -> MF.EntryAction -> Optional EligibilityProof -> Update ()
+requireEligible market party action proof = case market.access of
+  None -> pure ()
+  Some expected -> case proof of
+    None -> abort "This market is restricted: present an eligibility proof"
+    Some value -> MF.checkEligibility value.policy expected party action value.evidence
 
 -- | Standard reference for protocol-root markets. Factory instances may not
 -- use the reserved `protocol` ID, so the two never collide.
