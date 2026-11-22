@@ -65,28 +65,29 @@ separate market path:
 
 | Contract | Signatories / observers | Purpose |
 | --- | --- | --- |
-| `ClubRegistry` | operator, vault / — | Allocates club numbers and admitted collateral. `ClubRegistry_CreateClub` (any party) creates the club, the owner's membership and the club's own `OutcomiaMarketFactory`. |
-| `Club` | operator, owner / admins | Name, owner, pending owner, admin list, market-creation policy and stable references. **Implements `EligibilityPolicy`**: it admits current members to place, split and fill, and admits market creation by admins (or any member under the any-member policy). Consumed only by owner/admin/policy changes, never by joining or leaving. |
-| `ClubMember` | operator, member / — | Active membership, **implements `EligibilityEvidence`**. Archived on leave or removal; a rejoin is a new contract. |
-| `ClubInvite` | operator, inviter / invitee | Seven-day invitation: accept (creates the membership), decline, revoke by an admin, clear after expiry. |
-| Club factory | operator, vault / club admins | An `OutcomiaMarketFactory` whose creation policy is `ByPolicy` the club and whose admins the `Club` keeps in sync, so club admins manage club markets. |
+| `ClubRegistry` | operator, vault / — | Allocates club numbers and admitted collateral. `ClubRegistry_CreateClub` (any party) creates the club and its own `OutcomiaMarketFactory`. |
+| `Club` | operator, owner / members, invitees | The whole roster: owner, admins, members and pending seven-day invitations, plus the market-creation policy and stable references. **Implements `EligibilityPolicy`**: listed members may place, split and fill; admins (or every member under the any-member policy) may create markets. |
+| Club factory | operator, vault / club admins | An `OutcomiaMarketFactory` whose creation policy is `ByPolicy` the club and whose admins the club keeps in sync, so club admins manage club markets. |
 
-- **Members-only markets** are created with `Restricted clubPolicyRef`; public
-  club markets with `Public`. Either way the club curates and resolves.
-- **Membership proof** is the member's `ClubMember` contract, presented as
-  evidence. Fills re-check both parties with their current memberships, so a
-  removed member's resting order cannot fill.
-- **Admins** are listed on `Club` (owner always included); promotion, demotion,
-  removal of an admin and ownership transfer update the club factory's admins in
-  the same transaction, using the operator's signature on both contracts.
+- **Why one contract:** Canton shows a wallet only the contracts it is a party
+  to. Keeping the roster on `Club`, observed by members and invitees, lets every
+  member and invitee see their club, its roster and invitations without an
+  operator disclosure service, and lets admins act on members by party. Each
+  roster change consumes the club, so changes within one club are serialized;
+  clubs never contend with each other. Invitees can see the roster before
+  accepting. Limits: 256 members, 64 admins, 64 pending invitations.
+- **Membership** is the current roster, so a removed member fails the next
+  placement, split or fill. Markets restricted to the club (`Restricted
+  clubPolicyRef`) admit members only; public club markets admit anyone.
+- **Admin changes** (promotion, demotion, removing an admin, leaving, ownership
+  transfer) update the club factory's admins in the same transaction, using the
+  operator's signature on both contracts.
 - **Standard extension:** `CreationPolicy` gains `ByPolicy PolicyRef`,
   `EntryAction` gains `CreateMarket`, and `MarketFactory_Create` takes an
   optional creation proof, so any implementation can gate creation on
   credentials (club membership, KYC, token holdings).
-- `ClubRemoval` and `OrderBook_CancelDeparted` (operator cleanup of departed
-  members' orders) remain Phase E.
-
-Every club choice fetches the current `Club`, so revoked rights stop at once.
+- Operator cleanup of departed members' resting orders and member-scoped
+  disclosure of club market data remain Phase E.
 
 ## Visibility matrix
 
