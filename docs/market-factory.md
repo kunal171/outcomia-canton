@@ -1,6 +1,7 @@
 # Market factory standard
 
-Status: **design agreed, implementation in progress** (Phase B of
+Status: **steps 1–2 implemented** (standard package and Outcomia's factory);
+eligibility enforcement and invite lists are next. Phase B of
 [clubs and private markets](clubs-private-markets.md)).
 
 Goal: every market is created through a factory, and the factory contract
@@ -73,9 +74,13 @@ Exits (cancel, merge, withdraw, redeem) never consult eligibility.
 
 ## Delivery
 
-1. Standard package (interfaces, types, validation helpers) with tests.
-2. Outcomia factory: public mode, creation policy, per-factory numbering and
-   atomic bundle creation; existing creation path unchanged.
+1. **Done.** Standard package (interfaces, types, validation helpers), tested
+   with independent toy templates.
+2. **Done.** Outcomia factory: creation policy, admitted assets, per-factory
+   numbering, atomic Open market/reserve/book creation and factory-admin
+   management (close, propose, correct), isolated by scope from protocol-root
+   markets and other factory instances. `Protocol_CreateBinary` is unchanged.
+   Fee quotes still come from the protocol root's taker fee.
 3. Eligibility enforcement on placement, split and matching, plus invite lists.
 4. Clubs (Phase C) as factory instances with membership eligibility.
 
