@@ -1,60 +1,152 @@
 # Clubs and private markets
 
-Status: planned, not implemented. There are no club, invitation, membership,
-private-trading or governance contracts or corresponding working Canton UI flows.
-Existing market creation requires protocol admin authority; it is not yet a
-permissionless user-created market feature.
+Status: **design agreed, not implemented** (Phase A). There are no club,
+invitation, membership, factory or private-trading contracts yet, and no working
+Canton UI flow for them. Market creation still requires protocol admin
+authority through `Protocol_CreateBinary`.
 
-## What exists first
+This design follows the product rules already shipped for Outcomia on Solana
+(see `kunal171/outcomia` `docs/clubs-private-markets.md`), changed only where
+Canton's privacy model requires it. Clubs start with **binary** markets;
+multi-outcome club markets follow checkpoint 6. Everything here applies to the
+contracts in this repository; the shared UI lives in `kunal171/outcomia/app`.
 
-The shared UI connects Loop or Console Wallet. Canton contracts have locally
-tested binary creation/open/close, shared per-asset balances, complete-set
-split/merge, funded orders, cancellation and one-pair atomic matching, funded fee collection and operator fee withdrawal. Resolution proposals, corrections and finalization are locally checked; reward
-redemption and
-multi-outcome markets remain.
-No public Canton market deployment or wallet-to-ledger trading is verified.
+Principle: **authorization lives on the ledger; indexing and UI never grant
+rights.** A private club is not a frontend filter, and CantonGrid can only show
+what a caller is already entitled to see.
 
-The current roadmap places clubs/private markets after resolution/redemption
-and multi-outcome markets, then governance. Clubs can technically start with
-binary markets; multi-outcome support is not an inherent dependency. Safe exits,
-permission checks and a reviewed disclosure model are prerequisites.
+## Decisions
 
-## Required work
+| Topic | Decision |
+| --- | --- |
+| Creating a club | Any enrolled party, through the operator's club factory. The creator becomes the club **owner**. Club roles never grant protocol-admin authority, and protocol admins gain no club authority from their protocol role. |
+| Roles | **Owner** adds/removes admins and transfers ownership (two-step: nominate, then the nominee accepts). **Admins** manage invitations, members and club markets. Any member may leave; the owner must transfer ownership first. |
+| Joining | An admin **invites** a party; the party joins only by **accepting**. Invitations expire after **7 days**; admins can revoke earlier and the invitee can decline. |
+| Creating club markets | Per-club policy: **admins only** (default) or **any member**. |
+| Who trades | Per market: **members-only** or **public** (anyone eligible trades; the club curates and resolves). |
+| Removal | A removed member cannot place, split or have resting orders fill. Their resting orders are cancelled by the operator service (funds return to the owner), and matching rejects them regardless. |
+| Exits | Cancel, withdraw, merge and redeem never require membership. Removal never confiscates or strands a position. |
+| Resolution | Any **current club admin** proposes or corrects under the existing windows, review delay and correction deadline. No fallback resolver for club markets. Finalization stays as today (see issue #18). |
+| Fees | Traders pay the normal taker fee. A protocol-wide **club share** of it accrues to the club; only the owner withdraws it. Not part of the first club release. |
+| License | Apache-2.0 (PR #23), before the factory is presented as reusable. |
 
-- A permanent club identity, club admins and separately scoped creator roles.
-  Club roles must not silently grant global protocol-admin authority.
-- Wallet-party invitations and active/revoked memberships, checked by contracts.
-  A remembered wallet or hidden frontend route does not grant permission.
-- Explicit visibility and trading rules for each restricted market.
-- Membership checks on new orders and new exposure. Define removal behavior for
-  resting orders: they must not keep trading merely because the frontend hides
-  them. Revocation and a concurrent fill need ledger-level ordering checks.
-- Exit rights independent of active membership: cancellation, withdrawal,
-  valid complete-set merge and eventual redemption. Removal must not confiscate
-  or strand an existing position. Market resolution remains available.
-- Privacy tests for onboarding, order placement, matching, member removal and
-  exit. Include a former member who already knows old contract IDs.
-- Discovery, invitations and club administration in the original shared UI.
-  Leaderboards/history must use authorized data rather than a global exposure
-  of private member activity.
+### What differs from Solana, and why
 
-## Current disclosure constraints
+- **Departed-member orders.** On Solana anyone can cancel them because every
+  account is public. On Canton a stranger cannot see a member's order, so the
+  operator service cancels them, and matching independently rejects any order
+  whose membership is no longer active.
+- **Membership proof.** Solana checks a PDA that exists only while the wallet
+  is a member. Daml 3 has no contract keys, so a party proves membership by
+  presenting its active `ClubMembership` contract; matching re-fetches it, and
+  an archived membership fails the transaction.
+- **Privacy is real but bounded.** Canton restricts who receives contracts, but
+  the operator and vault host and process club contracts, explicit disclosure
+  hands contracts to the parties a service chooses, and a removed member cannot
+  be made to forget data already received.
 
-Canton can restrict contract disclosure, but it does not make an arbitrary
-application private automatically. Authorized hosts and the trusted custody
-operators still have access to the contracts they process. Revoking membership
-cannot erase information a member has already received.
+## Identity
 
-The current matching choice fetches the full bounded order index and its order
-contracts inside a transaction visible to the matched traders. The account
-registry also contains a shared enrollment list. Those designs must be reviewed
-before using them for private clubs; a `private` flag is insufficient.
+- **Clubs:** `ClubId = { operator, protocolName, clubNumber }`. A
+  `ClubRegistry` (operator-signed) allocates `clubNumber`; club creation is
+  rare, so this one consuming counter is acceptable.
+- **Club markets:** keep the market identity `MarketKey { operator,
+  protocolName, marketId }` and add an upgrade-safe trailing
+  `scope : Optional ClubId` (`None` means a public market). Club market numbers
+  are allocated per club by that club's market factory, so clubs never share a
+  write lock with each other or with public creation (issue #21).
+- **Never** use a `ContractId` as an external identity: markets, clubs and
+  memberships are archived and recreated by consuming choices.
 
-Owner cancellation currently needs the current book. A removed member must be
-able to exit without receiving unrelated new private order data. Design the exit
-authorization/disclosure path before promising both privacy and unrestricted
-exits. The [settlement design](binary-settlement.md) documents the present scope.
+## Contracts (proposed)
 
-Fee pools may remain per market when clubs arrive. Club revenue sharing or fee
-overrides are not part of the first fee implementation and cannot be inferred
-from club-admin status.
+| Contract | Signatories / observers | Purpose |
+| --- | --- | --- |
+| `ClubRegistry` | operator / — | Allocates club numbers; `ClubRegistry_CreateClub` (controller: creator). |
+| `Club` | operator, owner / admins | Name, owner, pending owner, market policy, next club market number. Consumed only by policy, ownership and market-creation choices, never by membership changes. |
+| `ClubAdmin` | operator, admin / owner | One per admin. Separate from membership so a role change never archives the membership (and so never kills the admin's orders). |
+| `ClubInvitation` | operator, inviter / invitee | Expiry, accept (creates membership), decline, revoke, expire. |
+| `ClubMembership` | operator, member / owner | Active membership. Archived on leave or removal. A rejoin is a new contract. |
+| `ClubRemoval` | operator / member | Tombstone created on removal, naming the archived membership. Authorizes the operator to cancel that member's orders. |
+| `ClubMarketFactory` | operator, owner / admins | Club-scoped creation under the club policy; creates `BinaryMarket` with `scope = Some clubId`. |
+
+Every club choice also fetches the current `Club` to check the caller's role or
+the policy, so revoked rights stop working immediately.
+
+## Visibility matrix
+
+| Data | Who receives it |
+| --- | --- |
+| Club name and policy | Owner, admins; members through operator-provided disclosure. No public listing unless the club opts in later. |
+| Members and invitations | The member or invitee, the owner, and admins through disclosure. No cross-club enumeration. |
+| Club market terms and book | Current members (members-only) or eligible traders (public), through explicit disclosure by the operator service. |
+| Orders and positions | Owner, vault and operator, as today. `OrderReference` carries no owner, so book disclosure reveals prices and sizes, not who placed them. |
+| Factory → market lineage | Only callers who can see the creating exercise and the market (CantonGrid M2/M3 rules). |
+| Exit after removal | The member's own orders, positions and balances. The operator cancels resting orders, so a departed member needs no new book data. |
+
+Known existing exposure, not introduced by clubs: `VaultAuthority.accounts`
+lists every enrolled `(party, instrument)` and is disclosed to each enrolling
+party, revealing protocol participation (not club membership). Replacing it
+with per-owner enrollment is tracked separately (issue #21).
+
+## Removal and matching
+
+1. On placement in a members-only club market, `LimitOrder` records the
+   placer's active `ClubMembership` contract ID.
+2. `OrderBook_MatchBest` fetches both orders' recorded memberships. If either
+   was archived (left or removed), the fill fails: removal and a concurrent fill
+   are ordered by the ledger, not by an off-ledger cache.
+3. Removal archives the membership and creates a `ClubRemoval`. A new
+   `OrderBook_CancelDeparted` choice (controller: operator) cancels an order
+   whose recorded membership is named in a `ClubRemoval`, releasing its backing
+   to the owner exactly like owner cancellation.
+4. A rejoined member gets a new membership; their old orders stay unfillable
+   and are cancelled the same way.
+5. Owner cancellation, withdrawal, merge and redemption never check membership.
+
+Splitting collateral into a complete set is an entry action and requires an
+active membership in members-only markets.
+
+## Market creation (Phase B factory)
+
+`Protocol_CreateBinary` consumes the single `Protocol` contract for every
+market, which serialises all creation. Phase B keeps it unchanged for public
+markets (existing tests must pass untouched) and adds `ClubMarketFactory`.
+The club factory checks the creator against the live `Club` policy, uses the
+operator's authority from its own signature, and never touches `Protocol`'s
+admin list. Club markets record the creator as `resolver` for history only;
+resolution checks current club adminship.
+
+## Delivery phases
+
+| Phase | Contracts | Gate |
+| --- | --- | --- |
+| A — Define | This document | Reviewed |
+| B — Factory | `MarketKey.scope`, `ClubMarketFactory` skeleton; public creation unchanged | Existing binary tests unchanged; upgrade-compatibility check |
+| C — Clubs | `ClubRegistry`, `Club`, `ClubAdmin`, `ClubInvitation`, `ClubMembership`, club market creation | Club lifecycle works without trading; negative authorization tests |
+| D — Lineage | Factory exercise → market evidence; LocalNet scripts | CantonGrid M2 verified-tree and M3 declared-link acceptance |
+| E — Trading | Membership on orders, matching checks, `ClubRemoval`, `OrderBook_CancelDeparted`, club resolution | Removal/fill race, exit and multi-party disclosure tests |
+| F — Harden | Club fee share, deployment, multi-outcome clubs | Controlled-network acceptance |
+
+## Acceptance tests (minimum)
+
+- Existing admin-controlled binary creation passes unchanged after Phase B.
+- An accepted invitation creates an active membership; a non-member cannot
+  create, split, place or fill in a members-only market.
+- Two clubs keep separate markets, policies, orders and totals.
+- Losing a role stops new market creation without touching protocol-admin rights.
+- A removed member holding stale contract IDs cannot place or fill, and can
+  cancel, withdraw, merge and redeem.
+- A removal racing a fill is resolved on the ledger, with rollback.
+- Multi-party LocalNet tests confirm the actual disclosure graph before any
+  claim of club privacy.
+
+## Open questions
+
+- Does the club owner need to see every membership (observer), or only through
+  disclosure? Observer status is simpler but ties membership contracts to owner
+  changes.
+- Club discovery for public club markets: an opt-in, operator-published listing,
+  or invite links only?
+- Should club markets reuse the shared per-market `OrderBook` disclosure, or
+  move to member-scoped book views before Phase E?
