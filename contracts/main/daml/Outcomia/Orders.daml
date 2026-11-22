@@ -145,9 +145,11 @@ template OrderRegistry
            pool.vault == vault && pool.creator == creator)
         checkCreator protocol operator protocolName creator
         current <- fetch market
+        assertMsg "Factory markets already include their reserve and book" (current.factory == None)
         assertMsg "Market does not match the registered reserve"
           (current.operator == operator && current.protocolName == protocolName &&
-           current.marketId == pool.key.marketId && current.creator == creator &&
+           current.marketId == pool.key.marketId && current.factory == pool.key.scope &&
+           current.creator == creator &&
            current.createdAt == pool.createdAt && current.terms == pool.terms)
         now <- getTime
         assertMsg "Book requires an unexpired Draft or Open market"
@@ -587,7 +589,8 @@ checkTrading book market = do
   current <- fetch market
   assertMsg "Market identity or terms do not match order book"
     (current.operator == book.key.operator && current.protocolName == book.key.protocolName &&
-     current.marketId == book.key.marketId && current.creator == book.creator &&
+     current.marketId == book.key.marketId && current.factory == book.key.scope &&
+     current.creator == book.creator &&
      current.createdAt == book.marketCreatedAt && current.terms == book.terms)
   now <- getTime
   assertMsg "Orders require an Open market before cutoff" (current.status == Open && now < book.terms.closeAt)

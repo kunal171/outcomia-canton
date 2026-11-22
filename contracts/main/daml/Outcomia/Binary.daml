@@ -16,6 +16,7 @@ import DA.Time (addRelTime, seconds)
 import Outcomia.Resolution qualified as Resolution
 import Outcomia.ProtocolRoles qualified as Roles
 import Outcomia.Types
+import Canton.MarketFactory (FactoryRef)
 import Outcomia.Validation
 
 -- | One operator-approved protocol lineage. Discovery/services must pin its
@@ -36,7 +37,7 @@ template Protocol
       takerFeeBps >= 0 && takerFeeBps <= 1000 && feeRevision >= 0
 
     interface instance Roles.ProtocolRoles for Protocol where
-      view = Roles.ProtocolRolesView operator protocolName admins
+      view = Roles.ProtocolRolesView operator protocolName admins None
 
     -- | Inputs: replacement admin list, including the operator.
     -- Rejects: non-operator authorization, duplicates, empty/oversized lists or
@@ -105,6 +106,7 @@ template Protocol
           status = Draft
           openedAt = None
           closeReason = None
+          factory = None
         pure (next, market)
 
 -- | Immutable terms plus explicit lifecycle state. Both operator and creator
@@ -122,6 +124,8 @@ template BinaryMarket
     status : MarketStatus
     closeReason : Optional Text
     openedAt : Optional Time
+    -- | Issuing factory instance, or `None` for protocol-root markets.
+    factory : Optional FactoryRef
   where
     signatory operator, creator
     observer Resolution.fallbackObservers terms
@@ -143,6 +147,7 @@ template BinaryMarket
       with protocol : ContractId Protocol
       controller creator
       do
+        assertMsg "Factory markets are managed through their factory" (factory == None)
         checkCreator protocol operator protocolName creator
         assertMsg "Only a draft can open" (status == Draft)
         now <- getTime
@@ -159,6 +164,7 @@ template BinaryMarket
         reason : Text
       controller creator
       do
+        assertMsg "Factory markets are managed through their factory" (factory == None)
         checkCreator protocol operator protocolName creator
         assertMsg "Only an open market can close" (status == Open)
         assertMsg "Closure reason must contain 1 to 500 characters" (boundedText 500 reason)
@@ -176,6 +182,7 @@ template BinaryMarket
         evidence : Resolution.ResolutionEvidence
       controller creator
       do
+        assertMsg "Factory markets are managed through their factory" (factory == None)
         checkCreator protocol operator protocolName creator
         proposeResolution this creator outcome evidence
 
@@ -192,6 +199,7 @@ template BinaryMarket
         evidence : Resolution.ResolutionEvidence
       controller resolver
       do
+        assertMsg "Factory markets are managed through their factory" (factory == None)
         current <- fetch protocol
         assertMsg "Fallback protocol does not belong to this market"
           (current.operator == operator && current.protocolName == protocolName)
@@ -243,7 +251,7 @@ proposeResolution market resolver outcome evidence = do
   let problems = Resolution.evidenceErrors evidence
   assertMsg (T.intercalate "; " problems) (null problems)
   create Resolution.ResolutionProposal with
-    key = MarketKey market.operator market.protocolName market.marketId
+    key = MarketKey market.operator market.protocolName market.marketId market.factory
     creator = market.creator; terms = market.terms; marketCreatedAt = market.createdAt
     openedAt = opened; proposedBy = resolver; outcome; evidence; proposedAt = now
     finalizableAt = addRelTime now (seconds market.terms.resolutionDelaySeconds)

@@ -7,6 +7,8 @@ source: daml
 dependencies:
   - daml-prim
   - daml-stdlib
+data-dependencies:
+  - ../factory/.daml/dist/canton-market-factory-0.1.0.dar
 build-options:
   - --target=2.1
   - --ghc-option=-Werror

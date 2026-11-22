@@ -2,6 +2,8 @@
 -- introduced separately; a lifecycle contract alone never proves collateral.
 module Outcomia.Types where
 
+import Canton.MarketFactory (FactoryRef)
+
 -- | YES and NO are outcomes, not votes. The eventual winning contract pays one
 -- unit of the configured collateral instrument, subject to final resolution.
 data Outcome = Yes | No
@@ -29,6 +31,9 @@ data MarketKey = MarketKey with
     operator : Party
     protocolName : Text
     marketId : Int
+    -- | Issuing factory instance; `None` for markets created through the
+    -- protocol root. Market numbers are unique only within one scope.
+    scope : Optional FactoryRef
   deriving (Eq, Ord, Show)
 
 -- | These criteria are authoritative structured market terms. The attachment

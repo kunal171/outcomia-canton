@@ -4,10 +4,15 @@
 -- callers also verify the actual operator signature and deployment namespace.
 module Outcomia.ProtocolRoles where
 
+import Canton.MarketFactory (FactoryRef)
+
 data ProtocolRolesView = ProtocolRolesView with
     operator : Party
     protocolName : Text
     admins : [Party]
+    -- | Which markets these admins govern: `None` for markets created through
+    -- the protocol root, `Some ref` for markets issued by that factory instance.
+    scope : Optional FactoryRef
   deriving (Eq, Show)
 
 interface ProtocolRoles where
@@ -18,12 +23,15 @@ interface ProtocolRoles where
 -- membership only; resolution choices independently enforce resolver/time roles.
 -- As with the existing protocol checks, services pin the intended lineage and
 -- trust the operator not to sign another conflicting root for that namespace.
-checkAdmin : ContractId ProtocolRoles -> Party -> Text -> Party -> Update ()
-checkAdmin roles expectedOperator expectedName actor = do
+checkAdmin : ContractId ProtocolRoles -> Party -> Text -> Optional FactoryRef -> Party -> Update ()
+checkAdmin roles expectedOperator expectedName expectedScope actor = do
   contract <- fetch roles
   let policy = view contract
   assertMsg "Role policy is not signed by the expected operator"
     (expectedOperator `elem` signatory contract)
   assertMsg "Role policy belongs to another protocol"
     (policy.operator == expectedOperator && policy.protocolName == expectedName)
+  -- Admins of one factory instance (or of the protocol root) never govern
+  -- markets issued elsewhere in the same deployment.
+  assertMsg "Role policy governs another market scope" (policy.scope == expectedScope)
   assertMsg "Resolver must be a current protocol admin" (actor `elem` policy.admins)

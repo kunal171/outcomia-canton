@@ -29,7 +29,7 @@ template PretendRoles
     signatory signerParty
     observer advertisedOperator, admins
     interface instance Roles.ProtocolRoles for PretendRoles where
-      view = Roles.ProtocolRolesView advertisedOperator "outcomia" admins
+      view = Roles.ProtocolRolesView advertisedOperator "outcomia" admins None
 
 correctedEvidence : ResolutionEvidence
 correctedEvidence = R.validEvidence with

@@ -55,7 +55,7 @@ template ResolutionProposal
         replacementEvidence : ResolutionEvidence
       controller resolver
       do
-        Roles.checkAdmin roles key.operator key.protocolName resolver
+        Roles.checkAdmin roles key.operator key.protocolName key.scope resolver
         now <- getTime
         assertMsg "Correction time cannot precede the current proposal" (now >= proposedAt)
         assertMsg "Corrections stop at the current finalization time" (now < finalizableAt)
