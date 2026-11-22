@@ -48,7 +48,7 @@ setupWithPrecision mode lot tick precision = script do
 
 split : Fixture -> ContractId MarketReserve -> ContractId AssetBalance -> Int -> Script SplitResult
 split f reserve balance quantity = submit (actAs f.custody.asset.alice <> readAs [f.custody.asset.operator, f.custody.asset.issuer]) do
-  exerciseCmd reserve MarketReserve_Split with owner = f.custody.asset.alice; market = f.market; balance; quantity; extraArgs = C.registryContext
+  exerciseCmd reserve MarketReserve_Split with owner = f.custody.asset.alice; market = f.market; balance; quantity; extraArgs = C.registryContext; eligibility = None
 
 merge : Fixture -> ContractId MarketReserve -> ContractId AssetBalance -> [ContractId PositionLot] -> Int -> Script MergeResult
 merge f reserve balance positions quantity = submit (actAs f.custody.asset.alice <> readAs [f.custody.asset.operator, f.custody.asset.issuer]) do
@@ -112,7 +112,7 @@ testSplitAuthorizationAndInternalPartition = script do
   let a = f.custody.asset
   forA_ [a.bob, a.operator, f.custody.vault] (\caller -> do
     submitMustFail (actAs caller <> readAs [a.alice, a.operator, a.issuer, f.custody.vault]) do
-      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 1; extraArgs = C.registryContext)
+      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 1; extraArgs = C.registryContext; eligibility = None)
   -- A trader cannot use the internal partition choice to bypass the reserve's
   -- supply update; readAs vault is deliberately insufficient authority.
   submitMustFail (actAs a.alice <> readAs [f.custody.vault, a.issuer]) do
@@ -137,7 +137,7 @@ testQuantityAndFundsChecks = script do
   f <- setup Good 2
   forA_ [0, -2, 1, 3, 6] (\quantity -> do
     submitMustFail (actAs f.custody.asset.alice <> readAs [f.custody.asset.operator, f.custody.asset.issuer]) do
-      exerciseCmd f.reserve MarketReserve_Split with owner = f.custody.asset.alice; market = f.market; balance = f.balance; quantity; extraArgs = C.registryContext)
+      exerciseCmd f.reserve MarketReserve_Split with owner = f.custody.asset.alice; market = f.market; balance = f.balance; quantity; extraArgs = C.registryContext; eligibility = None)
   placed <- split f f.reserve f.balance 2
   forA_ [0, -2, 1, 4] (\quantity -> do
     submitMustFail (actAs f.custody.asset.alice <> readAs [f.custody.asset.operator, f.custody.asset.issuer]) do
@@ -151,7 +151,7 @@ testCutoffClosureAndRevocationExit = script do
   let a = f.custody.asset
   closed <- submit a.operator do exerciseCmd f.market Binary_Close with protocol = f.protocol; reason = "Stopped"
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd placed.reserve MarketReserve_Split with owner = a.alice; market = closed; balance = placed.balance; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd placed.reserve MarketReserve_Split with owner = a.alice; market = closed; balance = placed.balance; quantity = 1; extraArgs = C.registryContext; eligibility = None
   pool <- loadReserve f placed.reserve
   setTime pool.terms.closeAt
   submit a.operator do archiveCmd a.admission
@@ -172,13 +172,13 @@ testExactCutoffAndWrongMarket = script do
   altered <- submit a.operator do createCmd (original with terms = (original.terms with question = "Different question"))
   activeDraft <- submit a.operator do createCmd (original with status = Draft; openedAt = None)
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = altered; balance = f.balance; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = altered; balance = f.balance; quantity = 1; extraArgs = C.registryContext; eligibility = None
   forA_ [activeDraft, f.draft] (\market -> do
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market; balance = f.balance; quantity = 1; extraArgs = C.registryContext)
+      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market; balance = f.balance; quantity = 1; extraArgs = C.registryContext; eligibility = None)
   setTime original.terms.closeAt
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 1; extraArgs = C.registryContext; eligibility = None
   assertConserved f f.reserve f.balance 5.0 0
 
 testReplayAndDuplicateLots : Script ()
@@ -187,7 +187,7 @@ testReplayAndDuplicateLots = script do
   placed <- split f f.reserve f.balance 3
   let a = f.custody.asset
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = placed.balance; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = placed.balance; quantity = 1; extraArgs = C.registryContext; eligibility = None
   forA_ [[], [placed.position, placed.position]] (\positions -> do
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
       exerciseCmd placed.reserve MarketReserve_Merge with owner = a.alice; balance = placed.balance; positions; quantity = 1; extraArgs = C.registryContext)
@@ -203,7 +203,7 @@ testRegistryFailureRollsBackSplitAndMerge = script do
   -- Deposit consolidation of 5 succeeds. A split of 3 requests a receiver
   -- holding of 2; this factory underpays it after consuming the inputs.
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 3; extraArgs = C.registryContext
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = f.balance; quantity = 3; extraArgs = C.registryContext; eligibility = None
   assertConserved f f.reserve f.balance 5.0 0
   placed <- split f f.reserve f.balance 2
   -- Merging 1 would create account backing of 4, the other deliberate fault.
@@ -294,11 +294,11 @@ testWrongBalanceBinding = script do
          (original with operator = a.bob), (original with vault = a.bob)] (\value -> do
     cid <- submit [value.vault, value.owner] do createCmd value
     submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer, a.bob]) do
-      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = cid; quantity = 1; extraArgs = C.registryContext)
+      exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = cid; quantity = 1; extraArgs = C.registryContext; eligibility = None)
   otherFactory <- submit a.issuer do createCmd TestRegistry with issuer = a.issuer; mode = Good
   cid <- submit [f.custody.vault, a.alice] do createCmd (original with factory = toInterfaceContractId @T.TransferFactory otherFactory)
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = cid; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd f.reserve MarketReserve_Split with owner = a.alice; market = f.market; balance = cid; quantity = 1; extraArgs = C.registryContext; eligibility = None
   assertConserved f f.reserve f.balance 5.0 0
 
 testSameAssetAcrossMarkets : Script ()
@@ -337,7 +337,7 @@ testTwoTradersShareReserveWithoutSharingFunds = script do
     exerciseCmd bobBalance AssetBalance_Deposit with admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0; extraArgs = C.registryContext
   alice <- split f f.reserve f.balance 3
   bob <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
-    exerciseCmd alice.reserve MarketReserve_Split with owner = a.bob; market = f.market; balance = funded.balance; quantity = 2; extraArgs = C.registryContext
+    exerciseCmd alice.reserve MarketReserve_Split with owner = a.bob; market = f.market; balance = funded.balance; quantity = 2; extraArgs = C.registryContext; eligibility = None
   submitMustFail (actAs a.bob <> readAs [a.operator, a.issuer, a.alice]) do
     exerciseCmd bob.reserve MarketReserve_Merge with owner = a.bob; balance = bob.balance; positions = [alice.position]; quantity = 1; extraArgs = C.registryContext
   bobExit <- submit (actAs a.bob <> readAs [a.operator, a.issuer]) do
@@ -362,7 +362,7 @@ testReserveBackingAndSupplyLimit = script do
     exerciseCmd mismatched MarketReserve_Merge with owner = a.alice; balance = placed.balance; positions = [placed.position]; quantity = 1; extraArgs = C.registryContext
   exhausted <- submit [a.operator, f.custody.vault] do createCmd (pool with completeSets = 9223372036854775807)
   submitMustFail (actAs a.alice <> readAs [a.operator, a.issuer]) do
-    exerciseCmd exhausted MarketReserve_Split with owner = a.alice; market = f.market; balance = placed.balance; quantity = 1; extraArgs = C.registryContext
+    exerciseCmd exhausted MarketReserve_Split with owner = a.alice; market = f.market; balance = placed.balance; quantity = 1; extraArgs = C.registryContext; eligibility = None
   -- Even with privileged malformed reserve fixtures, all genuine backing and
   -- positions remain unchanged after each rejected operation.
   assertConserved f placed.reserve placed.balance 2.0 3
