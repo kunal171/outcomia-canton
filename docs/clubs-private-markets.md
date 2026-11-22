@@ -109,6 +109,11 @@ active membership in members-only markets.
 
 ## Market creation (Phase B factory)
 
+The general factory standard (interfaces, numbering, eligibility and the
+reference implementation) is specified in [market factory](market-factory.md);
+the club factory is one instance of it.
+
+
 `Protocol_CreateBinary` consumes the single `Protocol` contract for every
 market, which serialises all creation. Phase B keeps it unchanged for public
 markets (existing tests must pass untouched) and adds `ClubMarketFactory`.
