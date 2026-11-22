@@ -67,11 +67,21 @@ data CreationPolicy
   = AdminsOnly [Party]
   | Allowlist [Party]
   | AnyParty
+  -- | Creators must be admitted by this eligibility policy for 'CreateMarket',
+  -- presenting a 'CreationProof' (for example club membership or KYC).
+  | ByPolicy PolicyRef
   deriving (Eq, Show)
 
 -- | Actions that add exposure. Exits (cancel, merge, withdraw, redeem) never
 -- consult eligibility.
-data EntryAction = Place | Split | Fill
+data EntryAction = Place | Split | Fill | CreateMarket
+  deriving (Eq, Show)
+
+-- | The current policy contract and evidence a creator presents when the
+-- factory's creation policy is 'ByPolicy'.
+data CreationProof = CreationProof with
+    policy : ContractId EligibilityPolicy
+    evidence : [ContractId EligibilityEvidence]
   deriving (Eq, Show)
 
 data MarketStatus = Draft | Open | Closed | ResolutionPending | Resolved
@@ -138,15 +148,17 @@ interface MarketFactory where
   viewtype FactoryView
   -- | Implementation: check the creation policy and terms, create the market
   -- (and any companion contracts) and the next factory revision atomically.
-  create' : Party -> MarketTerms -> Access -> Update MarketCreated
+  create' : Party -> MarketTerms -> Access -> Optional CreationProof -> Update MarketCreated
 
   choice MarketFactory_Create : MarketCreated
     with
       creator : Party
       terms : MarketTerms
       access : Access
+      -- | Required when the creation policy is 'ByPolicy'; ignored otherwise.
+      proof : Optional CreationProof
     controller creator
-    do create' this creator terms access
+    do create' this creator terms access proof
 
 -- | Inputs: creation policy and prospective creator.
 -- Result: whether the policy admits that creator.
@@ -154,6 +166,18 @@ mayCreate : CreationPolicy -> Party -> Bool
 mayCreate (AdminsOnly parties) creator = creator `elem` parties
 mayCreate (Allowlist parties) creator = creator `elem` parties
 mayCreate AnyParty _ = True
+-- A policy-based rule needs a ledger check; see 'checkCreation'.
+mayCreate (ByPolicy _) _ = False
+
+-- | Inputs: the factory's creation policy, the creator and an optional proof.
+-- Errors: a creator outside a static list, or a missing, foreign or denying
+-- policy for 'ByPolicy'. Result: admission to create a market.
+checkCreation : CreationPolicy -> Party -> Optional CreationProof -> Update ()
+checkCreation policy creator proof = case policy of
+  ByPolicy expected -> case proof of
+    None -> abort "This factory requires a creation proof"
+    Some value -> checkEligibility value.policy expected creator CreateMarket value.evidence
+  _ -> assertMsg "Creator is not allowed by this factory's creation policy" (mayCreate policy creator)
 
 -- | Inputs: limit and text. Result: True for text that is not blank (after
 -- treating tabs and line breaks as spaces) and at most `limit` characters.

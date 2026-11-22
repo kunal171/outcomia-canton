@@ -57,7 +57,7 @@ setup = script do
   Some policy <- queryContractId a.operator list
   created <- submit (actAs base.admin <> readAs (everyone base)) do
     exerciseCmd (toInterfaceContractId @MF.MarketFactory factory) MF.MarketFactory_Create with
-      creator = base.admin; terms = FT.standardTerms a; access = MF.Restricted policy.ref
+      creator = base.admin; terms = FT.standardTerms a; access = MF.Restricted policy.ref; proof = None
   [(reserve, _)] <- query @MarketReserve c.vault
   [(book, _)] <- query @OrderBook c.vault
   pure Fixture with

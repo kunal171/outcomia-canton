@@ -74,11 +74,11 @@ setup = setupWithPolicy "public" (\admin -> MF.AdminsOnly [admin])
 
 createAs : Fixture -> ContractId MF.MarketFactory -> Party -> MF.MarketTerms -> Script MF.MarketCreated
 createAs f factory creator terms = submit (actAs creator <> readAs [(asset f).operator, f.custody.vault]) do
-  exerciseCmd factory MF.MarketFactory_Create with creator; terms; access = MF.Public
+  exerciseCmd factory MF.MarketFactory_Create with creator; terms; access = MF.Public; proof = None
 
 createFailsAs : Fixture -> ContractId MF.MarketFactory -> Party -> MF.MarketTerms -> MF.Access -> Script ()
 createFailsAs f factory creator terms access = submitMustFail (actAs creator <> readAs [(asset f).operator, f.custody.vault]) do
-  exerciseCmd factory MF.MarketFactory_Create with creator; terms; access
+  exerciseCmd factory MF.MarketFactory_Create with creator; terms; access; proof = None
 
 iface : ContractId OutcomiaMarketFactory -> ContractId MF.MarketFactory
 iface = toInterfaceContractId
