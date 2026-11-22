@@ -1,0 +1,269 @@
+-- | Outcomia's reference market factory: atomic market/reserve/book creation,
+-- creation policies, admitted collateral, per-factory numbering and scope
+-- isolation from protocol-root markets and from other factory instances.
+module Outcomia.FactoryTest where
+
+import Canton.MarketFactory qualified as MF
+import DA.Assert ((===))
+import DA.List (sort)
+import DA.Time (addRelTime, hours)
+import Daml.Script
+import Outcomia.AssetTransferTest qualified as A
+import Outcomia.Binary
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Factory
+import Outcomia.Fixtures (termsFor)
+import Outcomia.Orders
+import Outcomia.Fees qualified as Fees
+import Outcomia.Positions
+import Outcomia.ProtocolRoles qualified as Roles
+import Outcomia.Resolution
+import Outcomia.TokenHarness
+import Outcomia.Types
+import Splice.Api.Token.HoldingV2 qualified as H
+
+data Fixture = Fixture with
+    custody : C.Fixture
+    factory : ContractId OutcomiaMarketFactory
+    ref : MF.FactoryRef
+    admin : Party
+    secondAdmin : Party
+    outsider : Party
+  deriving (Eq, Show)
+
+asset : Fixture -> A.Fixture
+asset f = f.custody.asset
+
+-- | Standard terms equivalent to the binary fixture terms.
+standardTerms : A.Fixture -> MF.MarketTerms
+standardTerms a =
+  let t = termsFor a.issuer a.now
+  in MF.MarketTerms with
+    question = t.question
+    outcomes = ["YES", "NO"]
+    outcomeCriteria = [t.rules.yesCriteria, t.rules.noCriteria]
+    invalidCriteria = t.rules.invalidCriteria
+    evidenceRequirements = t.rules.evidenceRequirements
+    rulesUri = t.rules.documentUri
+    rulesHash = t.rules.documentSha256
+    collateral = MF.InstrumentRef with admin = a.instrument.admin; id = a.instrument.id
+    closeAt = t.closeAt
+    earliestResolutionAt = t.earliestResolutionAt
+    resolutionDelaySeconds = t.resolutionDelaySeconds
+    priceTick = t.priceTick
+    quantityLot = t.quantityLot
+
+setupWithPolicy : Text -> (Party -> MF.CreationPolicy) -> Script Fixture
+setupWithPolicy factoryId policyFor = script do
+  custody <- C.setup Good
+  let a = custody.asset
+  admin <- allocateParty ("FactoryAdmin-" <> factoryId)
+  secondAdmin <- allocateParty ("SecondAdmin-" <> factoryId)
+  outsider <- allocateParty ("Outsider-" <> factoryId)
+  let ref = MF.FactoryRef with operator = a.operator; namespace = "outcomia"; factoryId
+  factory <- submit [a.operator, custody.vault] do
+    createCmd OutcomiaMarketFactory with
+      operator = a.operator; vault = custody.vault; protocolName = "outcomia"; ref
+      admins = [admin, secondAdmin]; policy = policyFor admin
+      assets = [FactoryAsset with instrument = a.instrument; admission = a.admission]
+      nextNumber = 1
+  pure Fixture with custody; factory; ref; admin; secondAdmin; outsider
+
+setup : Script Fixture
+setup = setupWithPolicy "public" (\admin -> MF.AdminsOnly [admin])
+
+createAs : Fixture -> ContractId MF.MarketFactory -> Party -> MF.MarketTerms -> Script MF.MarketCreated
+createAs f factory creator terms = submit (actAs creator <> readAs [(asset f).operator, f.custody.vault]) do
+  exerciseCmd factory MF.MarketFactory_Create with creator; terms; access = MF.Public
+
+createFailsAs : Fixture -> ContractId MF.MarketFactory -> Party -> MF.MarketTerms -> MF.Access -> Script ()
+createFailsAs f factory creator terms access = submitMustFail (actAs creator <> readAs [(asset f).operator, f.custody.vault]) do
+  exerciseCmd factory MF.MarketFactory_Create with creator; terms; access
+
+iface : ContractId OutcomiaMarketFactory -> ContractId MF.MarketFactory
+iface = toInterfaceContractId
+
+factoryRoles : ContractId OutcomiaMarketFactory -> ContractId Roles.ProtocolRoles
+factoryRoles = toInterfaceContractId
+
+marketKey : Fixture -> Int -> MarketKey
+marketKey f number = MarketKey with
+  operator = (asset f).operator; protocolName = "outcomia"; marketId = number; scope = Some f.ref
+
+-- One creation produces an Open market plus its reserve and book, numbered
+-- within the factory, and the spent factory revision cannot be reused.
+test_creation_is_atomic_and_numbered_per_factory : Script ()
+test_creation_is_atomic_and_numbered_per_factory = script do
+  f <- setup
+  let a = asset f
+  first <- createAs f (iface f.factory) f.admin (standardTerms a)
+  second <- createAs f first.factory f.admin (standardTerms a)
+  first.ref === MF.MarketRef with factory = f.ref; number = 1
+  second.ref === MF.MarketRef with factory = f.ref; number = 2
+  Some market <- queryContractId a.operator (fromInterfaceContractId @BinaryMarket first.market)
+  market.status === Open
+  market.factory === Some f.ref
+  market.marketId === 1
+  market.creator === f.admin
+  market.terms.fallback === None
+  Some marketView <- queryInterfaceContractId a.operator first.market
+  marketView.ref === first.ref
+  marketView.status === MF.Open
+  reserves <- query @MarketReserve f.custody.vault
+  books <- query @OrderBook f.custody.vault
+  sort [r.key | (_, r) <- reserves] === [marketKey f 1, marketKey f 2]
+  sort [b.key | (_, b) <- books] === [marketKey f 1, marketKey f 2]
+  assertMsg "Empty reserves and books" (all (\(_, r) -> r.completeSets == 0) reserves && all (\(_, b) -> null b.orders && b.nextOrderId == 1) books)
+  createFailsAs f first.factory f.admin (standardTerms a) MF.Public
+
+test_creation_policies : Script ()
+test_creation_policies = script do
+  admins <- setup
+  let a = asset admins
+  -- Admins only: another factory admin is not a listed creator, an outsider neither.
+  createFailsAs admins (iface admins.factory) admins.outsider (standardTerms a) MF.Public
+  createFailsAs admins (iface admins.factory) admins.secondAdmin (standardTerms a) MF.Public
+  -- Policy lists must name at least one party.
+  submitMustFail [a.operator, admins.custody.vault] do
+    createCmd OutcomiaMarketFactory with
+      operator = a.operator; vault = admins.custody.vault; protocolName = "outcomia"
+      ref = (admins.ref with factoryId = "empty"); admins = [admins.admin]; policy = MF.Allowlist []
+      assets = []; nextNumber = 1
+  -- Any party: an outsider creates through an open instance in the same deployment.
+  open <- submit [a.operator, admins.custody.vault] do
+    createCmd OutcomiaMarketFactory with
+      operator = a.operator; vault = admins.custody.vault; protocolName = "outcomia"
+      ref = (admins.ref with factoryId = "open"); admins = [admins.admin]; policy = MF.AnyParty
+      assets = [FactoryAsset with instrument = a.instrument; admission = a.admission]
+      nextNumber = 1
+  created <- createAs admins (iface open) admins.outsider (standardTerms a)
+  created.ref === MF.MarketRef with factory = (admins.ref with factoryId = "open"); number = 1
+
+test_rejects_unadmitted_collateral_bad_outcomes_and_restricted_access : Script ()
+test_rejects_unadmitted_collateral_bad_outcomes_and_restricted_access = script do
+  f <- setup
+  let a = asset f
+      terms = standardTerms a
+      policyRef = MF.PolicyRef with operator = a.operator; namespace = "outcomia"; policyId = "invite"
+  createFailsAs f (iface f.factory) f.admin (terms with collateral = MF.InstrumentRef with admin = a.alice; id = "OTHER") MF.Public
+  createFailsAs f (iface f.factory) f.admin (terms with outcomes = ["NO", "YES"]) MF.Public
+  createFailsAs f (iface f.factory) f.admin (terms with outcomes = ["Up", "Down"]) MF.Public
+  createFailsAs f (iface f.factory) f.admin terms (MF.Restricted policyRef)
+  createFailsAs f (iface f.factory) f.admin (terms with closeAt = a.now) MF.Public
+  -- A 7-decimal tick cannot settle in the 6-decimal test asset.
+  createFailsAs f (iface f.factory) f.admin (terms with priceTick = 0.0000001) MF.Public
+  -- Nothing was created by the failures.
+  markets <- query @BinaryMarket a.operator
+  [m.factory | (_, m) <- markets, m.factory /= None] === []
+
+test_operator_manages_admins_policy_and_assets : Script ()
+test_operator_manages_admins_policy_and_assets = script do
+  f <- setup
+  let a = asset f
+  submitMustFail f.admin do
+    exerciseCmd f.factory OutcomiaFactory_SetAdmins with replacementAdmins = [f.admin]
+  factory <- submit a.operator do
+    exerciseCmd f.factory OutcomiaFactory_SetPolicy with replacementPolicy = MF.Allowlist [f.outsider]
+  created <- createAs f (iface factory) f.outsider (standardTerms a)
+  created.ref.number === 1
+  noAssets <- submit a.operator do
+    exerciseCmd (fromInterfaceContractId @OutcomiaMarketFactory created.factory) OutcomiaFactory_SetAssets with replacementAssets = []
+  createFailsAs f (iface noAssets) f.outsider (standardTerms a) MF.Public
+  submitMustFail a.operator do
+    exerciseCmd noAssets OutcomiaFactory_SetAdmins with replacementAdmins = []
+
+-- Factory admins manage factory markets; protocol admins and admins of another
+-- factory instance cannot, and protocol-root choices refuse factory markets.
+test_scope_isolation_for_management : Script ()
+test_scope_isolation_for_management = script do
+  f <- setup
+  let a = asset f
+  created <- createAs f (iface f.factory) f.admin (standardTerms a)
+  let market = fromInterfaceContractId @BinaryMarket created.market
+      current = fromInterfaceContractId @OutcomiaMarketFactory created.factory
+  -- The protocol root's admins (the operator here) govern another scope.
+  submitMustFail (actAs a.operator) do
+    exerciseCmd market Binary_FactoryClose with actor = a.operator; roles = toInterfaceContractId @Roles.ProtocolRoles a.protocol; reason = "No"
+  -- Even when the creator is also a protocol-root admin, protocol-root choices
+  -- refuse factory markets.
+  rootWithCreator <- submit a.operator do
+    createCmd Protocol with
+      operator = a.operator; protocolName = "outcomia"; admins = [a.operator, f.admin]
+      nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  submitMustFail (actAs f.admin <> readAs a.operator) do
+    exerciseCmd market Binary_Close with protocol = rootWithCreator; reason = "No"
+  -- An admin of another factory instance cannot use that instance's roles here.
+  other <- submit [a.operator, f.custody.vault] do
+    createCmd OutcomiaMarketFactory with
+      operator = a.operator; vault = f.custody.vault; protocolName = "outcomia"
+      ref = (f.ref with factoryId = "other"); admins = [f.outsider]; policy = MF.AnyParty
+      assets = []; nextNumber = 1
+  submitMustFail (actAs f.outsider <> readAs a.operator) do
+    exerciseCmd market Binary_FactoryClose with actor = f.outsider; roles = factoryRoles other; reason = "No"
+  -- The reserved protocol ID cannot be claimed by a factory instance.
+  submitMustFail [a.operator, f.custody.vault] do
+    createCmd OutcomiaMarketFactory with
+      operator = a.operator; vault = f.custody.vault; protocolName = "outcomia"
+      ref = (f.ref with factoryId = "protocol"); admins = [f.admin]; policy = MF.AnyParty
+      assets = []; nextNumber = 1
+  -- Any current admin of the issuing factory may close, not only the creator.
+  closed <- submit (actAs f.secondAdmin <> readAs a.operator) do
+    exerciseCmd market Binary_FactoryClose with actor = f.secondAdmin; roles = factoryRoles current; reason = "Paused by admin"
+  Some value <- queryContractId a.operator closed
+  value.status === Closed
+
+-- Any current factory admin proposes and corrects; a removed admin cannot.
+test_factory_resolution_by_current_admins : Script ()
+test_factory_resolution_by_current_admins = script do
+  f <- setup
+  let a = asset f
+  created <- createAs f (iface f.factory) f.admin (standardTerms a)
+  let market = fromInterfaceContractId @BinaryMarket created.market
+      current = fromInterfaceContractId @OutcomiaMarketFactory created.factory
+      evidence = ResolutionEvidence with
+        summary = "Launch logs"; documentUri = "ar://evidence"
+        documentSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  submitMustFail (actAs f.secondAdmin <> readAs a.operator) do
+    exerciseCmd market Binary_FactoryPropose with actor = f.secondAdmin; roles = factoryRoles current; outcome = YesWins; evidence
+  setTime (addRelTime a.now (hours 49))
+  proposal <- submit (actAs f.secondAdmin <> readAs a.operator) do
+    exerciseCmd market Binary_FactoryPropose with actor = f.secondAdmin; roles = factoryRoles current; outcome = YesWins; evidence
+  reduced <- submit a.operator do
+    exerciseCmd current OutcomiaFactory_SetAdmins with replacementAdmins = [f.admin]
+  submitMustFail (actAs f.secondAdmin <> readAs [a.operator, f.admin]) do
+    exerciseCmd proposal ResolutionProposal_Correct with
+      resolver = f.secondAdmin; roles = factoryRoles reduced; replacementOutcome = NoWins; replacementEvidence = evidence
+  corrected <- submit (actAs f.admin <> readAs [a.operator, f.secondAdmin]) do
+    exerciseCmd proposal ResolutionProposal_Correct with
+      resolver = f.admin; roles = factoryRoles reduced; replacementOutcome = NoWins; replacementEvidence = evidence
+  Some value <- queryContractId a.operator corrected
+  value.outcome === NoWins
+  value.key === marketKey f 1
+  -- Protocol-root roles cannot correct a factory market's proposal.
+  submitMustFail (actAs a.operator <> readAs [f.admin, f.secondAdmin]) do
+    exerciseCmd corrected ResolutionProposal_Correct with
+      resolver = a.operator; roles = toInterfaceContractId @Roles.ProtocolRoles a.protocol
+      replacementOutcome = YesWins; replacementEvidence = evidence
+
+-- The bundle trades with the existing custody and order choices.
+test_factory_market_splits_and_places_orders : Script ()
+test_factory_market_splits_and_places_orders = script do
+  f <- setup
+  let a = asset f
+  funded <- C.deposit f.custody f.custody.balance 5.0 [toInterfaceContractId @H.Holding a.input]
+  created <- createAs f (iface f.factory) f.admin (standardTerms a)
+  let market = fromInterfaceContractId @BinaryMarket created.market
+  [(reserve, _)] <- query @MarketReserve f.custody.vault
+  [(book, _)] <- query @OrderBook f.custody.vault
+  split <- submit (actAs a.alice <> readAs [a.operator, a.issuer, f.custody.vault]) do
+    exerciseCmd reserve MarketReserve_Split with
+      owner = a.alice; market; balance = funded.balance; quantity = 2; extraArgs = C.registryContext
+  Some pool <- queryContractId f.custody.vault split.reserve
+  pool.completeSets === 2
+  placed <- submit (actAs a.alice <> readAs [a.operator, a.issuer, f.custody.vault]) do
+    exerciseCmd book OrderBook_PlaceSell with
+      owner = a.alice; market; positions = [split.position]; outcome = Yes; price = 0.6; quantity = 1
+      feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
+  Some value <- queryContractId f.custody.vault placed.book
+  length value.orders === 1
+  value.key === marketKey f 1
