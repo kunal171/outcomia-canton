@@ -102,6 +102,8 @@ test_invitations_accept_decline_revoke_and_expire = script do
   member <- joinBob f
   Some value <- queryContractId op member
   value.wallet === f.bob
+  value.clubName === "Chess club"
+  value.isAdmin === False
   -- Decline and revoke.
   declined <- as f f.owner do
     exerciseCmd f.created.club Club_Invite with inviter = f.owner; invitee = f.outsider
@@ -206,13 +208,18 @@ test_roles_sync_to_the_club_factory = script do
     exerciseCmd f.created.club Club_SetAdmin with member = bobMember; makeAdmin = True; factory = f.created.factory
   promoted <- as f f.owner do
     exerciseCmd f.created.club Club_SetAdmin with member = bobMember; makeAdmin = True; factory = f.created.factory
+  Some bobAdmin <- pure promoted.member
+  Some adminRecord <- queryContractId op bobAdmin
+  adminRecord.isAdmin === True
+  -- Admins cannot leave from their membership alone.
+  failsAs f f.bob do exerciseCmd bobAdmin ClubMember_Leave
   Some club <- queryContractId op promoted.club
   club.admins === [f.owner, f.bob]
   Some factory <- queryContractId op promoted.factory
   factory.admins === [f.owner, f.bob]
   -- A promoted admin manages club markets through the factory.
   created <- as f f.bob do
-    createMarket f promoted.factory f.bob promoted.club [bobMember] MF.Public
+    createMarket f promoted.factory f.bob promoted.club [bobAdmin] MF.Public
   closed <- as f f.bob do
     exerciseCmd (fromInterfaceContractId @BinaryMarket created.market) Binary_FactoryClose with
       actor = f.bob; roles = toInterfaceContractId @Roles.ProtocolRoles (fromInterfaceContractId @OutcomiaMarketFactory created.factory); reason = "Club decision"
@@ -222,7 +229,7 @@ test_roles_sync_to_the_club_factory = script do
   failsAs f f.bob do
     exerciseCmd promoted.club Club_RemoveMember with actor = f.bob; member = f.created.member; factory = fromInterfaceContractId created.factory
   removed <- as f f.owner do
-    exerciseCmd promoted.club Club_RemoveMember with actor = f.owner; member = bobMember; factory = fromInterfaceContractId created.factory
+    exerciseCmd promoted.club Club_RemoveMember with actor = f.owner; member = bobAdmin; factory = fromInterfaceContractId created.factory
   Some after <- queryContractId op removed.factory
   after.admins === [f.owner]
   -- The owner cannot leave.
@@ -249,3 +256,15 @@ test_ownership_moves_only_when_the_nominee_accepts = script do
     exerciseCmd transferred.club Club_Leave with wallet = f.owner; member = f.created.member; factory = transferred.factory
   Some after <- queryContractId op left.club
   after.admins === [f.bob]
+
+test_members_leave_from_their_membership : Script ()
+test_members_leave_from_their_membership = script do
+  f <- setup
+  bobMember <- joinBob f
+  failsAs f f.outsider do exerciseCmd bobMember ClubMember_Leave
+  as f f.bob do exerciseCmd bobMember ClubMember_Leave
+  found <- queryContractId (operatorOf f) bobMember
+  found === None
+  -- The owner's membership is an admin's and cannot be dropped alone.
+  failsAs f f.owner do exerciseCmd f.created.member ClubMember_Leave
+

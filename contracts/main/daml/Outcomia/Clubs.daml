@@ -34,6 +34,8 @@ data ClubCreated = ClubCreated with
 data ClubUpdated = ClubUpdated with
     club : ContractId Club
     factory : ContractId OutcomiaMarketFactory
+    -- | The changed member's new membership, when it was re-issued.
+    member : Optional (ContractId ClubMember)
   deriving (Eq, Show)
 
 -- | Invitations can be accepted for seven days.
@@ -82,7 +84,8 @@ template ClubRegistry
         club <- create Club with
           operator; owner; name; admins = [owner]; pendingOwner = None
           marketPolicy = AdminsOnly; ref = clubRef; factoryRef; createdAt = now
-        member <- create ClubMember with operator; club = clubRef; wallet = owner; joinedAt = now
+        member <- create ClubMember with
+          operator; club = clubRef; clubName = name; wallet = owner; isAdmin = True; joinedAt = now
         pure ClubCreated with registry = next; club; member; factory
 
     -- | Operator-managed collateral for clubs created from now on.
@@ -95,33 +98,45 @@ template ClubRegistry
         create this with assets = replacementAssets
 
 -- | Active membership: the evidence a member presents to the club policy.
--- Archived on leaving or removal; rejoining creates a new contract.
+-- Archived on leaving or removal; rejoining creates a new contract. The club
+-- name and admin flag let members who cannot see the 'Club' contract display
+-- it; the 'Club' admin list stays authoritative and in sync.
 template ClubMember
   with
     operator : Party
     club : MF.PolicyRef
+    clubName : Text
     wallet : Party
+    isAdmin : Bool
     joinedAt : Time
   where
     signatory operator
     observer wallet
-    ensure MF.validPolicyRef club && club.operator == operator
+    ensure MF.validPolicyRef club && club.operator == operator && MF.boundedLabel 64 clubName
 
     interface instance MF.EligibilityEvidence for ClubMember where
       view = MF.EvidenceView with policy = club; holder = wallet
+
+    -- | Non-admin members leave from their own membership. Admins leave
+    -- through the club, which also removes them from the admin lists.
+    choice ClubMember_Leave : ()
+      controller wallet
+      do assertMsg "Admins leave through the club" (not isAdmin)
 
 -- | A seven-day invitation. Only the invitee can accept or decline it.
 template ClubInvite
   with
     operator : Party
     club : MF.PolicyRef
+    clubName : Text
     inviter : Party
     invitee : Party
     expiresAt : Time
   where
     signatory operator
     observer inviter, invitee
-    ensure MF.validPolicyRef club && club.operator == operator && inviter /= invitee
+    ensure MF.validPolicyRef club && club.operator == operator && inviter /= invitee &&
+      MF.boundedLabel 64 clubName
 
     -- | Joins the club before the invitation expires.
     choice ClubInvite_Accept : ContractId ClubMember
@@ -129,7 +144,8 @@ template ClubInvite
       do
         now <- getTime
         assertMsg "The invitation has expired" (now < expiresAt)
-        create ClubMember with operator; club; wallet = invitee; joinedAt = now
+        create ClubMember with
+          operator; club; clubName; wallet = invitee; isAdmin = False; joinedAt = now
 
     choice ClubInvite_Decline : ()
       controller invitee
@@ -192,7 +208,7 @@ template Club
         assertMsg "Only club admins can invite" (inviter `elem` admins)
         now <- getTime
         create ClubInvite with
-          operator; club = ref; inviter; invitee
+          operator; club = ref; clubName = name; inviter; invitee
           expiresAt = addRelTime now (days inviteLifetimeDays)
 
     -- | Any admin revokes a pending invitation of this club.
@@ -228,7 +244,7 @@ template Club
           admins = remaining
           pendingOwner = if pendingOwner == Some target.wallet then None else pendingOwner
         synced <- syncFactory factory factoryRef remaining
-        pure ClubUpdated with club = next; factory = synced
+        pure ClubUpdated with club = next; factory = synced; member = None
 
     -- | Any member except the owner leaves; an admin also leaves the admins.
     choice Club_Leave : ClubUpdated
@@ -247,7 +263,7 @@ template Club
           admins = remaining
           pendingOwner = if pendingOwner == Some wallet then None else pendingOwner
         synced <- syncFactory factory factoryRef remaining
-        pure ClubUpdated with club = next; factory = synced
+        pure ClubUpdated with club = next; factory = synced; member = None
 
     -- | The owner promotes a current member to admin or demotes an admin.
     choice Club_SetAdmin : ClubUpdated
@@ -265,7 +281,8 @@ template Club
         assertMsg "A club has at most 64 admins" (length replacement <= 64)
         next <- create this with admins = replacement
         synced <- syncFactory factory factoryRef replacement
-        pure ClubUpdated with club = next; factory = synced
+        reissued <- reissue member target makeAdmin
+        pure ClubUpdated with club = next; factory = synced; member = Some reissued
 
     -- | The owner nominates a current member as the next owner; nominating
     -- nobody cancels a pending nomination.
@@ -299,7 +316,8 @@ template Club
         let replacement = if nominee `elem` admins then admins else admins ++ [nominee]
         next <- create this with owner = nominee; admins = replacement; pendingOwner = None
         synced <- syncFactory factory factoryRef replacement
-        pure ClubUpdated with club = next; factory = synced
+        reissued <- reissue member target True
+        pure ClubUpdated with club = next; factory = synced; member = Some reissued
 
 -- | Inputs: the club, a party and presented evidence. Errors unless one piece
 -- of evidence is an operator-signed 'ClubMember' of this club for that party.
@@ -311,6 +329,12 @@ requireMember club party evidence = do
       Some member -> member.operator == club.operator && member.club == club.ref && member.wallet == party
       None -> False)) evidence
   assertMsg "A current membership of this club is required" (or found)
+
+-- | Re-issues a membership with an updated admin flag (keeps `joinedAt`).
+reissue : ContractId ClubMember -> ClubMember -> Bool -> Update (ContractId ClubMember)
+reissue cid value admin = do
+  archive cid
+  create value with isAdmin = admin
 
 -- | Replaces the club factory's admins with the club's admins, using the
 -- operator's authority that both contracts carry.
