@@ -55,9 +55,9 @@ reuse a previous party's commands.
 
 ## Clubs/private-market status
 
-[Clubs and private markets](clubs-private-markets.md) are planned, not implemented.
-The current contracts have no club membership or invitation gate. Existing
-matching and account-registry disclosure must be redesigned before promising
-private club activity. Member removal must preserve safe exits. The roadmap
-next steps are deployment verification, multi-outcome,
-clubs, then governance.
+[Clubs and private markets](clubs-private-markets.md) have an agreed design
+(Phase A) and no contracts yet. By decision, clubs start on **binary** markets
+before checkpoint 6; multi-outcome club markets follow multi-outcome support.
+The design adds a club-scoped market factory, invitation-based membership,
+ledger-level removal checks in matching and operator cancellation of departed
+members' orders, with exits that never require membership.
