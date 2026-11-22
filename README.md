@@ -44,3 +44,9 @@ verifies pinned Token Standard interfaces. `make build` builds the production an
 test DARs; `make test` runs the IDE-ledger suite. The production package does not
 depend on `daml-script`. For checkouts with spaces, see the [DPM path issue
 and explicit local override](docs/dpm-local-path-issue.md).
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The license covers
+this repository's contracts, scripts and documentation; it does not grant access
+to any hosted Outcomia service, operator credentials or network deployment.
