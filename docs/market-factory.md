@@ -1,7 +1,6 @@
 # Market factory standard
 
-Status: **steps 1–2 implemented** (standard package and Outcomia's factory);
-eligibility enforcement and invite lists are next. Phase B of
+Status: **implemented with its UI** (Phase B of
 [clubs and private markets](clubs-private-markets.md)).
 
 Goal: every market is created through a factory, and the factory contract
@@ -81,7 +80,17 @@ Exits (cancel, merge, withdraw, redeem) never consult eligibility.
    management (close, propose, correct), isolated by scope from protocol-root
    markets and other factory instances. `Protocol_CreateBinary` is unchanged.
    Fee quotes still come from the protocol root's taker fee.
-3. Eligibility enforcement on placement, split and matching, plus invite lists.
-4. Clubs (Phase C) as factory instances with membership eligibility.
+3. **Done.** Eligibility enforcement on placement, split and both sides of
+   every fill, plus `InviteListPolicy` lists issued and numbered by a factory
+   (manager plus invitees). Exits never consult eligibility. A removed
+   invitee's resting order cannot fill; it stays until its owner cancels it
+   (operator cancellation of departed orders arrives with clubs, Phase E).
+4. **UI, same milestone** (shared app, `app/canton`): factory-instance
+   sections on the manage page (creation policy, market creation through the
+   standard interface, public or invite-only, invite lists), scope-aware
+   market routes, factory-admin close/propose/correct, invite-only labels and
+   eligibility proofs attached automatically. Requires
+   `CANTON_FACTORY_PACKAGE_ID`; live trading stays behind the deployment gate.
+5. Clubs (Phase C) as factory instances with membership eligibility.
 
 Each step runs the full contract suite; existing tests must pass unchanged.
