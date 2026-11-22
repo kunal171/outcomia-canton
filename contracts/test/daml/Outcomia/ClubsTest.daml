@@ -1,0 +1,251 @@
+-- | Clubs on the market factory: membership lifecycle, club market creation
+-- gated by the club policy, members-only entry and admin sync to the factory.
+module Outcomia.ClubsTest where
+
+import Canton.MarketFactory qualified as MF
+import DA.Assert ((===))
+import DA.Time (addRelTime, days)
+import Daml.Script
+import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.Binary
+import Outcomia.Clubs
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Factory
+import Outcomia.FactoryTest qualified as FT
+import Outcomia.Positions
+import Outcomia.ProtocolRoles qualified as Roles
+import Outcomia.TokenHarness (FactoryMode(..))
+import Outcomia.Types (MarketStatus(..))
+
+data Fixture = Fixture with
+    custody : C.Fixture
+    owner : Party
+    bob : Party
+    outsider : Party
+    created : ClubCreated
+  deriving (Eq, Show)
+
+operatorOf : Fixture -> Party
+operatorOf f = f.custody.asset.operator
+
+readers : Fixture -> [Party]
+readers f = [operatorOf f, f.custody.vault, f.custody.asset.issuer, f.owner, f.bob]
+
+setup : Script Fixture
+setup = script do
+  custody <- C.setup Good
+  let a = custody.asset
+  owner <- allocateParty "ClubOwner"
+  bob <- allocateParty "ClubBob"
+  outsider <- allocateParty "ClubOutsider"
+  registry <- submit [a.operator, custody.vault] do
+    createCmd ClubRegistry with
+      operator = a.operator; vault = custody.vault; protocolName = "outcomia"
+      assets = [FactoryAsset with instrument = a.instrument; admission = a.admission]
+      nextClub = 1
+  created <- submit (actAs owner <> readAs a.operator) do
+    exerciseCmd registry ClubRegistry_CreateClub with owner; name = "Chess club"
+  pure Fixture with custody; owner; bob; outsider; created
+
+as : Fixture -> Party -> Commands b -> Script b
+as f party = submit (actAs party <> readAs (readers f ++ [f.outsider]))
+
+failsAs : Fixture -> Party -> Commands b -> Script ()
+failsAs f party = submitMustFail (actAs party <> readAs (readers f ++ [f.outsider]))
+
+-- | Invites Bob and accepts as Bob.
+joinBob : Fixture -> Script (ContractId ClubMember)
+joinBob f = do
+  invite <- as f f.owner do
+    exerciseCmd f.created.club Club_Invite with inviter = f.owner; invitee = f.bob
+  as f f.bob do exerciseCmd invite ClubInvite_Accept
+
+clubProof : ContractId Club -> [ContractId ClubMember] -> Optional MF.CreationProof
+clubProof club members = Some MF.CreationProof with
+  policy = toInterfaceContractId club; evidence = map toInterfaceContractId members
+
+createMarket : Fixture -> ContractId OutcomiaMarketFactory -> Party -> ContractId Club -> [ContractId ClubMember] -> MF.Access -> Commands MF.MarketCreated
+createMarket f factory creator club members access =
+  exerciseCmd (toInterfaceContractId @MF.MarketFactory factory) MF.MarketFactory_Create with
+    creator; terms = FT.standardTerms f.custody.asset; access; proof = clubProof club members
+
+test_creating_a_club_sets_up_owner_membership_and_factory : Script ()
+test_creating_a_club_sets_up_owner_membership_and_factory = script do
+  f <- setup
+  let op = operatorOf f
+  Some club <- queryContractId op f.created.club
+  club.owner === f.owner
+  club.admins === [f.owner]
+  club.marketPolicy === AdminsOnly
+  club.ref.policyId === "club/1"
+  Some factory <- queryContractId op f.created.factory
+  factory.ref.factoryId === "club-1"
+  factory.admins === [f.owner]
+  factory.policy === MF.ByPolicy club.ref
+  Some member <- queryContractId op f.created.member
+  (member.wallet, member.club) === (f.owner, club.ref)
+  -- Names are validated and numbers advance per club.
+  failsAs f f.outsider do
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = " padded"
+  second <- as f f.outsider do
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = "Rival"
+  Some rival <- queryContractId op second.club
+  rival.ref.policyId === "club/2"
+
+test_invitations_accept_decline_revoke_and_expire : Script ()
+test_invitations_accept_decline_revoke_and_expire = script do
+  f <- setup
+  let op = operatorOf f
+  -- Non-admins cannot invite.
+  failsAs f f.bob do
+    exerciseCmd f.created.club Club_Invite with inviter = f.bob; invitee = f.outsider
+  member <- joinBob f
+  Some value <- queryContractId op member
+  value.wallet === f.bob
+  -- Decline and revoke.
+  declined <- as f f.owner do
+    exerciseCmd f.created.club Club_Invite with inviter = f.owner; invitee = f.outsider
+  as f f.outsider do exerciseCmd declined ClubInvite_Decline
+  revoked <- as f f.owner do
+    exerciseCmd f.created.club Club_Invite with inviter = f.owner; invitee = f.outsider
+  failsAs f f.bob do
+    exerciseCmd f.created.club Club_RevokeInvite with actor = f.bob; invite = revoked
+  as f f.owner do
+    exerciseCmd f.created.club Club_RevokeInvite with actor = f.owner; invite = revoked
+  failsAs f f.outsider do exerciseCmd revoked ClubInvite_Accept
+  -- Expiry: accepting fails and anyone may clear it afterwards, not before.
+  expiring <- as f f.owner do
+    exerciseCmd f.created.club Club_Invite with inviter = f.owner; invitee = f.outsider
+  failsAs f f.bob do exerciseCmd expiring ClubInvite_Clear with closer = f.bob
+  now <- getTime
+  setTime (addRelTime now (days 7))
+  failsAs f f.outsider do exerciseCmd expiring ClubInvite_Accept
+  as f f.bob do exerciseCmd expiring ClubInvite_Clear with closer = f.bob
+
+test_club_markets_follow_the_club_policy : Script ()
+test_club_markets_follow_the_club_policy = script do
+  f <- setup
+  let op = operatorOf f
+  bobMember <- joinBob f
+  -- Admins only: the owner creates a members-only market with membership proof.
+  [(club, clubValue)] <- query @Club op
+  first <- as f f.owner do
+    createMarket f f.created.factory f.owner club [f.created.member] (MF.Restricted clubValue.ref)
+  first.ref.factory.factoryId === "club-1"
+  Some market <- queryContractId op (fromInterfaceContractId @BinaryMarket first.market)
+  market.access === Some clubValue.ref
+  let factory = fromInterfaceContractId @OutcomiaMarketFactory first.factory
+  -- Bob is a member but not an admin.
+  failsAs f f.bob do
+    createMarket f factory f.bob club [bobMember] MF.Public
+  -- Without proof, or with an outsider's empty evidence, creation fails.
+  failsAs f f.owner do
+    exerciseCmd (toInterfaceContractId @MF.MarketFactory factory) MF.MarketFactory_Create with
+      creator = f.owner; terms = FT.standardTerms f.custody.asset; access = MF.Public; proof = None
+  failsAs f f.outsider do
+    createMarket f factory f.outsider club [] MF.Public
+  -- Another member's evidence does not stand in for Bob's own.
+  failsAs f f.bob do
+    createMarket f factory f.bob club [f.created.member] MF.Public
+  -- Under the any-member policy Bob creates.
+  open <- as f f.owner do
+    exerciseCmd club Club_SetMarketPolicy with actor = f.owner; replacementPolicy = AnyMember
+  second <- as f f.bob do
+    createMarket f factory f.bob open [bobMember] MF.Public
+  second.ref.number === 2
+  -- A rival club's membership is not evidence for this club.
+  rival <- as f f.outsider do
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = "Rival"
+  failsAs f f.outsider do
+    createMarket f (fromInterfaceContractId second.factory) f.outsider open [rival.member] MF.Public
+
+test_members_only_entry_and_removal : Script ()
+test_members_only_entry_and_removal = script do
+  f <- setup
+  let a = f.custody.asset
+      op = operatorOf f
+  funded <- C.deposit f.custody f.custody.balance 5.0 [toInterfaceContractId @H.Holding a.input]
+  -- Alice (the custody fixture's funded wallet) joins.
+  invite <- as f f.owner do
+    exerciseCmd f.created.club Club_Invite with inviter = f.owner; invitee = a.alice
+  aliceMember <- submit (actAs a.alice <> readAs (readers f)) do exerciseCmd invite ClubInvite_Accept
+  [(club, clubValue)] <- query @Club op
+  created <- as f f.owner do
+    createMarket f f.created.factory f.owner club [f.created.member] (MF.Restricted clubValue.ref)
+  let market = fromInterfaceContractId @BinaryMarket created.market
+  [(reserve, _)] <- query @MarketReserve f.custody.vault
+  let splitWith evidence = exerciseCmd reserve MarketReserve_Split with
+        owner = a.alice; market; balance = funded.balance; quantity = 1
+        extraArgs = C.registryContext
+        eligibility = Some EligibilityProof with policy = toInterfaceContractId club; evidence
+  submitMustFail (actAs a.alice <> readAs (readers f)) (splitWith [])
+  split <- submit (actAs a.alice <> readAs (readers f)) (splitWith [toInterfaceContractId aliceMember])
+  -- After removal, the old membership no longer exists.
+  removed <- as f f.owner do
+    exerciseCmd club Club_RemoveMember with actor = f.owner; member = aliceMember; factory = fromInterfaceContractId created.factory
+  submitMustFail (actAs a.alice <> readAs (readers f)) do
+    exerciseCmd split.reserve MarketReserve_Split with
+      owner = a.alice; market; balance = split.balance; quantity = 1
+      extraArgs = C.registryContext
+      eligibility = Some EligibilityProof with policy = toInterfaceContractId removed.club; evidence = [toInterfaceContractId aliceMember]
+  -- Exits never need membership: merging the pair back works.
+  merged <- submit (actAs a.alice <> readAs (readers f)) do
+    exerciseCmd split.reserve MarketReserve_Merge with
+      owner = a.alice; balance = split.balance; positions = [split.position]; quantity = 1
+      extraArgs = C.registryContext
+  Some pool <- queryContractId f.custody.vault merged.reserve
+  pool.completeSets === 0
+
+test_roles_sync_to_the_club_factory : Script ()
+test_roles_sync_to_the_club_factory = script do
+  f <- setup
+  let op = operatorOf f
+  bobMember <- joinBob f
+  -- Only the owner promotes; the factory's admins follow the club.
+  failsAs f f.bob do
+    exerciseCmd f.created.club Club_SetAdmin with member = bobMember; makeAdmin = True; factory = f.created.factory
+  promoted <- as f f.owner do
+    exerciseCmd f.created.club Club_SetAdmin with member = bobMember; makeAdmin = True; factory = f.created.factory
+  Some club <- queryContractId op promoted.club
+  club.admins === [f.owner, f.bob]
+  Some factory <- queryContractId op promoted.factory
+  factory.admins === [f.owner, f.bob]
+  -- A promoted admin manages club markets through the factory.
+  created <- as f f.bob do
+    createMarket f promoted.factory f.bob promoted.club [bobMember] MF.Public
+  closed <- as f f.bob do
+    exerciseCmd (fromInterfaceContractId @BinaryMarket created.market) Binary_FactoryClose with
+      actor = f.bob; roles = toInterfaceContractId @Roles.ProtocolRoles (fromInterfaceContractId @OutcomiaMarketFactory created.factory); reason = "Club decision"
+  Some value <- queryContractId op closed
+  value.status === Closed
+  -- Admins cannot remove admins or the owner; the owner removes the admin.
+  failsAs f f.bob do
+    exerciseCmd promoted.club Club_RemoveMember with actor = f.bob; member = f.created.member; factory = fromInterfaceContractId created.factory
+  removed <- as f f.owner do
+    exerciseCmd promoted.club Club_RemoveMember with actor = f.owner; member = bobMember; factory = fromInterfaceContractId created.factory
+  Some after <- queryContractId op removed.factory
+  after.admins === [f.owner]
+  -- The owner cannot leave.
+  failsAs f f.owner do
+    exerciseCmd removed.club Club_Leave with wallet = f.owner; member = f.created.member; factory = removed.factory
+
+test_ownership_moves_only_when_the_nominee_accepts : Script ()
+test_ownership_moves_only_when_the_nominee_accepts = script do
+  f <- setup
+  let op = operatorOf f
+  bobMember <- joinBob f
+  failsAs f f.bob do
+    exerciseCmd f.created.club Club_AcceptOwnership with member = bobMember; factory = f.created.factory
+  nominated <- as f f.owner do
+    exerciseCmd f.created.club Club_Nominate with nominee = Some bobMember
+  transferred <- as f f.bob do
+    exerciseCmd nominated Club_AcceptOwnership with member = bobMember; factory = f.created.factory
+  Some club <- queryContractId op transferred.club
+  (club.owner, club.admins, club.pendingOwner) === (f.bob, [f.owner, f.bob], None)
+  Some factory <- queryContractId op transferred.factory
+  factory.admins === [f.owner, f.bob]
+  -- The previous owner may now leave, which also drops them from the admins.
+  left <- as f f.owner do
+    exerciseCmd transferred.club Club_Leave with wallet = f.owner; member = f.created.member; factory = transferred.factory
+  Some after <- queryContractId op left.club
+  after.admins === [f.bob]
