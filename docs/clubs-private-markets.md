@@ -58,20 +58,35 @@ what a caller is already entitled to see.
 - **Never** use a `ContractId` as an external identity: markets, clubs and
   memberships are archived and recreated by consuming choices.
 
-## Contracts (proposed)
+## Contracts (Phase C, built on the market factory)
+
+Clubs reuse the [market factory standard](market-factory.md) instead of a
+separate market path:
 
 | Contract | Signatories / observers | Purpose |
 | --- | --- | --- |
-| `ClubRegistry` | operator / — | Allocates club numbers; `ClubRegistry_CreateClub` (controller: creator). |
-| `Club` | operator, owner / admins | Name, owner, pending owner, market policy, next club market number. Consumed only by policy, ownership and market-creation choices, never by membership changes. |
-| `ClubAdmin` | operator, admin / owner | One per admin. Separate from membership so a role change never archives the membership (and so never kills the admin's orders). |
-| `ClubInvitation` | operator, inviter / invitee | Expiry, accept (creates membership), decline, revoke, expire. |
-| `ClubMembership` | operator, member / owner | Active membership. Archived on leave or removal. A rejoin is a new contract. |
-| `ClubRemoval` | operator / member | Tombstone created on removal, naming the archived membership. Authorizes the operator to cancel that member's orders. |
-| `ClubMarketFactory` | operator, owner / admins | Club-scoped creation under the club policy; creates `BinaryMarket` with `scope = Some clubId`. |
+| `ClubRegistry` | operator, vault / — | Allocates club numbers and admitted collateral. `ClubRegistry_CreateClub` (any party) creates the club, the owner's membership and the club's own `OutcomiaMarketFactory`. |
+| `Club` | operator, owner / admins | Name, owner, pending owner, admin list, market-creation policy and stable references. **Implements `EligibilityPolicy`**: it admits current members to place, split and fill, and admits market creation by admins (or any member under the any-member policy). Consumed only by owner/admin/policy changes, never by joining or leaving. |
+| `ClubMember` | operator, member / — | Active membership, **implements `EligibilityEvidence`**. Archived on leave or removal; a rejoin is a new contract. |
+| `ClubInvite` | operator, inviter / invitee | Seven-day invitation: accept (creates the membership), decline, revoke by an admin, clear after expiry. |
+| Club factory | operator, vault / club admins | An `OutcomiaMarketFactory` whose creation policy is `ByPolicy` the club and whose admins the `Club` keeps in sync, so club admins manage club markets. |
 
-Every club choice also fetches the current `Club` to check the caller's role or
-the policy, so revoked rights stop working immediately.
+- **Members-only markets** are created with `Restricted clubPolicyRef`; public
+  club markets with `Public`. Either way the club curates and resolves.
+- **Membership proof** is the member's `ClubMember` contract, presented as
+  evidence. Fills re-check both parties with their current memberships, so a
+  removed member's resting order cannot fill.
+- **Admins** are listed on `Club` (owner always included); promotion, demotion,
+  removal of an admin and ownership transfer update the club factory's admins in
+  the same transaction, using the operator's signature on both contracts.
+- **Standard extension:** `CreationPolicy` gains `ByPolicy PolicyRef`,
+  `EntryAction` gains `CreateMarket`, and `MarketFactory_Create` takes an
+  optional creation proof, so any implementation can gate creation on
+  credentials (club membership, KYC, token holdings).
+- `ClubRemoval` and `OrderBook_CancelDeparted` (operator cleanup of departed
+  members' orders) remain Phase E.
+
+Every club choice fetches the current `Club`, so revoked rights stop at once.
 
 ## Visibility matrix
 
