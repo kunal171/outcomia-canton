@@ -1,0 +1,181 @@
+-- | Outcomia's reference implementation of the open market-factory standard.
+--
+-- One factory instance has its own admins, creation policy, admitted collateral
+-- and market counter. 'MarketFactory_Create' validates the standard terms, maps
+-- them to binary terms and creates an Open market with its collateral reserve
+-- and order book in one transaction; any failure rolls all of them back.
+-- Factory markets carry their 'FactoryRef' as scope, so their numbers never
+-- collide with protocol-root markets, and only this instance's current admins
+-- manage them (close, propose, correct). Club and invite-only access arrive
+-- with eligibility enforcement; this revision accepts public markets only.
+module Outcomia.Factory where
+
+import Canton.MarketFactory qualified as MF
+import DA.List (unique)
+import DA.Numeric qualified as Numeric
+import DA.Text qualified as T
+import Outcomia.Assets (AssetAdmission(..))
+import Outcomia.Binary
+import Outcomia.MarketFees qualified as MarketFees
+import Outcomia.Orders
+import Outcomia.Positions
+import Outcomia.ProtocolRoles qualified as Roles
+import Outcomia.Types
+import Outcomia.Validation
+
+-- | One admitted collateral instrument and its operator-signed admission.
+data FactoryAsset = FactoryAsset with
+    instrument : CollateralInstrument
+    admission : ContractId AssetAdmission
+  deriving (Eq, Show)
+
+-- | Inputs: proposed factory admins. Result: 1-64 unique parties.
+validFactoryAdmins : [Party] -> Bool
+validFactoryAdmins admins = not (null admins) && length admins <= 64 && unique admins
+
+template OutcomiaMarketFactory
+  with
+    operator : Party
+    vault : Party
+    protocolName : Text
+    ref : MF.FactoryRef
+    admins : [Party]
+    policy : MF.CreationPolicy
+    assets : [FactoryAsset]
+    nextNumber : Int
+  where
+    signatory operator, vault
+    observer admins
+    ensure operator /= vault && boundedText 64 protocolName && MF.validFactoryRef ref &&
+      ref.operator == operator && ref.namespace == protocolName &&
+      ref.factoryId /= "protocol" && validFactoryAdmins admins && nextNumber > 0 &&
+      length assets <= 64 && unique (map (\a -> a.instrument) assets) &&
+      validPolicy policy
+
+    interface instance MF.MarketFactory for OutcomiaMarketFactory where
+      view = MF.FactoryView with
+        ref; creationPolicy = policy; nextNumber; minOutcomes = 2; maxOutcomes = 2
+      create' creator terms access = createBundle this creator terms access
+
+    -- Lets resolution corrections verify current admins of this exact scope.
+    interface instance Roles.ProtocolRoles for OutcomiaMarketFactory where
+      view = Roles.ProtocolRolesView operator protocolName admins (Some ref)
+
+    -- | Inputs: replacement admin list. Rejects: another caller or an invalid
+    -- list. Result: a new revision; removed admins lose management at once.
+    choice OutcomiaFactory_SetAdmins : ContractId OutcomiaMarketFactory
+      with replacementAdmins : [Party]
+      controller operator
+      do
+        assertMsg "Factory admins must be 1 to 64 unique parties" (validFactoryAdmins replacementAdmins)
+        create this with admins = replacementAdmins
+
+    -- | Inputs: replacement creation policy. Result: a new revision; existing
+    -- markets are unaffected.
+    choice OutcomiaFactory_SetPolicy : ContractId OutcomiaMarketFactory
+      with replacementPolicy : MF.CreationPolicy
+      controller operator
+      do
+        assertMsg "Creation policy lists must be 1 to 64 unique parties" (validPolicy replacementPolicy)
+        create this with policy = replacementPolicy
+
+    -- | Inputs: replacement admitted assets. Result: a new revision; existing
+    -- markets keep the collateral binding they were created with.
+    choice OutcomiaFactory_SetAssets : ContractId OutcomiaMarketFactory
+      with replacementAssets : [FactoryAsset]
+      controller operator
+      do
+        assertMsg "Admitted assets must be unique and at most 64"
+          (length replacementAssets <= 64 && unique (map (\a -> a.instrument) replacementAssets))
+        create this with assets = replacementAssets
+
+-- | Party lists in a creation policy are bounded and unique.
+validPolicy : MF.CreationPolicy -> Bool
+validPolicy policy = case policy of
+  MF.AdminsOnly parties -> boundedParties parties
+  MF.Allowlist parties -> boundedParties parties
+  MF.AnyParty -> True
+  where boundedParties parties = not (null parties) && length parties <= 64 && unique parties
+
+-- | Inputs: standard terms with outcomes YES then NO and the admitted
+-- instrument. Result: Outcomia binary terms. Factory markets have no fallback.
+toBinaryTerms : MF.MarketTerms -> CollateralInstrument -> BinaryTerms
+toBinaryTerms terms instrument =
+  let criterion index = case drop index terms.outcomeCriteria of
+        value :: _ -> value
+        [] -> ""
+      rules = ResolutionRules with
+        yesCriteria = criterion 0
+        noCriteria = criterion 1
+        invalidCriteria = terms.invalidCriteria
+        evidenceRequirements = terms.evidenceRequirements
+        documentUri = terms.rulesUri
+        documentSha256 = terms.rulesHash
+  in BinaryTerms with
+    question = terms.question
+    collateral = instrument
+    rules
+    closeAt = terms.closeAt
+    earliestResolutionAt = terms.earliestResolutionAt
+    fallback = None
+    resolutionDelaySeconds = terms.resolutionDelaySeconds
+    priceTick = terms.priceTick
+    quantityLot = terms.quantityLot
+
+-- | Inputs: the current factory, creator, standard terms and access.
+-- Rejects: a creator outside the policy, restricted access (not yet supported),
+-- terms that are not a valid YES/NO market, unadmitted collateral, increments
+-- that cannot settle in the asset's precision, an elapsed cutoff or counter
+-- exhaustion. Result: next factory revision plus an Open market, its empty
+-- reserve and empty book, all numbered `nextNumber` in this factory's scope.
+createBundle : OutcomiaMarketFactory -> Party -> MF.MarketTerms -> MF.Access -> Update MF.MarketCreated
+createBundle factory creator terms access = do
+  assertMsg "Creator is not allowed by this factory's creation policy"
+    (MF.mayCreate factory.policy creator)
+  assertMsg "Restricted access requires eligibility support in a later release"
+    (access == MF.Public)
+  let shape = MF.termsShapeErrors 2 2 terms
+  assertMsg (T.intercalate "; " shape) (null shape)
+  assertMsg "Binary factory markets use the outcomes YES and NO" (terms.outcomes == ["YES", "NO"])
+  let instrument = CollateralInstrument with admin = terms.collateral.admin; id = terms.collateral.id
+  asset <- case filter (\a -> a.instrument == instrument) factory.assets of
+    found :: _ -> pure found
+    [] -> abort "Collateral is not admitted by this factory"
+  admitted <- fetch asset.admission
+  assertMsg "Admission does not match this factory's operator or instrument"
+    (admitted.operator == factory.operator && admitted.instrument == instrument)
+  assertMsg "Market number limit reached" (factory.nextNumber < 9223372036854775807)
+  now <- getTime
+  let binary = toBinaryTerms terms instrument
+      problems = termsErrors creator now binary
+      aligned value = Numeric.roundNumeric admitted.assetDecimals Numeric.RoundingDown value == value
+      lotNotional = binary.priceTick * intToDecimal binary.quantityLot
+  assertMsg (T.intercalate "; " problems) (null problems)
+  -- Same settlement-precision rules as registry reserve and book creation.
+  assertMsg "Price tick times quantity lot must align to asset precision"
+    (lotNotional > 0.0 && aligned lotNotional)
+  assertMsg "Invalid-result refunds must align with collateral precision"
+    (aligned (0.5 * intToDecimal binary.quantityLot))
+  next <- create factory with nextNumber = factory.nextNumber + 1
+  let number = factory.nextNumber
+      key = MarketKey with
+        operator = factory.operator; protocolName = factory.protocolName
+        marketId = number; scope = Some factory.ref
+  market <- create BinaryMarket with
+    operator = factory.operator; protocolName = factory.protocolName
+    marketId = number; creator; terms = binary; createdAt = now
+    status = Open; closeReason = None; openedAt = Some now
+    factory = Some factory.ref
+  _ <- create MarketReserve with
+    key; vault = factory.vault; creator; terms = binary; createdAt = now
+    factory = admitted.factory; assetDecimals = admitted.assetDecimals
+    completeSets = 0; cash = None
+  _ <- create OrderBook with
+    key; vault = factory.vault; creator; terms = binary; marketCreatedAt = now
+    factory = admitted.factory; assetDecimals = admitted.assetDecimals
+    nextOrderId = 1; orders = []
+    fees = MarketFees.FeePoolState 0.0 None
+  pure MF.MarketCreated with
+    factory = toInterfaceContractId next
+    market = toInterfaceContractId market
+    ref = MF.MarketRef with factory = factory.ref; number

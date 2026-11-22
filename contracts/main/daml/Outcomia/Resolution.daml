@@ -9,6 +9,7 @@ import DA.Time (addRelTime, seconds)
 import DA.Text qualified as T
 import Outcomia.ProtocolRoles qualified as Roles
 import Outcomia.Types
+import Canton.MarketFactory (FactoryRef)
 import Outcomia.Validation (boundedText, validDigest, termsErrors)
 
 -- | Invalid is distinct from NO. Its redemption formula must be specified and
@@ -60,7 +61,7 @@ template ResolutionProposal
         assertMsg "Correction time cannot precede the current proposal" (now >= proposedAt)
         assertMsg "Corrections stop at the current finalization time" (now < finalizableAt)
         assertMsg "Resolver is outside its agreed correction window"
-          (eligibleResolver creator terms resolver now)
+          (eligibleResolverFor key.scope creator terms resolver now)
         assertMsg "Correction must change the outcome or evidence"
           (replacementOutcome /= outcome || replacementEvidence /= evidence)
         assertMsg "Proposal revision limit reached" (revision < 9223372036854775807)
@@ -105,7 +106,7 @@ validProposal proposal = proposal.key.marketId > 0 && boundedText 64 proposal.ke
   null (termsErrors proposal.creator proposal.marketCreatedAt proposal.terms) &&
   proposal.marketCreatedAt <= proposal.openedAt && proposal.openedAt < proposal.terms.closeAt &&
   null (evidenceErrors proposal.evidence) && proposal.revision >= 0 &&
-  eligibleResolver proposal.creator proposal.terms proposal.proposedBy proposal.proposedAt &&
+  eligibleResolverFor proposal.key.scope proposal.creator proposal.terms proposal.proposedBy proposal.proposedAt &&
   proposal.finalizableAt == addRelTime proposal.proposedAt (seconds proposal.terms.resolutionDelaySeconds)
 
 -- | Inputs: immutable terms and proposed ledger time. Result: the earliest
@@ -128,6 +129,15 @@ eligibleResolver creator terms resolver now = now >= effectiveEarliest terms &&
     None -> False
     Some policy -> resolver == policy.resolver && now >= policy.availableAt &&
       (case policy.deadlineAt of None -> True; Some deadline -> now < deadline))
+
+-- | Inputs: market scope, signed creator/terms, resolver and time. Result:
+-- protocol-root markets use 'eligibleResolver'. Factory markets have no
+-- fallback and are governed by their factory's current admins, checked
+-- separately against the issuing scope, so only the timing applies here.
+eligibleResolverFor : Optional FactoryRef -> Party -> BinaryTerms -> Party -> Time -> Bool
+eligibleResolverFor scope creator terms resolver now = case scope of
+  None -> eligibleResolver creator terms resolver now
+  Some _ -> now >= effectiveEarliest terms && terms.fallback == None
 
 -- | Inputs: evidence summary, URI and digest. Result: all detected format errors.
 -- Evidence cannot be empty; valid shape is not an oracle or a truth guarantee.
