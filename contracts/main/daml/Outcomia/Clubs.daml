@@ -1,0 +1,312 @@
+-- | Clubs on the market factory standard.
+--
+-- A club is one 'Club' contract holding its roster: owner, admins, members and
+-- pending invitations. Members and invitees observe it, so every wallet can see
+-- the clubs it belongs to without an operator disclosure service. Each club
+-- gets its own 'OutcomiaMarketFactory' whose creation policy is the club, and
+-- 'Club' implements 'EligibilityPolicy': listed members may place, split and
+-- fill in members-only club markets, and admins (or every member, under the
+-- any-member policy) may create markets. Membership is checked against the
+-- current roster, so removal takes effect immediately.
+--
+-- Club roles never grant protocol-admin authority. Every roster change
+-- consumes the club, so changes within one club are serialized; clubs never
+-- contend with each other. Exits from positions never consult clubs.
+module Outcomia.Clubs where
+
+import Canton.MarketFactory qualified as MF
+import DA.List (unique)
+import DA.Time (addRelTime, days)
+import Outcomia.Factory
+import Outcomia.Validation (boundedText)
+
+-- | Who may create markets in a club.
+data ClubMarketPolicy = AdminsOnly | AnyMember
+  deriving (Eq, Show)
+
+-- | A pending, seven-day invitation.
+data ClubInvitation = ClubInvitation with
+    invitee : Party
+    inviter : Party
+    expiresAt : Time
+  deriving (Eq, Show)
+
+data ClubCreated = ClubCreated with
+    registry : ContractId ClubRegistry
+    club : ContractId Club
+    factory : ContractId OutcomiaMarketFactory
+  deriving (Eq, Show)
+
+-- | Result of a change that also updates the club factory's admins.
+data ClubUpdated = ClubUpdated with
+    club : ContractId Club
+    factory : ContractId OutcomiaMarketFactory
+  deriving (Eq, Show)
+
+inviteLifetimeDays : Int
+inviteLifetimeDays = 7
+
+maxMembers : Int
+maxMembers = 256
+
+maxAdmins : Int
+maxAdmins = 64
+
+maxInvitations : Int
+maxInvitations = 64
+
+-- | Allocates club numbers for one deployment and the collateral club
+-- factories admit. Any party may create a club and becomes its owner.
+template ClubRegistry
+  with
+    operator : Party
+    vault : Party
+    protocolName : Text
+    assets : [FactoryAsset]
+    nextClub : Int
+  where
+    signatory operator, vault
+    ensure operator /= vault && boundedText 64 protocolName && nextClub > 0 &&
+      length assets <= 64 && unique (map (\a -> a.instrument) assets)
+
+    -- | Inputs: the owner and a club name. Result: the club and its own
+    -- factory, which admits markets only through the club policy.
+    choice ClubRegistry_CreateClub : ClubCreated
+      with
+        owner : Party
+        name : Text
+      controller owner
+      do
+        assertMsg "Club names must be 1 to 64 characters without outer spaces" (MF.boundedLabel 64 name)
+        assertMsg "Club number limit reached" (nextClub < 9223372036854775807)
+        now <- getTime
+        let number = show nextClub
+            clubRef = MF.PolicyRef with
+              operator; namespace = protocolName; policyId = "club/" <> number
+            factoryRef = MF.FactoryRef with
+              operator; namespace = protocolName; factoryId = "club-" <> number
+        next <- create this with nextClub = nextClub + 1
+        factory <- create OutcomiaMarketFactory with
+          operator; vault; protocolName; ref = factoryRef; admins = [owner]
+          policy = MF.ByPolicy clubRef; assets; nextNumber = 1; nextPolicyNumber = 1
+        club <- create Club with
+          operator; owner; name; admins = [owner]; members = [owner]; invitations = []
+          pendingOwner = None; marketPolicy = AdminsOnly; ref = clubRef; factoryRef
+          createdAt = now
+        pure ClubCreated with registry = next; club; factory
+
+    -- | Operator-managed collateral for clubs created from now on.
+    choice ClubRegistry_SetAssets : ContractId ClubRegistry
+      with replacementAssets : [FactoryAsset]
+      controller operator
+      do
+        assertMsg "Admitted assets must be unique and at most 64"
+          (length replacementAssets <= 64 && unique (map (\a -> a.instrument) replacementAssets))
+        create this with assets = replacementAssets
+
+template Club
+  with
+    operator : Party
+    owner : Party
+    name : Text
+    -- | Admins (the owner always included); every admin is a member.
+    admins : [Party]
+    -- | Current members, the owner and admins included.
+    members : [Party]
+    invitations : [ClubInvitation]
+    -- | Member nominated by the owner; becomes owner only by accepting.
+    pendingOwner : Optional Party
+    marketPolicy : ClubMarketPolicy
+    ref : MF.PolicyRef
+    factoryRef : MF.FactoryRef
+    createdAt : Time
+  where
+    signatory operator, owner
+    observer members, map (\i -> i.invitee) invitations
+    ensure validClub this
+
+    interface instance MF.EligibilityPolicy for Club where
+      view = MF.PolicyView with ref; kind = "club"
+      admit party action _ = do
+        assertMsg "A current membership of this club is required" (party `elem` members)
+        case action of
+          MF.CreateMarket -> assertMsg "Only club admins may create markets in this club"
+            (marketPolicy == AnyMember || party `elem` admins)
+          _ -> pure ()
+
+    -- | Admins choose who may create club markets.
+    choice Club_SetMarketPolicy : ContractId Club
+      with
+        actor : Party
+        replacementPolicy : ClubMarketPolicy
+      controller actor
+      do
+        requireAdmin this actor
+        create this with marketPolicy = replacementPolicy
+
+    -- | Any admin invites a non-member for seven days; re-inviting renews.
+    choice Club_Invite : ContractId Club
+      with
+        inviter : Party
+        invitee : Party
+      controller inviter
+      do
+        requireAdmin this inviter
+        assertMsg "That wallet is already a member" (invitee `notElem` members)
+        now <- getTime
+        let invitation = ClubInvitation with
+              invitee; inviter; expiresAt = addRelTime now (days inviteLifetimeDays)
+        create this with invitations = invitation :: withoutInvite invitee invitations
+
+    -- | The invitee joins before the invitation expires.
+    choice Club_Accept : ContractId Club
+      with invitee : Party
+      controller invitee
+      do
+        invitation <- pendingFor invitee invitations
+        now <- getTime
+        assertMsg "The invitation has expired" (now < invitation.expiresAt)
+        create this with
+          members = members ++ [invitee]; invitations = withoutInvite invitee invitations
+
+    choice Club_Decline : ContractId Club
+      with invitee : Party
+      controller invitee
+      do
+        _ <- pendingFor invitee invitations
+        create this with invitations = withoutInvite invitee invitations
+
+    -- | Any admin withdraws a pending invitation.
+    choice Club_RevokeInvite : ContractId Club
+      with
+        actor : Party
+        invitee : Party
+      controller actor
+      do
+        requireAdmin this actor
+        _ <- pendingFor invitee invitations
+        create this with invitations = withoutInvite invitee invitations
+
+    -- | Any member or invitee clears expired invitations.
+    choice Club_ClearExpired : ContractId Club
+      with closer : Party
+      controller closer
+      do
+        assertMsg "Only members and invitees can clear invitations"
+          (closer `elem` members || closer `elem` map (\i -> i.invitee) invitations)
+        now <- getTime
+        let live = filter (\i -> now < i.expiresAt) invitations
+        assertMsg "No invitation has expired" (length live < length invitations)
+        create this with invitations = live
+
+    -- | Admins remove members; only the owner removes an admin; the owner
+    -- cannot be removed. Removing an admin updates the club factory's admins.
+    choice Club_RemoveMember : ClubUpdated
+      with
+        actor : Party
+        wallet : Party
+        factory : ContractId OutcomiaMarketFactory
+      controller actor
+      do
+        requireAdmin this actor
+        assertMsg "That wallet is not a member" (wallet `elem` members)
+        assertMsg "The owner cannot be removed; transfer ownership first" (wallet /= owner)
+        assertMsg "Only the owner can remove an admin" (wallet `notElem` admins || actor == owner)
+        depart this wallet factory
+
+    -- | Any member except the owner leaves; an admin also leaves the admins.
+    choice Club_Leave : ClubUpdated
+      with
+        wallet : Party
+        factory : ContractId OutcomiaMarketFactory
+      controller wallet
+      do
+        assertMsg "That wallet is not a member" (wallet `elem` members)
+        assertMsg "The owner must transfer ownership before leaving" (wallet /= owner)
+        depart this wallet factory
+
+    -- | The owner promotes a member to admin or demotes an admin.
+    choice Club_SetAdmin : ClubUpdated
+      with
+        wallet : Party
+        makeAdmin : Bool
+        factory : ContractId OutcomiaMarketFactory
+      controller owner
+      do
+        assertMsg "Only members can be admins" (wallet `elem` members)
+        assertMsg "The owner always stays an admin" (wallet /= owner)
+        let without = filter (/= wallet) admins
+            replacement = if makeAdmin then without ++ [wallet] else without
+        next <- create this with admins = replacement
+        synced <- syncFactory factory factoryRef replacement
+        pure ClubUpdated with club = next; factory = synced
+
+    -- | The owner nominates a member as the next owner, or cancels with None.
+    choice Club_Nominate : ContractId Club
+      with nominee : Optional Party
+      controller owner
+      do
+        case nominee of
+          Some party -> do
+            assertMsg "The nominee must be a member" (party `elem` members)
+            assertMsg "The owner cannot nominate themselves" (party /= owner)
+          None -> pure ()
+        create this with pendingOwner = nominee
+
+    -- | The nominee becomes owner and admin; the previous owner stays an admin.
+    choice Club_AcceptOwnership : ClubUpdated
+      with factory : ContractId OutcomiaMarketFactory
+      controller pendingOwner
+      do
+        nominee <- case pendingOwner of
+          Some party -> pure party
+          None -> abort "There is no pending ownership nomination"
+        let replacement = if nominee `elem` admins then admins else admins ++ [nominee]
+        next <- create this with owner = nominee; admins = replacement; pendingOwner = None
+        synced <- syncFactory factory factoryRef replacement
+        pure ClubUpdated with club = next; factory = synced
+
+validClub : Club -> Bool
+validClub c =
+  MF.boundedLabel 64 c.name && c.owner `elem` c.admins &&
+  all (`elem` c.members) c.admins && unique c.admins && length c.admins <= maxAdmins &&
+  unique c.members && length c.members <= maxMembers &&
+  length c.invitations <= maxInvitations && unique invitees &&
+  all (`notElem` c.members) invitees &&
+  MF.validPolicyRef c.ref && c.ref.operator == c.operator &&
+  c.factoryRef.operator == c.operator &&
+  (case c.pendingOwner of
+    None -> True
+    Some party -> party /= c.owner && party `elem` c.members)
+  where invitees = map (\i -> i.invitee) c.invitations
+
+requireAdmin : Club -> Party -> Update ()
+requireAdmin club actor = assertMsg "Only club admins can do this" (actor `elem` club.admins)
+
+pendingFor : Party -> [ClubInvitation] -> Update ClubInvitation
+pendingFor invitee invitations = case filter (\i -> i.invitee == invitee) invitations of
+  invitation :: _ -> pure invitation
+  [] -> abort "There is no pending invitation for that wallet"
+
+withoutInvite : Party -> [ClubInvitation] -> [ClubInvitation]
+withoutInvite invitee = filter (\i -> i.invitee /= invitee)
+
+-- | Removes a member (and admin role), clears a nomination naming them and
+-- syncs the club factory's admins.
+depart : Club -> Party -> ContractId OutcomiaMarketFactory -> Update ClubUpdated
+depart club wallet factory = do
+  let remainingAdmins = filter (/= wallet) club.admins
+  next <- create club with
+    members = filter (/= wallet) club.members
+    admins = remainingAdmins
+    pendingOwner = if club.pendingOwner == Some wallet then None else club.pendingOwner
+  synced <- syncFactory factory club.factoryRef remainingAdmins
+  pure ClubUpdated with club = next; factory = synced
+
+-- | Replaces the club factory's admins with the club's admins, using the
+-- operator's authority that both contracts carry.
+syncFactory : ContractId OutcomiaMarketFactory -> MF.FactoryRef -> [Party] -> Update (ContractId OutcomiaMarketFactory)
+syncFactory factory expected admins = do
+  current <- fetch factory
+  assertMsg "That factory does not belong to this club" (current.ref == expected)
+  exercise factory OutcomiaFactory_SetAdmins with replacementAdmins = admins

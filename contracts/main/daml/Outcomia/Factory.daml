@@ -58,7 +58,7 @@ template OutcomiaMarketFactory
     interface instance MF.MarketFactory for OutcomiaMarketFactory where
       view = MF.FactoryView with
         ref; creationPolicy = policy; nextNumber; minOutcomes = 2; maxOutcomes = 2
-      create' creator terms access = createBundle this creator terms access
+      create' creator terms access proof = createBundle this creator terms access proof
 
     -- Lets resolution corrections verify current admins of this exact scope.
     interface instance Roles.ProtocolRoles for OutcomiaMarketFactory where
@@ -73,6 +73,7 @@ template OutcomiaMarketFactory
         parties : [Party]
       controller manager
       do
+        -- Policy-gated factories (clubs) restrict markets with their own policy.
         assertMsg "Manager is not allowed by this factory's creation policy" (MF.mayCreate policy manager)
         assertMsg "Policy number limit reached" (nextPolicyNumber < 9223372036854775807)
         let policyRef = MF.PolicyRef with
@@ -146,6 +147,7 @@ validPolicy policy = case policy of
   MF.AdminsOnly parties -> boundedParties parties
   MF.Allowlist parties -> boundedParties parties
   MF.AnyParty -> True
+  MF.ByPolicy ref -> MF.validPolicyRef ref
   where boundedParties parties = not (null parties) && length parties <= 64 && unique parties
 
 -- | Inputs: standard terms with outcomes YES then NO and the admitted
@@ -179,10 +181,9 @@ toBinaryTerms terms instrument =
 -- that cannot settle in the asset's precision, an elapsed cutoff or counter
 -- exhaustion. Result: next factory revision plus an Open market, its empty
 -- reserve and empty book, all numbered `nextNumber` in this factory's scope.
-createBundle : OutcomiaMarketFactory -> Party -> MF.MarketTerms -> MF.Access -> Update MF.MarketCreated
-createBundle factory creator terms access = do
-  assertMsg "Creator is not allowed by this factory's creation policy"
-    (MF.mayCreate factory.policy creator)
+createBundle : OutcomiaMarketFactory -> Party -> MF.MarketTerms -> MF.Access -> Optional MF.CreationProof -> Update MF.MarketCreated
+createBundle factory creator terms access proof = do
+  MF.checkCreation factory.policy creator proof
   restriction <- case access of
     MF.Public -> pure None
     MF.Restricted policyRef -> do

@@ -37,8 +37,8 @@ template ToyFactory
     interface instance MarketFactory for ToyFactory where
       view = FactoryView with
         ref; creationPolicy = policy; nextNumber; minOutcomes = 2; maxOutcomes = 2
-      create' creator terms access = do
-        assertMsg "Creator is not allowed by this factory" (mayCreate policy creator)
+      create' creator terms access proof = do
+        checkCreation policy creator proof
         let problems = termsShapeErrors 2 2 terms
         assertMsg (show problems) (null problems)
         next <- create this with nextNumber = nextNumber + 1
@@ -129,11 +129,11 @@ test_factory_numbers_markets_through_the_interface = script do
     createCmd ToyFactory with operator; ref; policy = AdminsOnly [admin]; nextNumber = 1
   let iface = toInterfaceContractId @MarketFactory factory
   submitMustFail outsider do
-    exerciseCmd iface MarketFactory_Create with creator = outsider; terms = termsAt admin now; access = Public
+    exerciseCmd iface MarketFactory_Create with creator = outsider; terms = termsAt admin now; access = Public; proof = None
   first <- submit (actAs admin <> readAs operator) do
-    exerciseCmd iface MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public
+    exerciseCmd iface MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public; proof = None
   second <- submit (actAs admin <> readAs operator) do
-    exerciseCmd first.factory MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public
+    exerciseCmd first.factory MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public; proof = None
   first.ref === MarketRef with factory = ref; number = 1
   second.ref === MarketRef with factory = ref; number = 2
   Some market <- queryInterfaceContractId admin second.market
@@ -141,7 +141,7 @@ test_factory_numbers_markets_through_the_interface = script do
   market.outcomes === ["YES", "NO"]
   -- The old factory revision is spent; reusing it fails.
   submitMustFail (actAs admin <> readAs operator) do
-    exerciseCmd first.factory MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public
+    exerciseCmd first.factory MarketFactory_Create with creator = admin; terms = termsAt admin now; access = Public; proof = None
 
 test_eligibility_binds_policy_reference_and_operator : Script ()
 test_eligibility_binds_policy_reference_and_operator = script do
@@ -168,3 +168,27 @@ test_eligibility_binds_policy_reference_and_operator = script do
     createCmd ToyInviteList with operator = rival; ref; parties = [stranger]
   submitMustFail (actAs stranger <> readAs operator <> readAs rival) do
     exerciseCmd book ToyBook_Enter with trader = stranger; policy = toInterfaceContractId forged
+
+test_policy_gated_creation_needs_an_admitting_proof : Script ()
+test_policy_gated_creation_needs_an_admitting_proof = script do
+  operator <- allocateParty "PolicyOperator"
+  member <- allocateParty "Member"
+  stranger <- allocateParty "Stranger"
+  now <- getTime
+  let policyRef = PolicyRef with operator; namespace = "toy"; policyId = "members"
+  list <- submit operator do
+    createCmd ToyInviteList with operator; ref = policyRef; parties = [member]
+  factory <- submit operator do
+    createCmd ToyFactory with
+      operator; ref = FactoryRef with operator; namespace = "toy"; factoryId = "club"
+      policy = ByPolicy policyRef; nextNumber = 1
+  let iface = toInterfaceContractId @MarketFactory factory
+      proof = Some CreationProof with policy = toInterfaceContractId list; evidence = []
+  assertMsg "Static check never admits a policy-gated creator" (not (mayCreate (ByPolicy policyRef) member))
+  submitMustFail (actAs member <> readAs operator) do
+    exerciseCmd iface MarketFactory_Create with creator = member; terms = termsAt member now; access = Public; proof = None
+  submitMustFail (actAs stranger <> readAs operator) do
+    exerciseCmd iface MarketFactory_Create with creator = stranger; terms = termsAt member now; access = Public; proof
+  created <- submit (actAs member <> readAs operator) do
+    exerciseCmd iface MarketFactory_Create with creator = member; terms = termsAt member now; access = Public; proof
+  created.ref.number === 1
