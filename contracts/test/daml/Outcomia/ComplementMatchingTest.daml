@@ -1,0 +1,99 @@
+-- | Complementary (complete-set) planner tests. Nothing here moves collateral;
+-- settlement tests cover the ledger effects. Expected prices are written out,
+-- not derived from the implementation.
+module Outcomia.ComplementMatchingTest where
+
+import Daml.Script
+import Outcomia.Matching
+import Outcomia.Types
+
+order : Party -> Int -> Outcome -> OrderSide -> Decimal -> Int -> MatchOrder
+order owner orderId outcome side price quantity = MatchOrder with owner; orderId; outcome; side; price; quantity
+
+requirePlan : Either Text ComplementDecision -> Script ComplementPlan
+requirePlan result = case result of
+  Right (Complement plan) -> pure plan
+  _ -> abort "Expected a complementary plan"
+
+testNoCrossOrMissingHead : Script ()
+testNoCrossOrMissingHead = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  -- Buys summing below one, sells summing above one, or a missing head do not cross.
+  assert (planComplement 0.01 1 Buy [order alice 1 Yes Buy 0.55 2, order bob 2 No Buy 0.44 2] == Right NoComplement)
+  assert (planComplement 0.01 1 Sell [order alice 1 Yes Sell 0.55 2, order bob 2 No Sell 0.46 2] == Right NoComplement)
+  assert (planComplement 0.01 1 Buy [order alice 1 Yes Buy 0.90 2] == Right NoComplement)
+  assert (planComplement 0.01 1 Buy [] == Right NoComplement)
+  -- Opposite sides never pair here; that is direct matching.
+  assert (planComplement 0.01 1 Buy [order alice 1 Yes Buy 0.90 2, order bob 2 No Sell 0.10 2] == Right NoComplement)
+  assert (planComplement 0.01 1 Sell [order alice 1 Yes Buy 0.90 2, order bob 2 No Buy 0.90 2] == Right NoComplement)
+
+testMintAtMakerPrice : Script ()
+testMintAtMakerPrice = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  -- Older NO buy 0.40 x 5 is maker; YES buy 0.65 x 3 takes at 0.60.
+  plan <- requirePlan (planComplement 0.01 1 Buy [order alice 2 Yes Buy 0.65 3, order bob 1 No Buy 0.40 5])
+  assert (plan.side == Buy && plan.yesId == 2 && plan.noId == 1 && plan.makerId == 1 && plan.takerId == 2)
+  assert (plan.yesPrice == 0.60 && plan.noPrice == 0.40 && plan.quantity == 3)
+  assert (plan.yesRemaining == 0 && plan.noRemaining == 2)
+
+testMergeAtMakerPrice : Script ()
+testMergeAtMakerPrice = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  -- Older YES sell 0.45 x 4 is maker; NO sell 0.50 x 4 takes at 0.55.
+  plan <- requirePlan (planComplement 0.01 1 Sell [order alice 1 Yes Sell 0.45 4, order bob 2 No Sell 0.50 4])
+  assert (plan.side == Sell && plan.makerId == 1 && plan.takerId == 2)
+  assert (plan.yesPrice == 0.45 && plan.noPrice == 0.55 && plan.quantity == 4)
+  assert (plan.yesRemaining == 0 && plan.noRemaining == 0)
+
+testExactCompleteSetCrosses : Script ()
+testExactCompleteSetCrosses = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  mint <- requirePlan (planComplement 0.01 1 Buy [order alice 1 Yes Buy 0.70 1, order bob 2 No Buy 0.30 1])
+  assert (mint.yesPrice == 0.70 && mint.noPrice == 0.30)
+  merge <- requirePlan (planComplement 0.01 1 Sell [order alice 2 Yes Sell 0.70 1, order bob 1 No Sell 0.30 1])
+  assert (merge.yesPrice == 0.70 && merge.noPrice == 0.30)
+
+testBestPriceThenFifo : Script ()
+testBestPriceThenFifo = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  carol <- allocateParty "Carol"
+  -- Highest YES buy wins; among equal NO buys the lower ID wins. Input order is irrelevant.
+  let orders =
+        [ order carol 5 No Buy 0.45 1
+        , order alice 4 Yes Buy 0.58 2
+        , order bob 3 No Buy 0.45 1
+        , order alice 2 Yes Buy 0.60 2
+        , order carol 1 No Buy 0.30 9 ]
+  plan <- requirePlan (planComplement 0.01 1 Buy orders)
+  assert (plan.yesId == 2 && plan.noId == 3 && plan.makerId == 2)
+  assert (plan.yesPrice == 0.60 && plan.noPrice == 0.40 && plan.quantity == 1)
+  plan' <- requirePlan (planComplement 0.01 1 Buy (reverse orders))
+  assert (plan == plan')
+
+testSelfCrossCancelsNewer : Script ()
+testSelfCrossCancelsNewer = script do
+  alice <- allocateParty "Alice"
+  assert (planComplement 0.01 1 Buy [order alice 3 Yes Buy 0.60 1, order alice 7 No Buy 0.50 1] == Right (CancelComplementSelfTrade 7))
+  assert (planComplement 0.01 1 Sell [order alice 9 Yes Sell 0.40 1, order alice 4 No Sell 0.50 1] == Right (CancelComplementSelfTrade 9))
+
+testExecutionPricesAlwaysSumToOne : Script ()
+testExecutionPricesAlwaysSumToOne = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let cases = [(0.99, 0.01), (0.51, 0.62), (0.70, 0.70), (0.33, 0.67)]
+  plans <- mapA (\(y, n) -> requirePlan (planComplement 0.01 1 Buy [order alice 1 Yes Buy y 1, order bob 2 No Buy n 1])) cases
+  assert (all (\p -> p.yesPrice + p.noPrice == 1.0 && p.yesPrice > 0.0 && p.noPrice > 0.0) plans)
+
+testInvalidSnapshotRejected : Script ()
+testInvalidSnapshotRejected = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let rejected result = case result of Left _ -> True; _ -> False
+  assert (rejected (planComplement 0.01 1 Buy [order alice 1 Yes Buy 0.605 1, order bob 2 No Buy 0.50 1]))
+  assert (rejected (planComplement 0.01 2 Buy [order alice 1 Yes Buy 0.60 3, order bob 2 No Buy 0.50 2]))
+  assert (rejected (planComplement 0.01 1 Buy [order alice 1 Yes Buy 0.60 1, order bob 1 No Buy 0.50 1]))
