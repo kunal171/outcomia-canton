@@ -17,7 +17,9 @@ flowchart LR
 
 ## Selection
 
-Match YES buys with YES sells, and NO buys with NO sells. Buy priority is highest
+Match YES buys with YES sells, and NO buys with NO sells. Pairs of YES and NO
+orders on the same side trade through the complete set instead; see
+[complementary matching](binary-complementary-matching.md). Buy priority is highest
 price, then lowest acceptance ID. Sell priority is lowest price, then lowest ID.
 The order index and planner share the same priority helper; input list order and
 ledger timestamps do not break ties.
