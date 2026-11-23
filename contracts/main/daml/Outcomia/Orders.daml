@@ -13,7 +13,7 @@ import DA.Numeric qualified as Numeric
 import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.TransferInstructionV2 qualified as T
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
-import Outcomia.Assets (AssetAdmission(..), holdingTotal)
+import Outcomia.Assets (AssetAdmission(..), holdingTotal, transferExact)
 import Outcomia.Fees qualified as Fees
 import Outcomia.MarketFees qualified as MarketFees
 import Outcomia.Binary
@@ -103,6 +103,47 @@ template TradeFill
       feeTerms.takerFeeBps >= 0 && feeTerms.takerFeeBps <= 1000 &&
       feeTerms.assetDecimals >= 0 && feeTerms.assetDecimals <= 10 &&
       feeAmount >= 0.0 && feeAmount <= plan.sellerProceeds && buyerRefund >= 0.0 && remainingBuyEscrow >= 0.0
+
+-- | A complementary match returns all revised IDs. For a fill, balances are the
+-- YES owner's then the NO owner's; a mint returns their new lots (YES owner's
+-- first) and the reserve successor. For self-trade cancellation, balances holds
+-- the one owner's account and positions any restored sell quantity.
+data ComplementResult = ComplementResult with
+    book : ContractId OrderBook
+    decision : Matching.ComplementDecision
+    reserve : Optional (ContractId MarketReserve)
+    balances : [ContractId AssetBalance]
+    positions : [ContractId PositionLot]
+    receipt : Optional (ContractId ComplementFill)
+  deriving (Eq, Show)
+
+-- | Audit record of one complete-set fill, never spendable backing. Credits are
+-- each owner's refund (mint) or net proceeds (merge); feeAmount is the taker's.
+template ComplementFill
+  with
+    key : MarketKey
+    vault : Party
+    yesOwner : Party
+    noOwner : Party
+    instrument : CollateralInstrument
+    plan : Matching.ComplementPlan
+    executedAt : Time
+    feeTerms : Fees.FeeTerms
+    feeAmount : Decimal
+    yesCredit : Decimal
+    noCredit : Decimal
+  where
+    signatory key.operator, vault
+    observer yesOwner, noOwner
+    ensure key.operator /= vault && yesOwner /= noOwner && yesOwner /= vault && noOwner /= vault &&
+      key.marketId > 0 && boundedText 64 key.protocolName && boundedText 128 instrument.id &&
+      plan.yesId > 0 && plan.noId > 0 && plan.yesId /= plan.noId &&
+      plan.makerId == min plan.yesId plan.noId && plan.takerId == max plan.yesId plan.noId &&
+      plan.quantity > 0 && plan.yesPrice > 0.0 && plan.noPrice > 0.0 &&
+      plan.yesPrice + plan.noPrice == 1.0 && plan.yesRemaining >= 0 && plan.noRemaining >= 0 &&
+      feeTerms.takerFeeBps >= 0 && feeTerms.takerFeeBps <= 1000 &&
+      feeTerms.assetDecimals >= 0 && feeTerms.assetDecimals <= 10 &&
+      feeAmount >= 0.0 && yesCredit >= 0.0 && noCredit >= 0.0
 
 -- | One configured order-registry lineage, separate from account/reserve roots.
 -- Joint operator/vault signers can bootstrap another root, so services must pin
@@ -346,6 +387,42 @@ template OrderBook
           exercise buyRef.order LimitOrder_SettleBuy with
             book = self; market; sellOrder = sellRef.order; buyerBalance; sellerBalance; extraArgs
 
+    -- | Inputs: current market and live reserve, the side to pair (Buy mints,
+    -- Sell merges), both owners' accounts and registry context. Rejects
+    -- closed/cutoff markets, missing or uncrossed heads, stale contracts, wrong
+    -- accounts or a foreign reserve. Result: one complete-set fill or the
+    -- cancellation of the newer same-owner head. Like MatchBest, the inner
+    -- settlement MUST archive this exact book; nested signed orders supply the
+    -- owners' authority. See docs/binary-complementary-matching.md.
+    nonconsuming choice OrderBook_MatchComplement : ComplementResult
+      with
+        market : ContractId BinaryMarket
+        reserve : ContractId MarketReserve
+        side : OrderSide
+        yesBalance : ContractId AssetBalance
+        noBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+        -- | Required for restricted markets: both owners must still be eligible.
+        yesEligibility : Optional EligibilityProof
+        noEligibility : Optional EligibilityProof
+      controller key.operator
+      do
+        checkTrading this market
+        yesRef <- requireBest orders Yes side
+        noRef <- requireBest orders No side
+        yes <- fetch yesRef.order
+        no <- fetch noRef.order
+        if yes.owner == no.owner then do
+          assertMsg "Self-trade cancellation uses one owner account" (yesBalance == noBalance)
+          let newer = if yesRef.orderId > noRef.orderId then yesRef.order else noRef.order
+          exercise newer LimitOrder_CancelComplementSelfTrade with book = self; market; balance = yesBalance; extraArgs
+        else do
+          current <- fetch market
+          requireEligible current yes.owner MF.Fill yesEligibility
+          requireEligible current no.owner MF.Fill noEligibility
+          exercise yesRef.order LimitOrder_SettleComplementYes with
+            book = self; market; reserve; noOrder = noRef.order; yesBalance; noBalance; extraArgs
+
     -- | Inputs: owner, exact active order reference, optional buy refund account
     -- and registry context. Rejects: foreign/unindexed order, another owner or
     -- wrong refund account. Result: order archived, index entry removed, backing
@@ -552,6 +629,174 @@ template LimitOrder
           book = next; decision; position = released.position; receipt = None
           balances = [case released.balance of Some cid -> cid; None -> balance]
 
+    -- | Inputs: current book/market/reserve, the selected NO head and both
+    -- accounts. Rejects a non-YES entry; everything else is checked downstream.
+    -- Nonconsuming keeps this order fetchable during verification; the NO
+    -- order's body archives it. Its owner becomes an explicit controller there.
+    nonconsuming choice LimitOrder_SettleComplementYes : ComplementResult
+      with
+        book : ContractId OrderBook
+        market : ContractId BinaryMarket
+        reserve : ContractId MarketReserve
+        noOrder : ContractId LimitOrder
+        yesBalance : ContractId AssetBalance
+        noBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault
+      do
+        assertMsg "Complementary settlement entry requires a YES order" (outcome == Yes)
+        exercise noOrder LimitOrder_SettleComplement with
+          yesOwner = owner; yesOrder = self; book; market; reserve; yesBalance; noBalance; extraArgs
+
+    -- | Inputs: YES owner delegated by the signed YES order, live book/market/
+    -- reserve and both accounts. Rejects non-best/foreign/self pairs, a foreign
+    -- or misbacked reserve, wrong accounts or registry outputs. Result: both
+    -- orders, the book and the reserve consumed; reserve, fee pool, credits,
+    -- delivered lots (mint), partial successors and a receipt created. All
+    -- failures roll back every nested transfer.
+    postconsuming choice LimitOrder_SettleComplement : ComplementResult
+      with
+        yesOwner : Party
+        yesOrder : ContractId LimitOrder
+        book : ContractId OrderBook
+        market : ContractId BinaryMarket
+        reserve : ContractId MarketReserve
+        yesBalance : ContractId AssetBalance
+        noBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault, yesOwner
+      do
+        index <- fetch book
+        checkTrading index market
+        snapshot <- matchingSnapshot index
+        yes <- fetch yesOrder
+        assertMsg "Settlement YES identity does not match its signed order" (yes.owner == yesOwner)
+        plan <- case Matching.planComplement index.terms.priceTick index.terms.quantityLot side snapshot of
+          Right (Matching.Complement value) -> pure value
+          _ -> abort "No eligible complementary pair for settlement"
+        yesRef <- requireBest index.orders Yes side
+        noRef <- requireBest index.orders No side
+        assertMsg "Settlement must use the best indexed YES and NO orders"
+          (yesRef.order == yesOrder && noRef.order == self && outcome == No &&
+           yes.outcome == Yes && yes.side == side && yes.orderId == plan.yesId && orderId == plan.noId &&
+           key == index.key && vault == index.vault && yesOwner /= owner)
+        checkOrderAccount key vault instrument factory yesOwner yesBalance
+        checkOrderAccount key vault instrument factory owner noBalance
+        pool <- fetch reserve
+        assertMsg "Reserve does not belong to this book"
+          (pool.key == index.key && pool.vault == vault && pool.creator == index.creator &&
+           pool.terms == index.terms && pool.createdAt == index.marketCreatedAt &&
+           pool.factory == factory && pool.assetDecimals == index.assetDecimals)
+        reserveBacking <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") (optionalHoldings pool.cash)
+        assertMsg "Reserve backing does not equal complete sets" (reserveBacking == intToDecimal pool.completeSets)
+        exercise reserve Archive
+        let yesTaker = plan.takerId == yes.orderId
+        let takerTerms = if yesTaker then yes.feeTerms else feeTerms
+        settled <- if side == Buy then do
+          assertMsg "Complete-set supply limit reached" (plan.quantity <= 9223372036854775807 - pool.completeSets)
+          y <- mintLeg index yes plan.yesPrice plan.quantity yesTaker yesBalance index.fees pool.cash (intToDecimal pool.completeSets) extraArgs
+          n <- mintLeg index this plan.noPrice plan.quantity (not yesTaker) noBalance y.pool y.reserveCash
+            (intToDecimal pool.completeSets + y.movement.tradeCost) extraArgs
+          assertMsg "Mint must add exactly one collateral unit per pair"
+            (y.movement.tradeCost + n.movement.tradeCost == intToDecimal plan.quantity)
+          nextReserve <- create pool with completeSets = pool.completeSets + plan.quantity; cash = n.reserveCash
+          yesLot <- create PositionLot with key; vault; owner = yesOwner; yes = plan.quantity; no = 0
+          noLot <- create PositionLot with key; vault; owner; yes = 0; no = plan.quantity
+          exercise yesOrder Archive
+          yesNext <- if plan.yesRemaining == 0 then do
+            assertMsg "Completed YES buy must have no remaining escrow" (y.remainingCash == None)
+            pure None
+            else do
+              cash <- case y.remainingCash of Some cid -> pure cid; None -> abort "Partial buy requires escrow"
+              cid <- create yes with
+                quantity = plan.yesRemaining; backing = CashEscrow cash
+                takerNotional = y.movement.nextState.takerNotional; paidFee = y.movement.nextState.paidFee
+              pure (Some cid)
+          noNext <- if plan.noRemaining == 0 then do
+            assertMsg "Completed NO buy must have no remaining escrow" (n.remainingCash == None)
+            pure None
+            else do
+              cash <- case n.remainingCash of Some cid -> pure cid; None -> abort "Partial buy requires escrow"
+              cid <- create this with
+                quantity = plan.noRemaining; backing = CashEscrow cash
+                takerNotional = n.movement.nextState.takerNotional; paidFee = n.movement.nextState.paidFee
+              pure (Some cid)
+          pure SettledComplement with
+            reserve = nextReserve; pool = n.pool; balances = [y.balance, n.balance]
+            positions = [yesLot, noLot]; successors = optionalHoldings yesNext ++ optionalHoldings noNext
+            feeAmount = y.movement.feeCharged + n.movement.feeCharged
+            yesCredit = y.movement.refund; noCredit = n.movement.refund
+          else do
+            assertMsg "Merge exceeds reserved complete sets" (plan.quantity <= pool.completeSets)
+            let yesGross = plan.yesPrice * intToDecimal plan.quantity
+            let noGross = plan.noPrice * intToDecimal plan.quantity
+            yesMove <- checkedFee (Fees.sellFillFunding yes.feeTerms yes.takerNotional yes.paidFee yesGross yesTaker)
+            noMove <- checkedFee (Fees.sellFillFunding feeTerms takerNotional paidFee noGross (not yesTaker))
+            let fee = yesMove.accrual.charge + noMove.accrual.charge
+            let held = intToDecimal pool.completeSets
+            collected <- MarketFees.collectFees vault instrument factory index.assetDecimals index.fees fee pool.cash held extraArgs
+            (yesNextBalance, afterYes) <- credit yesBalance yesMove.netProceeds collected.remainingCash (held - fee) extraArgs
+            (noNextBalance, afterNo) <- credit noBalance noMove.netProceeds afterYes (held - fee - yesMove.netProceeds) extraArgs
+            let left = held - intToDecimal plan.quantity
+            actual <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") (optionalHoldings afterNo)
+            assertMsg "Merge must release exactly one collateral unit per pair" (actual == left)
+            nextReserve <- create pool with completeSets = pool.completeSets - plan.quantity; cash = afterNo
+            exercise yesOrder Archive
+            yesNext <- if plan.yesRemaining == 0 then pure None else do
+              cid <- create yes with
+                quantity = plan.yesRemaining
+                takerNotional = yesMove.accrual.takerNotional; paidFee = yesMove.accrual.paidFee
+              pure (Some cid)
+            noNext <- if plan.noRemaining == 0 then pure None else do
+              cid <- create this with
+                quantity = plan.noRemaining
+                takerNotional = noMove.accrual.takerNotional; paidFee = noMove.accrual.paidFee
+              pure (Some cid)
+            pure SettledComplement with
+              reserve = nextReserve; pool = collected.pool; balances = [yesNextBalance, noNextBalance]
+              positions = []; successors = optionalHoldings yesNext ++ optionalHoldings noNext
+              feeAmount = fee; yesCredit = yesMove.netProceeds; noCredit = noMove.netProceeds
+        refs <- mapA referenceFor settled.successors
+        exercise book Archive
+        next <- create index with
+          orders = filter (\r -> r.order /= yesOrder && r.order /= self) index.orders ++ refs
+          fees = settled.pool
+        now <- getTime
+        receipt <- create ComplementFill with
+          key; vault; yesOwner; noOwner = owner; instrument; plan; executedAt = now
+          feeTerms = takerTerms; feeAmount = settled.feeAmount
+          yesCredit = settled.yesCredit; noCredit = settled.noCredit
+        pure ComplementResult with
+          book = next; decision = Matching.Complement plan; reserve = Some settled.reserve
+          balances = settled.balances; positions = settled.positions; receipt = Some receipt
+
+    -- | Inputs: live book/market and the one owner's refund account. Rejects
+    -- anything except the recomputed newer complementary self-cross. Result:
+    -- backing fully restored and that reference removed, with no receipt.
+    postconsuming choice LimitOrder_CancelComplementSelfTrade : ComplementResult
+      with
+        book : ContractId OrderBook
+        market : ContractId BinaryMarket
+        balance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault
+      do
+        index <- fetch book
+        checkTrading index market
+        snapshot <- matchingSnapshot index
+        decision <- case Matching.planComplement index.terms.priceTick index.terms.quantityLot side snapshot of
+          Right value@(Matching.CancelComplementSelfTrade newer) | newer == orderId -> pure value
+          _ -> abort "Only the newer best complementary self-cross may be cancelled"
+        assertMsg "Self-trade order must be indexed" (any (\r -> r.order == self) index.orders)
+        checkOrderAccount key vault instrument factory owner balance
+        released <- releaseBacking this (if side == Buy then Some balance else None) extraArgs
+        exercise book Archive
+        next <- create index with orders = filter (\r -> r.order /= self) index.orders
+        pure ComplementResult with
+          book = next; decision; reserve = None; receipt = None
+          balances = [case released.balance of Some cid -> cid; None -> balance]
+          positions = optionalHoldings released.position
+
     -- | Inputs: buy refund account (None for a sell), registry context.
     -- Rejects: missing/wrong account, unexpected sell account, invalid backing
     -- or missing owner/vault authority. Result: exact collateral refund or a
@@ -715,3 +960,63 @@ validOrderFeeHistory order =
 -- as a transaction abort. Result: validated funding/movement; no ledger effect.
 checkedFee : Either Text a -> Update a
 checkedFee value = case value of Right result -> pure result; Left message -> abort message
+
+-- | Settlement outputs shared by the mint and merge branches.
+data SettledComplement = SettledComplement with
+    reserve : ContractId MarketReserve
+    pool : MarketFees.FeePoolState
+    balances : [ContractId AssetBalance]
+    positions : [ContractId PositionLot]
+    successors : [ContractId LimitOrder]
+    feeAmount : Decimal
+    yesCredit : Decimal
+    noCredit : Decimal
+
+data MintLeg = MintLeg with
+    movement : Fees.BuyFeeMovement
+    reserveCash : Optional (ContractId H.Holding)
+    pool : MarketFees.FeePoolState
+    balance : ContractId AssetBalance
+    remainingCash : Optional (ContractId H.Holding)
+
+-- | Inputs: book, one signed buy, its execution price, the fill quantity and
+-- role, its owner's account, the current fee pool and the reserve holding with
+-- its recorded amount. Errors: misbacked escrow, invalid fee movement or
+-- registry outputs. Result: the trade cost moved into the reserve holding, the
+-- taker fee into the pool, the refund to the owner and the exact remaining
+-- escrow. Example: escrow 1.954875, cost 1.80, fee 0.0045, refund 0.150375.
+mintLeg : OrderBook -> LimitOrder -> Decimal -> Int -> Bool -> ContractId AssetBalance -> MarketFees.FeePoolState -> Optional (ContractId H.Holding) -> Decimal -> ExtraArgs -> Update MintLeg
+mintLeg book order price quantity isTaker balance pool reserveCash reserveAmount extraArgs = do
+  cash <- case order.backing of CashEscrow cid -> pure cid; _ -> abort "Mint requires buy cash escrow"
+  funding <- checkedFee (Fees.buyFunding order.feeTerms (buyFeeState order))
+  let asset = H.InstrumentId order.instrument.admin order.instrument.id
+  let vaultAccount = H.Account (Some order.vault) None ""
+  total <- holdingTotal asset vaultAccount [cash]
+  assertMsg "Buy escrow amount is incorrect" (total == funding.totalEscrow)
+  movement <- checkedFee (Fees.buyFillFunding order.feeTerms (buyFeeState order) price quantity isTaker)
+  intent <- transferIntent order.vault order.vault (reserveAmount + movement.tradeCost)
+    (optionalHoldings reserveCash ++ [cash]) extraArgs
+  moved <- transferExact book.factory order.instrument intent
+  nextReserve <- exactlyOne moved.received
+  let afterCost = total - movement.tradeCost
+  afterCostCash <- canonicalOptional afterCost moved.change
+  collected <- MarketFees.collectFees order.vault order.instrument book.factory book.assetDecimals pool
+    movement.feeCharged afterCostCash afterCost extraArgs
+  let afterFee = afterCost - movement.feeCharged
+  (nextBalance, remainingCash) <- if movement.refund > 0.0 then do
+    refunded <- exercise balance AssetBalance_Repartition with
+      otherCash = collected.remainingCash; otherAmount = afterFee; delta = movement.refund; extraArgs
+    pure (refunded.balance, refunded.otherCash)
+    else pure (balance, collected.remainingCash)
+  left <- holdingTotal asset vaultAccount (optionalHoldings remainingCash)
+  assertMsg "Remaining buy escrow is incorrect" (left == movement.funding.totalEscrow)
+  pure MintLeg with movement; reserveCash = Some nextReserve; pool = collected.pool; balance = nextBalance; remainingCash
+
+-- | Inputs: owner account, credit, source holding and its recorded amount.
+-- Result: the account successor and the source change. A zero credit keeps
+-- both unchanged, because custody rejects zero transfers.
+credit : ContractId AssetBalance -> Decimal -> Optional (ContractId H.Holding) -> Decimal -> ExtraArgs -> Update (ContractId AssetBalance, Optional (ContractId H.Holding))
+credit balance amount source sourceAmount extraArgs = if amount <= 0.0 then pure (balance, source) else do
+  moved <- exercise balance AssetBalance_Repartition with
+    otherCash = source; otherAmount = sourceAmount; delta = amount; extraArgs
+  pure (moved.balance, moved.otherCash)

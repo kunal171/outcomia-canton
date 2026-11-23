@@ -1,0 +1,215 @@
+-- | Complementary (complete-set) settlement against real harness holdings.
+-- Each fill is reconciled with SettlementTest.assertConserved: every one of the
+-- fixture's 10 collateral units stays in exactly one account, escrow, reserve,
+-- fee pool or wallet, and YES/NO supply equals the reserve's complete sets.
+module Outcomia.ComplementSettlementTest where
+
+import Daml.Script
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.FeeCollectionTest qualified as FC
+import Outcomia.Fees qualified as F
+import Outcomia.Matching qualified as M
+import Outcomia.Orders
+import Outcomia.OrdersTest qualified as O
+import Outcomia.Positions
+import Outcomia.PositionsTest qualified as P
+import Outcomia.SettlementTest qualified as S
+import Outcomia.TokenHarness (FactoryMode(..))
+import Outcomia.Types
+
+-- | Zero-fee configuration over the shared settlement fixture: Alice holds 5
+-- available; Bob holds 2 available plus one lot of 3 YES and 3 NO.
+zeroFee : S.Fixture -> FC.Config
+zeroFee ledger = FC.Config with ledger; policy = ledger.orders.positions.protocol; revision = 0; rate = 0
+
+placeBuy : FC.Config -> Party -> ContractId OrderBook -> ContractId AssetBalance -> Outcome -> Decimal -> Int -> Script PlacementResult
+placeBuy f owner book balance outcome price quantity = do
+  let p = f.ledger.orders.positions
+  let a = p.custody.asset
+  submit (actAs owner <> readAs [a.operator, a.issuer]) do
+    exerciseCmd book OrderBook_PlaceBuy with
+      owner; market = p.market; balance; outcome; price; quantity; extraArgs = C.registryContext
+      feePolicy = f.policy; expectedFeeRevision = f.revision; expectedFeeTerms = F.FeeTerms f.rate 6; eligibility = None
+
+placeSell : FC.Config -> Party -> ContractId OrderBook -> [ContractId PositionLot] -> Outcome -> Decimal -> Int -> Script PlacementResult
+placeSell f owner book positions outcome price quantity = do
+  let p = f.ledger.orders.positions
+  let a = p.custody.asset
+  submit (actAs owner <> readAs [a.operator, a.issuer]) do
+    exerciseCmd book OrderBook_PlaceSell with
+      owner; market = p.market; positions; outcome; price; quantity
+      feePolicy = f.policy; expectedFeeRevision = f.revision; expectedFeeTerms = F.FeeTerms f.rate 6; eligibility = None
+
+matchCommand : FC.Config -> ContractId OrderBook -> ContractId MarketReserve -> OrderSide -> ContractId AssetBalance -> ContractId AssetBalance -> Commands ComplementResult
+matchCommand f book reserve side yesBalance noBalance =
+  exerciseCmd book OrderBook_MatchComplement with
+    market = f.ledger.orders.positions.market; reserve; side; yesBalance; noBalance
+    extraArgs = C.registryContext; yesEligibility = None; noEligibility = None
+
+matcher : FC.Config -> Party
+matcher f = f.ledger.orders.positions.custody.asset.operator
+
+matcherReads : FC.Config -> [Party]
+matcherReads f = let c = f.ledger.orders.positions.custody in [c.vault, c.asset.issuer]
+
+complement : FC.Config -> ContractId OrderBook -> ContractId MarketReserve -> OrderSide -> ContractId AssetBalance -> ContractId AssetBalance -> Script ComplementResult
+complement f book reserve side yesBalance noBalance =
+  submit (actAs (matcher f) <> readAs (matcherReads f)) (matchCommand f book reserve side yesBalance noBalance)
+
+loadReceipt : FC.Config -> ComplementResult -> Script ComplementFill
+loadReceipt f result = case result.receipt of
+  Some cid -> do
+    found <- queryContractId f.ledger.orders.positions.custody.vault cid
+    case found of Some value -> pure value; None -> abort "Expected live receipt"
+  None -> abort "Expected a receipt"
+
+fillParts : ComplementResult -> Script (M.ComplementPlan, ContractId MarketReserve, ContractId AssetBalance, ContractId AssetBalance)
+fillParts result = case (result.decision, result.reserve, result.balances) of
+  (M.Complement plan, Some reserve, [yes, no]) -> pure (plan, reserve, yes, no)
+  _ -> abort "Expected a complementary fill"
+
+freeOf : FC.Config -> ContractId AssetBalance -> Script Decimal
+freeOf f cid = do
+  value <- S.loadBalance f.ledger cid
+  pure value.available
+
+lotOf : FC.Config -> ContractId PositionLot -> Script (Party, Int, Int)
+lotOf f cid = do
+  found <- queryContractId f.ledger.orders.positions.custody.vault cid
+  case found of
+    Some lot -> pure (lot.owner, lot.yes, lot.no)
+    None -> abort "Expected live position lot"
+
+conserved : FC.Config -> ContractId MarketReserve -> ContractId OrderBook -> Script ()
+conserved f reserve book = S.assertConserved (f.ledger with reserve) book
+
+-- | Older NO buy (Bob, maker) and newer YES buy (Alice, taker) mint pairs.
+mintSetup : FC.Config -> Decimal -> Int -> Decimal -> Int -> Script (ContractId OrderBook, ContractId AssetBalance, ContractId AssetBalance, ContractId LimitOrder)
+mintSetup f noPrice noQty yesPrice yesQty = do
+  let a = f.ledger.orders.positions.custody.asset
+  bid <- placeBuy f a.bob f.ledger.orders.book f.ledger.sellerBalance No noPrice noQty
+  bobBalance <- O.requireBalance bid
+  ask <- placeBuy f a.alice bid.book f.ledger.buyerBalance Yes yesPrice yesQty
+  aliceBalance <- O.requireBalance ask
+  pure (ask.book, aliceBalance, bobBalance, bid.order)
+
+testMintAtMakerPriceWithPartialMaker : Script ()
+testMintAtMakerPriceWithPartialMaker = script do
+  f <- zeroFee <$> S.setup Good
+  let a = f.ledger.orders.positions.custody.asset
+  (book, alice, bob, _) <- mintSetup f 0.40 5 0.65 3
+  result <- complement f book f.ledger.reserve Buy alice bob
+  (plan, reserve, aliceNext, bobNext) <- fillParts result
+  assert (plan.yesPrice == 0.60 && plan.noPrice == 0.40 && plan.quantity == 3 && plan.noRemaining == 2)
+  -- Alice locked 1.95 and is refunded the 0.15 improvement; Bob's 2.00 lock
+  -- pays 1.20 and 0.80 stays in escrow for the 2 remaining contracts.
+  aliceLeft <- freeOf f aliceNext
+  bobLeft <- freeOf f bobNext
+  assert (aliceLeft == 3.20 && bobLeft == 0.0)
+  pool <- P.loadReserve f.ledger.orders.positions reserve
+  assert (pool.completeSets == 6)
+  lots <- mapA (lotOf f) result.positions
+  assert (lots == [(a.alice, 3, 0), (a.bob, 0, 3)])
+  index <- O.loadBook f.ledger.orders result.book
+  assert (length index.orders == 1 && index.fees.amount == 0.0)
+  receipt <- loadReceipt f result
+  assert (receipt.yesOwner == a.alice && receipt.noOwner == a.bob && receipt.yesCredit == 0.15 && receipt.noCredit == 0.0)
+  conserved f reserve result.book
+
+testMintChargesTakerFeeOnly : Script ()
+testMintChargesTakerFeeOnly = script do
+  f <- FC.setup Good 0.01
+  (book, alice, bob, _) <- mintSetup f 0.40 4 0.65 3
+  result <- complement f book f.ledger.reserve Buy alice bob
+  (_, reserve, aliceNext, bobNext) <- fillParts result
+  -- Taker: 1.954875 escrow = 1.80 cost + 0.0045 fee + 0.150375 refund.
+  -- Maker: 1.604 escrow = 1.20 cost + 0.003 released + 0.401 remaining escrow.
+  aliceLeft <- freeOf f aliceNext
+  bobLeft <- freeOf f bobNext
+  assert (aliceLeft == 3.1955 && bobLeft == 0.399)
+  index <- O.loadBook f.ledger.orders result.book
+  assert (index.fees.amount == 0.0045)
+  receipt <- loadReceipt f result
+  assert (receipt.feeAmount == 0.0045 && receipt.feeTerms == F.FeeTerms 25 6)
+  conserved f reserve result.book
+
+-- | Alice splits 2 sets so both owners hold NO and YES. Bob's YES sell (maker)
+-- rests first; Alice's NO sell (taker) merges with it.
+mergeSetup : FC.Config -> Script (ContractId OrderBook, ContractId MarketReserve, ContractId AssetBalance, ContractId AssetBalance)
+mergeSetup f = do
+  let p = f.ledger.orders.positions
+  let a = p.custody.asset
+  split <- submit (actAs a.alice <> readAs [a.operator, a.issuer]) do
+    exerciseCmd f.ledger.reserve MarketReserve_Split with
+      owner = a.alice; market = p.market; balance = f.ledger.buyerBalance; quantity = 2; extraArgs = C.registryContext; eligibility = None
+  ask <- placeSell f a.bob f.ledger.orders.book [f.ledger.position] Yes 0.45 3
+  bid <- placeSell f a.alice ask.book [split.position] No 0.50 2
+  pure (bid.book, split.reserve, split.balance, f.ledger.sellerBalance)
+
+testMergeAtMakerPrice : Script ()
+testMergeAtMakerPrice = script do
+  f <- zeroFee <$> S.setup Good
+  (book, reserve, alice, bob) <- mergeSetup f
+  result <- complement f book reserve Sell bob alice
+  (plan, nextReserve, bobNext, aliceNext) <- fillParts result
+  assert (plan.yesPrice == 0.45 && plan.noPrice == 0.55 && plan.quantity == 2 && plan.yesRemaining == 1)
+  bobLeft <- freeOf f bobNext
+  aliceLeft <- freeOf f aliceNext
+  assert (bobLeft == 2.90 && aliceLeft == 4.10)
+  pool <- P.loadReserve f.ledger.orders.positions nextReserve
+  assert (pool.completeSets == 3 && null result.positions)
+  index <- O.loadBook f.ledger.orders result.book
+  assert (length index.orders == 1)
+  conserved f nextReserve result.book
+
+testMergeChargesTakerFeeOnly : Script ()
+testMergeChargesTakerFeeOnly = script do
+  f <- FC.setup Good 0.01
+  (book, reserve, alice, bob) <- mergeSetup f
+  result <- complement f book reserve Sell bob alice
+  (_, nextReserve, bobNext, aliceNext) <- fillParts result
+  -- Maker Bob receives 0.90; taker Alice 1.10 less a 0.00275 fee.
+  bobLeft <- freeOf f bobNext
+  aliceLeft <- freeOf f aliceNext
+  assert (bobLeft == 2.90 && aliceLeft == 4.09725)
+  index <- O.loadBook f.ledger.orders result.book
+  assert (index.fees.amount == 0.00275)
+  conserved f nextReserve result.book
+
+testSelfCrossCancelsNewer : Script ()
+testSelfCrossCancelsNewer = script do
+  f <- zeroFee <$> S.setup Good
+  let a = f.ledger.orders.positions.custody.asset
+  yes <- placeBuy f a.bob f.ledger.orders.book f.ledger.sellerBalance Yes 0.60 1
+  afterYes <- O.requireBalance yes
+  no <- placeBuy f a.bob yes.book afterYes No 0.50 1
+  afterNo <- O.requireBalance no
+  result <- complement f no.book f.ledger.reserve Buy afterNo afterNo
+  assert (result.decision == M.CancelComplementSelfTrade 2 && result.receipt == None && result.reserve == None)
+  restored <- case result.balances of [cid] -> freeOf f cid; _ -> abort "Expected one account"
+  assert (restored == 1.40)
+  index <- O.loadBook f.ledger.orders result.book
+  assert (map (\r -> r.orderId) index.orders == [1])
+  conserved f f.ledger.reserve result.book
+
+testUncrossedPairRejected : Script ()
+testUncrossedPairRejected = script do
+  f <- zeroFee <$> S.setup Good
+  (book, alice, bob, _) <- mintSetup f 0.40 1 0.55 1
+  submitMustFail (actAs (matcher f) <> readAs (matcherReads f)) (matchCommand f book f.ledger.reserve Buy alice bob)
+  conserved f f.ledger.reserve book
+
+testStaleReserveRejected : Script ()
+testStaleReserveRejected = script do
+  f <- zeroFee <$> S.setup Good
+  (book, _, alice, bob) <- mergeSetup f
+  -- The split consumed the fixture's reserve; settling against it must fail.
+  submitMustFail (actAs (matcher f) <> readAs (matcherReads f)) (matchCommand f book f.ledger.reserve Sell bob alice)
+
+testTradersCannotMatch : Script ()
+testTradersCannotMatch = script do
+  f <- zeroFee <$> S.setup Good
+  let a = f.ledger.orders.positions.custody.asset
+  (book, alice, bob, _) <- mintSetup f 0.40 5 0.65 3
+  submitMustFail (actAs a.alice <> readAs (a.operator :: matcherReads f)) (matchCommand f book f.ledger.reserve Buy alice bob)

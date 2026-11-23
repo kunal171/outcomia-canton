@@ -47,26 +47,95 @@ data MatchDecision = NoMatch | CancelSelfTrade Int | Fill FillPlan
 -- projection. Errors: invalid increments, >128 entries, duplicate/nonpositive
 -- IDs, off-tick prices or nonpositive/off-lot quantities. Result: no crossing,
 -- one self-trade cancellation request or one exact fill plan. Never skips the
--- best order to find a different owner, and never matches YES against NO.
+-- best order to find a different owner, and never matches YES against NO
+-- (complete-set fills are planComplement's job).
 planFill : Decimal -> Int -> Outcome -> [MatchOrder] -> Either Text MatchDecision
-planFill tick lot outcome orders
+planFill tick lot outcome orders = do
+  checkSnapshot tick lot orders
+  pure $ case (bestOrder orders outcome Buy, bestOrder orders outcome Sell) of
+    (Some buy, Some sell)
+      | buy.price < sell.price -> NoMatch
+      | buy.owner == sell.owner -> CancelSelfTrade (max buy.orderId sell.orderId)
+      | otherwise -> Fill (fillTerms buy sell)
+    _ -> NoMatch
+
+-- | Inputs: admitted tick and lot and a bounded book projection. Errors:
+-- invalid increments, >128 entries, duplicate/nonpositive IDs, off-tick prices
+-- or nonpositive/off-lot quantities. Shared by direct and complementary plans.
+checkSnapshot : Decimal -> Int -> [MatchOrder] -> Either Text ()
+checkSnapshot tick lot orders
   | tick <= 0.0 || tick >= 1.0 || lot <= 0 = Left "Invalid market increments"
   | length orders > 128 = Left "Matching snapshot exceeds 128 orders"
   | not (unique (map (\o -> o.orderId) orders)) = Left "Duplicate acceptance IDs"
   | not (all valid orders) = Left "Invalid order in matching snapshot"
-  | otherwise = case (best Buy, best Sell) of
-      (Some buy, Some sell)
-        | buy.price < sell.price -> Right NoMatch
-        | buy.owner == sell.owner -> Right (CancelSelfTrade (max buy.orderId sell.orderId))
-        | otherwise -> Right (Fill (fillTerms buy sell))
-      _ -> Right NoMatch
+  | otherwise = Right ()
   where
     valid order = order.orderId > 0 && validMatchPrice tick order.price &&
       order.quantity > 0 && order.quantity % lot == 0
-    best side = case sortOn (\o -> priorityKey side o.price o.orderId)
-        (filter (\o -> o.outcome == outcome && o.side == side) orders) of
-      [] -> None
-      first :: _ -> Some first
+
+-- | Inputs: a checked snapshot and one queue. Result: its best-price/FIFO head.
+bestOrder : [MatchOrder] -> Outcome -> OrderSide -> Optional MatchOrder
+bestOrder orders outcome side =
+  case sortOn (\o -> priorityKey side o.price o.orderId)
+      (filter (\o -> o.outcome == outcome && o.side == side) orders) of
+    [] -> None
+    first :: _ -> Some first
+
+-- | One complete-set fill between the YES and NO heads of the same side. Side
+-- Buy mints new pairs; side Sell merges (burns) them. The maker (lower
+-- acceptance ID) executes at its own limit and the taker at 1 minus it, so the
+-- two execution prices always sum to exactly one collateral unit.
+data ComplementPlan = ComplementPlan with
+    side : OrderSide
+    yesId : Int
+    noId : Int
+    makerId : Int
+    takerId : Int
+    yesPrice : Decimal
+    noPrice : Decimal
+    quantity : Int
+    yesRemaining : Int
+    noRemaining : Int
+  deriving (Eq, Show)
+
+data ComplementDecision = NoComplement | CancelComplementSelfTrade Int | Complement ComplementPlan
+  deriving (Eq, Show)
+
+-- | Inputs: admitted tick, lot, side and the complete bounded book projection.
+-- Errors: as planFill. Result: no crossing, a request to cancel the newer of
+-- two same-owner heads, or one exact complete-set plan. Buys cross when their
+-- limits sum to at least one; sells when they sum to at most one. Example:
+-- older NO buy 5 at 0.40 and YES buy 3 at 0.65 mint 3 pairs, YES at 0.60.
+planComplement : Decimal -> Int -> OrderSide -> [MatchOrder] -> Either Text ComplementDecision
+planComplement tick lot side orders = do
+  checkSnapshot tick lot orders
+  pure $ case (bestOrder orders Yes side, bestOrder orders No side) of
+    (Some yes, Some no)
+      | not (crosses (yes.price + no.price)) -> NoComplement
+      | yes.owner == no.owner -> CancelComplementSelfTrade (max yes.orderId no.orderId)
+      | otherwise -> Complement (complementTerms side yes no)
+    _ -> NoComplement
+  where
+    crosses total = if side == Buy then total >= 1.0 else total <= 1.0
+
+-- | Inputs: the validated YES and NO heads of one side, different owners.
+-- Result: the smaller quantity at the maker's price and its complement.
+complementTerms : OrderSide -> MatchOrder -> MatchOrder -> ComplementPlan
+complementTerms side yes no =
+  let filled = min yes.quantity no.quantity
+      yesIsMaker = yes.orderId < no.orderId
+      makerPrice = if yesIsMaker then yes.price else no.price
+  in ComplementPlan with
+    side
+    yesId = yes.orderId
+    noId = no.orderId
+    makerId = min yes.orderId no.orderId
+    takerId = max yes.orderId no.orderId
+    yesPrice = if yesIsMaker then makerPrice else 1.0 - makerPrice
+    noPrice = if yesIsMaker then 1.0 - makerPrice else makerPrice
+    quantity = filled
+    yesRemaining = yes.quantity - filled
+    noRemaining = no.quantity - filled
 
 -- | Inputs: side, valid sub-unit price and acceptance ID. Result: sortable key
 -- with highest buys/lowest sells first, then FIFO. Ledger timestamps and input

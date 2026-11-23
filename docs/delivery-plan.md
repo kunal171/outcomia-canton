@@ -27,7 +27,7 @@ The shared wallet gateway, binary lifecycle and [approved asset transfers](colla
 are locally tested. Collateral support includes dedicated-vault asset balances
 and [complete-set split/merge](complete-set-positions.md). [Resting orders](binary-limit-orders.md)
 add funded placement and cancellation. The [matching planner](binary-matching.md) defines selection, partial fills,
-maker-price execution and cancel-newer self-trade behavior. [Atomic settlement](binary-settlement.md) now applies one fill or self-trade
+maker-price execution and cancel-newer self-trade behavior. [Complementary matching](binary-complementary-matching.md) also pairs YES and NO orders on the same side: two buys mint a complete set and two sells merge one, as on Solana. [Atomic settlement](binary-settlement.md) now applies one fill or self-trade
 cancellation, with signed-order delegation and actual token transfers. The [fee rules and pure arithmetic](fee-accounting.md) are locally tested; fee
 policy, funded fees, atomic collection and operator withdrawal are also checked.
 [Resolution proposals, corrections and delayed finalization](binary-resolution.md)
