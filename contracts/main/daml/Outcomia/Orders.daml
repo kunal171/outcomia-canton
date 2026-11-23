@@ -423,6 +423,32 @@ template OrderBook
           exercise yesRef.order LimitOrder_SettleComplementYes with
             book = self; market; reserve; noOrder = noRef.order; yesBalance; noBalance; extraArgs
 
+    -- | Inputs: current market, an indexed order, the market's current policy
+    -- contract, the owner's account for a buy refund and registry context.
+    -- Rejects public markets, closed/cutoff markets, foreign/unindexed orders
+    -- or a policy that still admits the owner. Result: exactly what the owner's
+    -- own cancellation gives: order archived, index entry removed, backing
+    -- returned to the owner. Lets the operator clear a departed member's
+    -- resting orders, which can no longer fill and would block the queue.
+    choice OrderBook_CancelIneligible : CancellationResult
+      with
+        market : ContractId BinaryMarket
+        order : ContractId LimitOrder
+        policy : ContractId MF.EligibilityPolicy
+        balance : Optional (ContractId AssetBalance)
+        extraArgs : ExtraArgs
+      controller key.operator
+      do
+        checkTrading this market
+        current <- fetch order
+        let reference = OrderReference current.orderId order current.outcome current.side current.price
+        assertMsg "Order does not belong to this book"
+          (current.key == key && current.vault == vault && current.instrument == terms.collateral &&
+           current.factory == factory && reference `elem` orders)
+        released <- exercise order LimitOrder_ReleaseIneligible with market; policy; balance; extraArgs
+        next <- create this with orders = filter (\r -> r.order /= order) orders
+        pure CancellationResult with book = next; released
+
     -- | Inputs: owner, exact active order reference, optional buy refund account
     -- and registry context. Rejects: foreign/unindexed order, another owner or
     -- wrong refund account. Result: order archived, index entry removed, backing
@@ -796,6 +822,28 @@ template LimitOrder
           book = next; decision; reserve = None; receipt = None
           balances = [case released.balance of Some cid -> cid; None -> balance]
           positions = optionalHoldings released.position
+
+    -- | Inputs: the order's restricted market, its current policy contract,
+    -- the owner's refund account (buys) and registry context. Rejects public
+    -- markets, a foreign market or policy, or a policy that still admits the
+    -- owner. Result: exact release to the owner; the book removes the entry.
+    choice LimitOrder_ReleaseIneligible : ReleasedBacking
+      with
+        market : ContractId BinaryMarket
+        policy : ContractId MF.EligibilityPolicy
+        balance : Optional (ContractId AssetBalance)
+        extraArgs : ExtraArgs
+      controller key.operator, vault
+      do
+        current <- fetch market
+        assertMsg "Market does not match this order"
+          (current.operator == key.operator && current.protocolName == key.protocolName &&
+           current.marketId == key.marketId && current.factory == key.scope)
+        expected <- case current.access of
+          Some ref -> pure ref
+          None -> abort "Public markets have no ineligible owners"
+        MF.requireExcluded policy expected owner
+        releaseBacking this balance extraArgs
 
     -- | Inputs: buy refund account (None for a sell), registry context.
     -- Rejects: missing/wrong account, unexpected sell account, invalid backing
