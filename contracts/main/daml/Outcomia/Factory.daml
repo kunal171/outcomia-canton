@@ -128,6 +128,7 @@ template InviteListPolicy
       view = MF.PolicyView with ref; kind = "invite-list"
       admit party _ _ = assertMsg "Party is not on this market's invite list"
         (party == manager || party `elem` parties)
+      excludes party = not (party == manager || party `elem` parties)
 
     -- | Inputs: replacement invitees. Result: a new revision with the same
     -- reference; removed parties can no longer place, split or be filled.

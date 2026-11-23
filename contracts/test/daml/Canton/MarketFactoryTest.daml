@@ -60,6 +60,7 @@ template ToyInviteList
     interface instance EligibilityPolicy for ToyInviteList where
       view = PolicyView with ref; kind = "invite-list"
       admit party _ _ = assertMsg "Party is not invited" (party `elem` parties)
+      excludes party = not (party `elem` parties)
 
 -- | Toy book: entry requires the market's stored policy to admit the trader.
 template ToyBook
