@@ -107,17 +107,22 @@ with per-owner enrollment is tracked separately (issue #21).
 
 ## Removal and matching
 
-1. On placement in a members-only club market, `LimitOrder` records the
-   placer's active `ClubMembership` contract ID.
-2. `OrderBook_MatchBest` fetches both orders' recorded memberships. If either
-   was archived (left or removed), the fill fails: removal and a concurrent fill
-   are ordered by the ledger, not by an off-ledger cache.
-3. Removal archives the membership and creates a `ClubRemoval`. A new
-   `OrderBook_CancelDeparted` choice (controller: operator) cancels an order
-   whose recorded membership is named in a `ClubRemoval`, releasing its backing
-   to the owner exactly like owner cancellation.
-4. A rejoined member gets a new membership; their old orders stay unfillable
-   and are cancelled the same way.
+Implemented on the club roster (Phase C replaced separate membership
+contracts):
+
+1. Placement and split in a members-only club market present the current
+   `Club` as eligibility proof; its roster must list the party.
+2. Every fill (`OrderBook_MatchBest`, `OrderBook_MatchComplement`) re-checks
+   both owners against the current `Club`. Each roster change archives the club
+   contract, so a removal and a concurrent fill are ordered by the ledger, not
+   by an off-ledger cache.
+3. `OrderBook_CancelIneligible` (controller: operator) clears a resting order
+   whose owner the current `Club` no longer lists, through the standard
+   `EligibilityPolicy.excludes` check. Backing returns to the owner exactly as
+   with owner cancellation, so a departed member cannot block the queue. On
+   Solana anyone may do this; on Canton strangers cannot see the order.
+4. A member who rejoins before the operator clears their orders is listed
+   again, so those orders become fillable again (as on Solana).
 5. Owner cancellation, withdrawal, merge and redemption never check membership.
 
 Splitting collateral into a complete set is an entry action and requires an
@@ -150,7 +155,7 @@ existing deployment gate until Phase F.
 | B — Factory | Standard package, `MarketKey.scope`, Outcomia factory, eligibility, invite lists; public creation unchanged | Create markets through the factory (policy shown, public or invite-only access), factory-admin close/propose, eligibility evidence on orders and splits | Existing binary tests unchanged; factory and UI command tests |
 | C — Clubs | `ClubRegistry`, `Club`, `ClubAdmin`, `ClubInvitation`, `ClubMembership`, club factory instances | Club pages: create, invite/accept/decline, members and roles, club market creation | Club lifecycle works without trading; negative authorization tests |
 | D — Lineage | Factory exercise → market evidence; LocalNet scripts | Market and club provenance shown from indexed data | CantonGrid M2 verified-tree and M3 declared-link acceptance |
-| E — Trading | Membership on orders, matching checks, `ClubRemoval`, `OrderBook_CancelDeparted`, club resolution | Membership-aware trading, departed-member state, club resolution | Removal/fill race, exit and multi-party disclosure tests |
+| E — Trading | Matching checks (done in B/C), `OrderBook_CancelIneligible` (done), club resolution (done via the club factory's admins) | Membership-aware trading, departed-member state, club resolution | Removal/fill race, exit and multi-party disclosure tests |
 | F — Harden | Club fee share, deployment, multi-outcome clubs | Remove the deployment gate after a wallet smoke test | Controlled-network acceptance |
 
 ## Acceptance tests (minimum)

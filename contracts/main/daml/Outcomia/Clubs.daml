@@ -133,6 +133,7 @@ template Club
           MF.CreateMarket -> assertMsg "Only club admins may create markets in this club"
             (marketPolicy == AnyMember || party `elem` admins)
           _ -> pure ()
+      excludes party = not (party `elem` members)
 
     -- | Admins choose who may create club markets.
     choice Club_SetMarketPolicy : ContractId Club

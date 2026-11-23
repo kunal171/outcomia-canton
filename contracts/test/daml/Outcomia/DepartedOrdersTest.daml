@@ -1,0 +1,121 @@
+-- | Clearing resting orders of parties who lost access to a restricted market
+-- (removed from a club or an invite list). Only the operator clears, only with
+-- the market's current policy proving the exclusion, and funds or contracts
+-- always return to the order owner exactly as the owner's own cancel would.
+module Outcomia.DepartedOrdersTest where
+
+import Canton.MarketFactory qualified as MF
+import DA.Assert ((===))
+import Daml.Script
+import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.Binary
+import Outcomia.Clubs
+import Outcomia.ClubsTest qualified as CT
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.EligibilityTest qualified as E
+import Outcomia.Factory
+import Outcomia.FactoryTest qualified as FT
+import Outcomia.Fees qualified as Fees
+import Outcomia.Orders
+import Outcomia.Positions
+import Outcomia.Types
+
+-- | A members-only club market where Alice (a member, 5.0 available) rests a
+-- buy of 2 YES at 0.40.
+data ClubBook = ClubBook with
+    f : CT.Fixture
+    club : ContractId Club
+    factory : ContractId OutcomiaMarketFactory
+    market : ContractId BinaryMarket
+    placed : PlacementResult
+  deriving (Eq, Show)
+
+clubBook : Bool -> Script ClubBook
+clubBook restricted = script do
+  f <- CT.setup
+  let a = f.custody.asset
+  funded <- C.deposit f.custody f.custody.balance 5.0 [toInterfaceContractId @H.Holding a.input]
+  club <- CT.admitWallet f f.created.club a.alice
+  value <- CT.clubValue f club
+  let marketAccess = if restricted then MF.Restricted value.ref else MF.Public
+  created <- CT.as f f.owner (CT.createMarket f f.created.factory f.owner club marketAccess)
+  let market = fromInterfaceContractId @BinaryMarket created.market
+      factory = fromInterfaceContractId @OutcomiaMarketFactory created.factory
+  [(book, _)] <- query @OrderBook f.custody.vault
+  placed <- CT.as f a.alice do
+    exerciseCmd book OrderBook_PlaceBuy with
+      owner = a.alice; market; balance = funded.balance; outcome = Yes; price = 0.4; quantity = 2
+      feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = Fees.FeeTerms 0 6
+      extraArgs = C.registryContext
+      eligibility = Some EligibilityProof with policy = toInterfaceContractId club; evidence = []
+  pure ClubBook with f; club; factory; market; placed
+
+clearCommand : ClubBook -> ContractId Club -> ContractId AssetBalance -> Commands CancellationResult
+clearCommand c club balance =
+  exerciseCmd c.placed.book OrderBook_CancelIneligible with
+    market = c.market; order = c.placed.order; policy = toInterfaceContractId club
+    balance = Some balance; extraArgs = C.registryContext
+
+operatorReads : CT.Fixture -> [Party]
+operatorReads f = let a = f.custody.asset in [f.custody.vault, a.issuer, a.alice, f.owner]
+
+test_operator_clears_a_removed_members_buy_and_refunds_it : Script ()
+test_operator_clears_a_removed_members_buy_and_refunds_it = script do
+  c <- clubBook True
+  let f = c.f
+      a = f.custody.asset
+      operator = CT.operatorOf f
+  Some balance <- pure c.placed.balance
+  -- While Alice is a member, nobody can clear her order.
+  submitMustFail (actAs operator <> readAs (operatorReads f)) (clearCommand c c.club balance)
+  removed <- CT.as f f.owner do
+    exerciseCmd c.club Club_RemoveMember with actor = f.owner; wallet = a.alice; factory = c.factory
+  -- The pre-removal club contract is archived, so it cannot be used either way.
+  submitMustFail (actAs operator <> readAs (operatorReads f)) (clearCommand c c.club balance)
+  -- Traders, including the club owner, cannot clear; only the operator can.
+  submitMustFail (actAs f.owner <> readAs (operator :: operatorReads f)) (clearCommand c removed.club balance)
+  result <- submit (actAs operator <> readAs (operatorReads f)) (clearCommand c removed.club balance)
+  Some refunded <- pure result.released.balance
+  Some account <- queryContractId f.custody.vault refunded
+  account.available === 5.0
+  Some next <- queryContractId f.custody.vault result.book
+  next.orders === []
+  None <- queryContractId @LimitOrder f.custody.vault c.placed.order
+  pure ()
+
+test_public_club_markets_have_no_ineligible_owners : Script ()
+test_public_club_markets_have_no_ineligible_owners = script do
+  c <- clubBook False
+  let f = c.f
+      a = f.custody.asset
+  Some balance <- pure c.placed.balance
+  removed <- CT.as f f.owner do
+    exerciseCmd c.club Club_RemoveMember with actor = f.owner; wallet = a.alice; factory = c.factory
+  submitMustFail (actAs (CT.operatorOf f) <> readAs (operatorReads f)) (clearCommand c removed.club balance)
+
+test_operator_clears_an_uninvited_sell_and_restores_the_lot : Script ()
+test_operator_clears_an_uninvited_sell_and_restores_the_lot = script do
+  e <- E.setup
+  let a = FT.asset e.base
+      vault = e.base.custody.vault
+  sellerSplit <- E.asParty e a.bob (E.split e a.bob e.reserve e.bobBalance 3 (E.proofFor e.list))
+  ask <- E.asParty e a.bob do
+    exerciseCmd e.book OrderBook_PlaceSell with
+      owner = a.bob; market = e.market; positions = [sellerSplit.position]; outcome = No
+      price = 0.55; quantity = 2; feePolicy = a.protocol; expectedFeeRevision = 0
+      expectedFeeTerms = Fees.FeeTerms 0 6; eligibility = E.proofFor e.list
+  let reads = [vault, a.issuer, a.bob, e.base.admin]
+      clear policy = exerciseCmd ask.book OrderBook_CancelIneligible with
+        market = e.market; order = ask.order; policy = toInterfaceContractId policy
+        balance = None; extraArgs = C.registryContext
+  submitMustFail (actAs a.operator <> readAs reads) (clear e.list)
+  reduced <- E.asParty e e.base.admin do
+    exerciseCmd e.list InviteList_Set with replacementParties = []
+  result <- submit (actAs a.operator <> readAs reads) (clear reduced)
+  -- The escrowed 2 NO come back as a lot; Bob again holds 3 YES and 3 NO in total.
+  Some lot <- pure result.released.position
+  Some restored <- queryContractId vault lot
+  (restored.owner, restored.yes, restored.no) === (a.bob, 0, 2)
+  lots <- query @PositionLot a.bob
+  (sum (map (\(_, l) -> l.yes) lots), sum (map (\(_, l) -> l.no) lots)) === (3, 3)

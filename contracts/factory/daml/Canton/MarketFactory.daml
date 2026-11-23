@@ -135,6 +135,11 @@ interface EligibilityPolicy where
   -- | Implementation check; abort to deny. Must not depend on the caller's
   -- knowledge of unrelated contracts.
   admit : Party -> EntryAction -> [ContractId EligibilityEvidence] -> Update ()
+  -- | True only when this policy contract itself proves the party has no
+  -- access for any entry action, whatever evidence it might present (for
+  -- example, a roster that no longer lists it). Evidence-based policies return
+  -- False. Lets an operator clear resting orders of parties who lost access.
+  excludes : Party -> Bool
 
   nonconsuming choice EligibilityPolicy_Check : ()
     with
@@ -244,6 +249,19 @@ checkEligibility policy expected party action evidence = do
   assertMsg "Eligibility policy does not match the market's reference"
     ((view contract).ref == expected)
   exercise policy EligibilityPolicy_Check with party; action; evidence
+
+-- | Inputs: the current policy, the market's stored reference and a party.
+-- Rejects a policy the market operator did not sign, a different reference,
+-- or a policy that does not prove the party excluded. No state change; the
+-- fetch makes a concurrent roster change conflict with the caller.
+requireExcluded : ContractId EligibilityPolicy -> PolicyRef -> Party -> Update ()
+requireExcluded policy expected party = do
+  contract <- fetch policy
+  assertMsg "Eligibility policy is not signed by the market operator"
+    (expected.operator `elem` signatory contract)
+  assertMsg "Eligibility policy does not match the market's reference"
+    ((view contract).ref == expected)
+  assertMsg "The policy still admits this party" (excludes contract party)
 
 -- | True when the terms restrict trading to a policy.
 restricted : Access -> Bool
