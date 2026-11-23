@@ -17,9 +17,12 @@ flowchart LR
   Canton --> Contracts[Canton contracts and services in this repository]
 ```
 
-The shared app uses `@console-wallet/dapp-sdk` 3.0.0's `consoleWallet` export and
-browser-extension approval. Loop uses `@fivenorth/loop-sdk` 0.16.0 and its native
-CIP-0103 bridge for hosted-wallet/QR approval. Console mobile QR is not enabled. Signing stays in
+Both wallets are used through the CIP-0103 dApp Standard provider interface:
+`status`/`getPrimaryAccount` for identity, `ledgerApi` for reads, `prepareExecute`
+with `txChanged` events for submission and the standard error codes. Loop uses
+`@fivenorth/loop-sdk` 0.16.0's native CIP-0103 provider for hosted-wallet/QR
+approval; the shared app adapts `@console-wallet/dapp-sdk` 3.0.0's
+`consoleWallet` (browser-extension approval) into the same provider. Console mobile QR is not enabled. Signing stays in
 the wallet; no signing keys or access tokens enter application session state.
 
 The configured CAIP-2 network, active network and account network must agree.
