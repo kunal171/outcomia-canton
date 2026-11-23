@@ -51,6 +51,11 @@ Implementations validate and map these terms to their own types.
   `EligibilityPolicy_Check` (controller: the policy's operator) asserts that a
   party may take an entry action (place, split or fill), optionally using
   evidence contracts the party presents (such as a club membership).
+  Its pure `excludes party` method is true only when the policy itself proves
+  the party has no access whatever evidence it presents (a roster that no
+  longer lists it); `requireExcluded` checks it so an operator can clear the
+  resting orders of parties who lost access. Evidence-based policies return
+  false.
 
 Access is `Public` or `Restricted policyRef`. A market stores the stable policy
 reference, and each entry action passes the current policy contract, whose view
