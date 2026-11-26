@@ -34,9 +34,10 @@ never identities.
 **Terms.** `MarketTerms` is the common core every implementation accepts:
 question, outcome labels and per-outcome criteria, invalid criteria, evidence
 requirements, rules URI and SHA-256, collateral instrument, trading cutoff,
-earliest resolution time, review delay, price tick and quantity lot. Binary
-markets have exactly two outcomes; multi-outcome implementations use more.
-Implementations validate and map these terms to their own types.
+earliest resolution time, review delay, price tick and quantity lot.
+Implementations validate and map these terms to their own types. Outcomia's
+factory accepts 2 to 8 outcomes: exactly `YES, NO` creates a binary market,
+any other list a multi-outcome market (`docs/multi-outcome-markets.md`).
 
 **Interfaces.**
 

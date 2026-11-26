@@ -1,0 +1,481 @@
+-- | Multi-outcome markets: 2 to 8 named outcomes, exactly one winner, or an
+-- invalid result that refunds an equal share to every outcome.
+--
+-- Locking Q collateral units mints Q contracts of every outcome; merging Q of
+-- every outcome returns Q units. After finalization a winning contract pays one
+-- unit and, for an invalid result, every contract pays 1/N. Quantities are
+-- whole multiples of the market lot L, and L/N is exact at the collateral's
+-- precision, so every refund is exact.
+--
+-- These markets are issued only by market factories (public or club), so the
+-- issuing factory's current admins close, propose and correct them, exactly as
+-- for binary factory markets. Binary templates are untouched; outcome IDs are
+-- zero-based indices into the fixed outcome list.
+module Outcomia.MultiOutcome where
+
+import DA.List (unique)
+import DA.Numeric qualified as Numeric
+import DA.Text qualified as T
+import DA.Time (addRelTime, seconds)
+import Canton.MarketFactory qualified as MF
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Outcomia.Assets (holdingTotal)
+import Outcomia.Binary (EligibilityProof(..))
+import Outcomia.Custody
+import Outcomia.ProtocolRoles qualified as Roles
+import Outcomia.Resolution (ResolutionEvidence, evidenceErrors)
+import Outcomia.Types
+import Outcomia.Validation (boundedText, validDigest)
+
+-- | Fixed when the market is created. One criterion per outcome, in order.
+data MultiTerms = MultiTerms with
+    question : Text
+    collateral : CollateralInstrument
+    outcomes : [Text]
+    outcomeCriteria : [Text]
+    invalidCriteria : Text
+    evidenceRequirements : Text
+    documentUri : Text
+    documentSha256 : Text
+    closeAt : Time
+    earliestResolutionAt : Optional Time
+    resolutionDelaySeconds : Int
+    priceTick : Decimal
+    quantityLot : Int
+  deriving (Eq, Show)
+
+-- | A winning outcome index, or invalid.
+data MultiResult = Winner Int | InvalidResult
+  deriving (Eq, Show)
+
+maxOutcomeCount : Int
+maxOutcomeCount = 8
+
+-- | Inputs: creation time and terms. Result: every detected problem.
+multiTermsErrors : Time -> MultiTerms -> [Text]
+multiTermsErrors createdAt terms =
+  [ message | (message, valid) <- checks, not valid ]
+  where
+    n = length terms.outcomes
+    checks =
+      [ ("Question must contain 1 to 500 characters", boundedText 500 terms.question)
+      , ("Collateral instrument ID is required and limited to 128 characters", boundedText 128 terms.collateral.id)
+      , ("Multi-outcome markets have 2 to 8 outcomes", n >= 2 && n <= maxOutcomeCount)
+      , ("Outcome labels must be unique and 1 to 64 characters",
+          all (boundedText 64) terms.outcomes && unique terms.outcomes)
+      , ("Each outcome needs one criterion of 1 to 4096 characters",
+          length terms.outcomeCriteria == n && all (boundedText 4096) terms.outcomeCriteria)
+      , ("Invalid-market criteria are required and limited to 4096 characters", boundedText 4096 terms.invalidCriteria)
+      , ("Evidence requirements are required and limited to 4096 characters", boundedText 4096 terms.evidenceRequirements)
+      , ("Rules URI must use ar:// or https:// and be limited to 512 characters",
+          boundedText 512 terms.documentUri &&
+          ((T.isPrefixOf "ar://" terms.documentUri && T.length terms.documentUri > 5) ||
+           (T.isPrefixOf "https://" terms.documentUri && T.length terms.documentUri > 8)))
+      , ("Rules hash must be lowercase SHA-256 hex", validDigest terms.documentSha256)
+      , ("Trading cutoff must be after creation", createdAt < terms.closeAt)
+      , ("Earliest resolution cannot precede trading cutoff", terms.closeAt <= earliest terms)
+      , ("Resolution delay must be 1 to 604800 seconds",
+          1 <= terms.resolutionDelaySeconds && terms.resolutionDelaySeconds <= 604800)
+      , ("Price tick must be greater than zero and less than one collateral unit",
+          0.0 < terms.priceTick && terms.priceTick < 1.0)
+      , ("Quantity lot must be positive", terms.quantityLot > 0)
+      ]
+
+-- | The earliest time a result may be proposed.
+earliest : MultiTerms -> Time
+earliest terms = case terms.earliestResolutionAt of
+  None -> terms.closeAt
+  Some timestamp -> timestamp
+
+-- | Inputs: lot, outcome count and asset decimals. Result: whether `lot/n` is
+-- exact at that precision, that is `lot × 10^decimals` divisible by `n`.
+-- Computed modulo `n`, so large lots cannot overflow.
+refundAligned : Int -> Int -> Int -> Bool
+refundAligned lot n decimals =
+  n > 0 && decimals >= 0 && ((lot % n) * (tenPowMod decimals n)) % n == 0
+
+tenPowMod : Int -> Int -> Int
+tenPowMod decimals n = foldl (\acc _ -> (acc * 10) % n) (1 % n) [1 .. decimals]
+
+-- | Exact collateral owed for `counts` contracts under a final result.
+multiPayout : MultiResult -> [Int] -> Decimal
+multiPayout result counts = case result of
+  Winner index -> case drop index counts of
+    value :: _ -> intToDecimal value
+    [] -> 0.0
+  InvalidResult -> sum (map (\c -> intToDecimal c / intToDecimal (length counts)) counts)
+
+validResult : Int -> MultiResult -> Bool
+validResult n result = case result of
+  Winner index -> index >= 0 && index < n
+  InvalidResult -> True
+
+-- | Public markets admit everyone; restricted markets need a proof whose
+-- policy matches the stored reference. Exits never call this.
+requireAccess : Optional MF.PolicyRef -> Party -> MF.EntryAction -> Optional EligibilityProof -> Update ()
+requireAccess access party action proof = case access of
+  None -> pure ()
+  Some expected -> case proof of
+    None -> abort "This market is restricted: present an eligibility proof"
+    Some value -> MF.checkEligibility value.policy expected party action value.evidence
+
+template MultiMarket
+  with
+    key : MarketKey
+    creator : Party
+    terms : MultiTerms
+    createdAt : Time
+    openedAt : Time
+    status : MarketStatus
+    closeReason : Optional Text
+    access : Optional MF.PolicyRef
+  where
+    signatory key.operator, creator
+    ensure key.marketId > 0 && boundedText 64 key.protocolName && key.scope /= None &&
+      null (multiTermsErrors createdAt terms) &&
+      createdAt <= openedAt && openedAt < terms.closeAt &&
+      (case (status, closeReason) of
+        (Open, None) -> True
+        (Closed, Some reason) -> boundedText 500 reason
+        _ -> False)
+
+    interface instance MF.Market for MultiMarket where
+      view = MF.MarketView with
+        ref = MF.MarketRef with
+          factory = optional (MF.FactoryRef key.operator key.protocolName "protocol") identity key.scope
+          number = key.marketId
+        creator; question = terms.question; outcomes = terms.outcomes
+        closeAt = terms.closeAt
+        status = case status of
+          Open -> MF.Open
+          Closed -> MF.Closed
+          Draft -> MF.Draft
+        access = optional MF.Public MF.Restricted access
+
+    -- | A current admin of the issuing factory stops trading early. Not a
+    -- result: resolution still waits for the agreed earliest time.
+    choice Multi_Close : ContractId MultiMarket
+      with
+        actor : Party
+        roles : ContractId Roles.ProtocolRoles
+        reason : Text
+      controller actor
+      do
+        Roles.checkAdmin roles key.operator key.protocolName key.scope actor
+        assertMsg "Only an open market can close" (status == Open)
+        assertMsg "Closure reason must contain 1 to 500 characters" (boundedText 500 reason)
+        create this with status = Closed; closeReason = Some reason
+
+    -- | A current factory admin proposes a winner or invalid once the earliest
+    -- resolution time has passed. Consumes the market, so one proposal exists
+    -- per market and split stops.
+    choice Multi_Propose : ContractId MultiProposal
+      with
+        actor : Party
+        roles : ContractId Roles.ProtocolRoles
+        result : MultiResult
+        evidence : ResolutionEvidence
+      controller actor
+      do
+        Roles.checkAdmin roles key.operator key.protocolName key.scope actor
+        now <- getTime
+        assertMsg "Resolution is not open yet" (now >= earliest terms)
+        assertMsg "Winner must be one of the market's outcomes" (validResult (length terms.outcomes) result)
+        let problems = evidenceErrors evidence
+        assertMsg (T.intercalate "; " problems) (null problems)
+        create MultiProposal with
+          key; creator; terms; marketCreatedAt = createdAt; openedAt
+          proposedBy = actor; result; evidence; proposedAt = now
+          finalizableAt = addRelTime now (seconds terms.resolutionDelaySeconds)
+          revision = 0
+
+template MultiProposal
+  with
+    key : MarketKey
+    creator : Party
+    terms : MultiTerms
+    marketCreatedAt : Time
+    openedAt : Time
+    proposedBy : Party
+    result : MultiResult
+    evidence : ResolutionEvidence
+    proposedAt : Time
+    finalizableAt : Time
+    revision : Int
+  where
+    signatory key.operator, creator
+    observer proposedBy
+    ensure validMultiProposal this
+
+    -- | A current factory admin replaces the result or evidence before the
+    -- review delay ends; the full delay restarts.
+    choice MultiProposal_Correct : ContractId MultiProposal
+      with
+        resolver : Party
+        roles : ContractId Roles.ProtocolRoles
+        replacementResult : MultiResult
+        replacementEvidence : ResolutionEvidence
+      controller resolver
+      do
+        Roles.checkAdmin roles key.operator key.protocolName key.scope resolver
+        now <- getTime
+        assertMsg "Correction time cannot precede the current proposal" (now >= proposedAt)
+        assertMsg "Corrections stop at the current finalization time" (now < finalizableAt)
+        assertMsg "Correction must change the result or evidence"
+          (replacementResult /= result || replacementEvidence /= evidence)
+        assertMsg "Proposal revision limit reached" (revision < 9223372036854775807)
+        create this with
+          proposedBy = resolver; result = replacementResult; evidence = replacementEvidence
+          proposedAt = now
+          finalizableAt = addRelTime now (seconds terms.resolutionDelaySeconds)
+          revision = revision + 1
+
+    -- | The operator records exactly the proposed result after the delay.
+    choice MultiProposal_Finalize : ContractId MultiFinal
+      controller key.operator
+      do
+        now <- getTime
+        assertMsg "Resolution review delay has not elapsed" (now >= finalizableAt)
+        create MultiFinal with proposal = this; finalizedAt = now
+
+-- | The final, unchangeable result.
+template MultiFinal
+  with
+    proposal : MultiProposal
+    finalizedAt : Time
+  where
+    signatory proposal.key.operator, proposal.creator
+    observer proposal.proposedBy
+    ensure validMultiProposal proposal && finalizedAt >= proposal.finalizableAt
+
+validMultiProposal : MultiProposal -> Bool
+validMultiProposal p = p.key.marketId > 0 && boundedText 64 p.key.protocolName &&
+  null (multiTermsErrors p.marketCreatedAt p.terms) &&
+  p.marketCreatedAt <= p.openedAt && p.openedAt < p.terms.closeAt &&
+  earliest p.terms <= p.proposedAt &&
+  validResult (length p.terms.outcomes) p.result &&
+  null (evidenceErrors p.evidence) && p.revision >= 0 &&
+  p.finalizableAt == addRelTime p.proposedAt (seconds p.terms.resolutionDelaySeconds)
+
+-- | A holder's contracts in one market: one count per outcome.
+template MultiLot
+  with
+    key : MarketKey
+    vault : Party
+    owner : Party
+    counts : [Int]
+  where
+    signatory vault, owner
+    observer key.operator
+    ensure vault /= key.operator && owner /= vault && key.marketId > 0 &&
+      boundedText 64 key.protocolName &&
+      length counts >= 2 && length counts <= maxOutcomeCount &&
+      all (>= 0) counts && any (> 0) counts
+
+data MultiSplitResult = MultiSplitResult with
+    reserve : ContractId MultiReserve
+    balance : ContractId AssetBalance
+    position : ContractId MultiLot
+  deriving (Eq, Show)
+
+data MultiMergeResult = MultiMergeResult with
+    reserve : ContractId MultiReserve
+    balance : ContractId AssetBalance
+    remainder : Optional (ContractId MultiLot)
+  deriving (Eq, Show)
+
+-- | Exactly `completeSets` collateral units back every outstanding lot.
+template MultiReserve
+  with
+    key : MarketKey
+    vault : Party
+    creator : Party
+    terms : MultiTerms
+    createdAt : Time
+    factory : ContractId T.TransferFactory
+    assetDecimals : Int
+    completeSets : Int
+    cash : Optional (ContractId H.Holding)
+  where
+    signatory key.operator, vault
+    observer creator
+    ensure key.operator /= vault && key.marketId > 0 && boundedText 64 key.protocolName &&
+      null (multiTermsErrors createdAt terms) && completeSets >= 0 &&
+      assetDecimals >= 0 && assetDecimals <= 10 &&
+      refundAligned terms.quantityLot (length terms.outcomes) assetDecimals &&
+      ((completeSets == 0) == (cash == None))
+
+    -- | The operator binds the final result; split and merge stop and
+    -- redemption opens on the settled successor.
+    choice MultiReserve_BindResolution : ContractId MultiSettledReserve
+      with resolution : ContractId MultiFinal
+      controller key.operator
+      do
+        final <- fetch resolution
+        assertMsg "Final resolution does not match this reserve"
+          (final.proposal.key == key && final.proposal.creator == creator &&
+           final.proposal.terms == terms && final.proposal.marketCreatedAt == createdAt)
+        now <- getTime
+        assertMsg "Final resolution is dated in the future" (now >= final.finalizedAt)
+        actual <- holdingTotal (H.InstrumentId terms.collateral.admin terms.collateral.id)
+          (H.Account (Some vault) None "") (optionalHoldings cash)
+        assertMsg "Reserve backing does not equal complete sets" (actual == intToDecimal completeSets)
+        create MultiSettledReserve with
+          key; vault; creator; terms; createdAt; factory; assetDecimals; resolution
+          result = final.proposal.result
+          outstanding = map (const completeSets) terms.outcomes
+          remainingCollateral = intToDecimal completeSets; cash
+
+    -- | Lock Q collateral units and mint Q contracts of every outcome.
+    choice MultiReserve_Split : MultiSplitResult
+      with
+        owner : Party
+        market : ContractId MultiMarket
+        balance : ContractId AssetBalance
+        quantity : Int
+        extraArgs : ExtraArgs
+        eligibility : Optional EligibilityProof
+      controller owner
+      do
+        current <- fetch market
+        assertMsg "Market does not match this reserve"
+          (current.key == key && current.creator == creator &&
+           current.createdAt == createdAt && current.terms == terms)
+        requireAccess current.access owner MF.Split eligibility
+        now <- getTime
+        assertMsg "Splitting requires an open market before cutoff"
+          (current.status == Open && now < terms.closeAt)
+        checkLot terms.quantityLot quantity
+        assertMsg "Complete-set supply limit reached" (quantity <= 9223372036854775807 - completeSets)
+        checkAccount this owner balance
+        partition <- exercise balance AssetBalance_Repartition with
+          otherCash = cash
+          otherAmount = intToDecimal completeSets
+          delta = negate (intToDecimal quantity)
+          extraArgs
+        next <- create this with completeSets = completeSets + quantity; cash = partition.otherCash
+        position <- create MultiLot with
+          key; vault; owner; counts = map (const quantity) terms.outcomes
+        pure MultiSplitResult with reserve = next; balance = partition.balance; position
+
+    -- | Burn Q of every outcome and return Q collateral units. No access or
+    -- open-market check: closing or revocation never blocks this exit.
+    choice MultiReserve_Merge : MultiMergeResult
+      with
+        owner : Party
+        balance : ContractId AssetBalance
+        positions : [ContractId MultiLot]
+        quantity : Int
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        checkLot terms.quantityLot quantity
+        assertMsg "Merge exceeds reserved complete sets" (quantity <= completeSets)
+        checkAccount this owner balance
+        totals <- takeLots key vault owner (length terms.outcomes) positions
+        assertMsg "Merge requires the quantity of every outcome" (all (>= quantity) totals)
+        partition <- exercise balance AssetBalance_Repartition with
+          otherCash = cash
+          otherAmount = intToDecimal completeSets
+          delta = intToDecimal quantity
+          extraArgs
+        next <- create this with completeSets = completeSets - quantity; cash = partition.otherCash
+        let rest = map (\c -> c - quantity) totals
+        remainder <- if all (== 0) rest then pure None else
+          Some <$> create MultiLot with key; vault; owner; counts = rest
+        pure MultiMergeResult with reserve = next; balance = partition.balance; remainder
+
+data MultiRedemption = MultiRedemption with
+    reserve : ContractId MultiSettledReserve
+    balance : ContractId AssetBalance
+    paid : Decimal
+    burned : [Int]
+  deriving (Eq, Show)
+
+-- | Remaining collateral equals the liability of every unburned contract.
+template MultiSettledReserve
+  with
+    key : MarketKey
+    vault : Party
+    creator : Party
+    terms : MultiTerms
+    createdAt : Time
+    factory : ContractId T.TransferFactory
+    assetDecimals : Int
+    resolution : ContractId MultiFinal
+    result : MultiResult
+    outstanding : [Int]
+    remainingCollateral : Decimal
+    cash : Optional (ContractId H.Holding)
+  where
+    signatory key.operator, vault
+    observer creator
+    ensure key.operator /= vault && key.marketId > 0 && boundedText 64 key.protocolName &&
+      null (multiTermsErrors createdAt terms) && assetDecimals >= 0 && assetDecimals <= 10 &&
+      length outstanding == length terms.outcomes && all (>= 0) outstanding &&
+      validResult (length terms.outcomes) result &&
+      remainingCollateral == multiPayout result outstanding &&
+      Numeric.roundNumeric assetDecimals Numeric.RoundingDown remainingCollateral == remainingCollateral &&
+      ((remainingCollateral == 0.0) == (cash == None))
+
+    -- | Burn whole lots (losing outcomes included) and credit the exact payout.
+    choice MultiSettled_Redeem : MultiRedemption
+      with
+        owner : Party
+        balance : ContractId AssetBalance
+        positions : [ContractId MultiLot]
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        account <- fetch balance
+        assertMsg "Claim balance does not match owner, asset, factory or deployment"
+          (account.owner == owner && account.operator == key.operator && account.vault == vault &&
+           account.protocolName == key.protocolName && account.instrument == terms.collateral &&
+           account.factory == factory)
+        actual <- holdingTotal (H.InstrumentId terms.collateral.admin terms.collateral.id)
+          (H.Account (Some vault) None "") (optionalHoldings cash)
+        assertMsg "Settled reserve backing is incorrect" (actual == remainingCollateral)
+        burned <- takeLots key vault owner (length terms.outcomes) positions
+        assertMsg "Claim exceeds outstanding supply or violates market lots"
+          (and (zipWith (<=) burned outstanding) && all (\c -> c % terms.quantityLot == 0) burned)
+        let payout = multiPayout result burned
+        assertMsg "Claim payout must be covered and precision-aligned"
+          (payout <= remainingCollateral &&
+           Numeric.roundNumeric assetDecimals Numeric.RoundingDown payout == payout)
+        (nextBalance, nextCash) <- if payout == 0.0 then pure (balance, cash) else do
+          moved <- exercise balance AssetBalance_Repartition with
+            otherCash = cash; otherAmount = remainingCollateral; delta = payout; extraArgs
+          pure (moved.balance, moved.otherCash)
+        next <- create this with
+          outstanding = zipWith (-) outstanding burned
+          remainingCollateral = remainingCollateral - payout; cash = nextCash
+        pure MultiRedemption with reserve = next; balance = nextBalance; paid = payout; burned
+
+-- | Archive 1..16 unique lots of this owner and market. Result: total count
+-- per outcome.
+takeLots : MarketKey -> Party -> Party -> Int -> [ContractId MultiLot] -> Update [Int]
+takeLots key vault owner n positions = do
+  assertMsg "Use 1 to 16 unique position lots"
+    (not (null positions) && length positions <= 16 && unique positions)
+  lots <- mapA (\cid -> do
+    lot <- fetch cid
+    assertMsg "Position owner, vault or market does not match"
+      (lot.owner == owner && lot.vault == vault && lot.key == key && length lot.counts == n)
+    exercise cid Archive
+    pure lot.counts) positions
+  pure (foldl (zipWith (+)) (replicate n 0) lots)
+
+checkLot : Int -> Int -> Update ()
+checkLot lot quantity =
+  assertMsg "Quantity must be positive and a multiple of the market lot"
+    (quantity > 0 && quantity % lot == 0)
+
+checkAccount : MultiReserve -> Party -> ContractId AssetBalance -> Update ()
+checkAccount reserve owner cid = do
+  balance <- fetch cid
+  assertMsg "Balance does not belong to this reserve/owner/asset"
+    (balance.operator == reserve.key.operator && balance.vault == reserve.vault &&
+     balance.protocolName == reserve.key.protocolName && balance.owner == owner &&
+     balance.instrument == reserve.terms.collateral && balance.factory == reserve.factory)

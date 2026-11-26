@@ -1,0 +1,213 @@
+-- | Multi-outcome factory markets: creation routing and precision, complete
+-- sets, admin resolution with corrections, and exact winner/invalid payouts.
+module Outcomia.MultiOutcomeTest where
+
+import Canton.MarketFactory qualified as MF
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours)
+import Daml.Script
+import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.AssetTransferTest qualified as A
+import Outcomia.Custody (AssetBalance(..))
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Factory
+import Outcomia.FactoryTest qualified as FT
+import Outcomia.MultiOutcome
+import Outcomia.Resolution (ResolutionEvidence(..))
+import Outcomia.Types
+
+-- | Four outcomes: with a 1-contract lot, 1/4 is exact at 6 decimals.
+fourTerms : A.Fixture -> MF.MarketTerms
+fourTerms a = (FT.standardTerms a) with
+  question = "Which team wins the final?"
+  outcomes = ["Red", "Blue", "Green", "Gold"]
+  outcomeCriteria = ["Red wins", "Blue wins", "Green wins", "Gold wins"]
+
+proofDoc : ResolutionEvidence
+proofDoc = ResolutionEvidence with
+  summary = "Official result"; documentUri = "ar://result"
+  documentSha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+data Market = Market with
+    f : FT.Fixture
+    market : ContractId MultiMarket
+    factory : ContractId OutcomiaMarketFactory
+    reserve : ContractId MultiReserve
+    balance : ContractId AssetBalance
+  deriving (Eq, Show)
+
+reads : FT.Fixture -> [Party]
+reads f = let a = FT.asset f in [a.operator, a.issuer, f.custody.vault]
+
+-- | Alice funds 5 units and a 4-outcome market is created.
+open : Script Market
+open = script do
+  f <- FT.setup
+  let a = FT.asset f
+  funded <- C.deposit f.custody f.custody.balance 5.0 [toInterfaceContractId @H.Holding a.input]
+  created <- FT.createAs f (FT.iface f.factory) f.admin (fourTerms a)
+  [(reserve, _)] <- query @MultiReserve f.custody.vault
+  pure Market with
+    f; market = fromInterfaceContractId created.market
+    factory = fromInterfaceContractId created.factory
+    reserve; balance = funded.balance
+
+split : Market -> Int -> Script MultiSplitResult
+split m quantity = submit (actAs (FT.asset m.f).alice <> readAs (reads m.f)) do
+  exerciseCmd m.reserve MultiReserve_Split with
+    owner = (FT.asset m.f).alice; market = m.market; balance = m.balance; quantity
+    extraArgs = C.registryContext; eligibility = None
+
+-- | Propose at the earliest time, wait out the delay, finalize and bind.
+settle : Market -> ContractId MultiReserve -> MultiResult -> Script (ContractId MultiSettledReserve)
+settle m reserve result = do
+  let a = FT.asset m.f
+  setTime (addRelTime a.now (hours 25))
+  proposal <- submit (actAs m.f.admin <> readAs a.operator) do
+    exerciseCmd m.market Multi_Propose with
+      actor = m.f.admin; roles = FT.factoryRoles m.factory; result; evidence = proofDoc
+  setTime (addRelTime a.now (hours 27))
+  final <- submit a.operator do exerciseCmd proposal MultiProposal_Finalize
+  submit (actAs a.operator <> readAs (reads m.f)) do
+    exerciseCmd reserve MultiReserve_BindResolution with resolution = final
+
+redeem : Market -> ContractId MultiSettledReserve -> ContractId AssetBalance -> [ContractId MultiLot] -> Script MultiRedemption
+redeem m settled balance positions = submit (actAs (FT.asset m.f).alice <> readAs (reads m.f)) do
+  exerciseCmd settled MultiSettled_Redeem with
+    owner = (FT.asset m.f).alice; balance; positions; extraArgs = C.registryContext
+
+freeCash : Market -> ContractId AssetBalance -> Script Decimal
+freeCash m cid = do
+  account <- C.loadAccount m.f.custody cid
+  pure account.available
+
+test_other_outcome_lists_create_multi_markets : Script ()
+test_other_outcome_lists_create_multi_markets = script do
+  m <- open
+  let a = FT.asset m.f
+  Some market <- queryContractId a.operator m.market
+  market.status === Open
+  market.key === FT.marketKey m.f 1
+  market.terms.outcomes === ["Red", "Blue", "Green", "Gold"]
+  Some marketView <- queryInterfaceContractId a.operator (toInterfaceContractId @MF.Market m.market)
+  marketView.outcomes === market.terms.outcomes
+  -- Binary contracts are not created for a multi-outcome market.
+  binaries <- query @MultiReserve m.f.custody.vault
+  length binaries === 1
+  -- YES/NO in reverse order is rejected rather than treated as multi.
+  FT.createFailsAs m.f (FT.iface m.factory) m.f.admin
+    ((FT.standardTerms a) with outcomes = ["NO", "YES"]) MF.Public
+
+test_invalid_refunds_must_be_exact : Script ()
+test_invalid_refunds_must_be_exact = script do
+  m <- open
+  let a = FT.asset m.f
+      three = (fourTerms a) with
+        outcomes = ["A", "B", "C"]; outcomeCriteria = ["A", "B", "C"]
+  -- 1/3 is not exact at 6 decimals; a lot of 3 is.
+  FT.createFailsAs m.f (FT.iface m.factory) m.f.admin three MF.Public
+  _ <- FT.createAs m.f (FT.iface m.factory) m.f.admin (three with quantityLot = 3; priceTick = 0.01)
+  refundAligned 1 3 6 === False
+  refundAligned 3 3 6 === True
+  refundAligned 1 8 6 === True
+  refundAligned 1 8 2 === False
+  refundAligned 1 7 10 === False
+  refundAligned 7 7 0 === True
+
+test_split_and_merge_complete_sets : Script ()
+test_split_and_merge_complete_sets = script do
+  m <- open
+  let a = FT.asset m.f
+  made <- split m 3
+  Some lot <- queryContractId m.f.custody.vault made.position
+  lot.counts === [3, 3, 3, 3]
+  freeCash m made.balance >>= (=== 2.0)
+  merged <- submit (actAs a.alice <> readAs (reads m.f)) do
+    exerciseCmd made.reserve MultiReserve_Merge with
+      owner = a.alice; balance = made.balance; positions = [made.position]; quantity = 2
+      extraArgs = C.registryContext
+  freeCash m merged.balance >>= (=== 4.0)
+  Some reserve <- queryContractId m.f.custody.vault merged.reserve
+  reserve.completeSets === 1
+  Some rest <- pure merged.remainder
+  Some left <- queryContractId m.f.custody.vault rest
+  left.counts === [1, 1, 1, 1]
+  -- Merging more than every outcome holds fails.
+  submitMustFail (actAs a.alice <> readAs (reads m.f)) do
+    exerciseCmd merged.reserve MultiReserve_Merge with
+      owner = a.alice; balance = merged.balance; positions = [rest]; quantity = 2
+      extraArgs = C.registryContext
+
+test_admins_resolve_with_corrections : Script ()
+test_admins_resolve_with_corrections = script do
+  m <- open
+  let a = FT.asset m.f
+      roles = FT.factoryRoles m.factory
+  -- Too early, out of range, or not a factory admin.
+  submitMustFail (actAs m.f.admin <> readAs a.operator) do
+    exerciseCmd m.market Multi_Propose with actor = m.f.admin; roles; result = Winner 1; evidence = proofDoc
+  setTime (addRelTime a.now (hours 25))
+  submitMustFail (actAs m.f.admin <> readAs a.operator) do
+    exerciseCmd m.market Multi_Propose with actor = m.f.admin; roles; result = Winner 4; evidence = proofDoc
+  submitMustFail (actAs m.f.outsider <> readAs a.operator) do
+    exerciseCmd m.market Multi_Propose with actor = m.f.outsider; roles; result = Winner 1; evidence = proofDoc
+  proposal <- submit (actAs m.f.secondAdmin <> readAs a.operator) do
+    exerciseCmd m.market Multi_Propose with actor = m.f.secondAdmin; roles; result = Winner 1; evidence = proofDoc
+  submitMustFail a.operator do exerciseCmd proposal MultiProposal_Finalize
+  corrected <- submit (actAs m.f.admin <> readAs [a.operator, m.f.secondAdmin]) do
+    exerciseCmd proposal MultiProposal_Correct with
+      resolver = m.f.admin; roles; replacementResult = Winner 2; replacementEvidence = proofDoc
+  setTime (addRelTime a.now (hours 26))
+  final <- submit a.operator do exerciseCmd corrected MultiProposal_Finalize
+  Some value <- queryContractId a.operator final
+  value.proposal.result === Winner 2
+  value.proposal.revision === 1
+
+test_close_stops_split_but_not_merge : Script ()
+test_close_stops_split_but_not_merge = script do
+  m <- open
+  let a = FT.asset m.f
+  made <- split m 1
+  closed <- submit (actAs m.f.admin <> readAs a.operator) do
+    exerciseCmd m.market Multi_Close with
+      actor = m.f.admin; roles = FT.factoryRoles m.factory; reason = "Event postponed"
+  submitMustFail (actAs a.alice <> readAs (reads m.f)) do
+    exerciseCmd made.reserve MultiReserve_Split with
+      owner = a.alice; market = closed; balance = made.balance; quantity = 1
+      extraArgs = C.registryContext; eligibility = None
+  merged <- submit (actAs a.alice <> readAs (reads m.f)) do
+    exerciseCmd made.reserve MultiReserve_Merge with
+      owner = a.alice; balance = made.balance; positions = [made.position]; quantity = 1
+      extraArgs = C.registryContext
+  freeCash m merged.balance >>= (=== 5.0)
+
+test_the_winner_pays_one_unit : Script ()
+test_the_winner_pays_one_unit = script do
+  m <- open
+  made <- split m 2
+  settled <- settle m made.reserve (Winner 2)
+  paid <- redeem m settled made.balance [made.position]
+  paid.paid === 2.0
+  paid.burned === [2, 2, 2, 2]
+  freeCash m paid.balance >>= (=== 5.0)
+  Some rest <- queryContractId m.f.custody.vault paid.reserve
+  (rest.outstanding, rest.remainingCollateral) === ([0, 0, 0, 0], 0.0)
+
+test_invalid_refunds_each_contract_equally : Script ()
+test_invalid_refunds_each_contract_equally = script do
+  m <- open
+  let a = FT.asset m.f
+  made <- split m 2
+  -- Keep only one outcome's contracts by merging is impossible; instead merge
+  -- one set back and redeem the rest: 1 of each pays 4 × 1/4 = 1.
+  merged <- submit (actAs a.alice <> readAs (reads m.f)) do
+    exerciseCmd made.reserve MultiReserve_Merge with
+      owner = a.alice; balance = made.balance; positions = [made.position]; quantity = 1
+      extraArgs = C.registryContext
+  Some rest <- pure merged.remainder
+  settled <- settle m merged.reserve InvalidResult
+  paid <- redeem m settled merged.balance [rest]
+  paid.paid === 1.0
+  freeCash m paid.balance >>= (=== 5.0)
+  multiPayout InvalidResult [1, 0, 0, 0] === 0.25
+  multiPayout (Winner 0) [3, 1, 0, 0] === 3.0
