@@ -27,7 +27,7 @@ what a caller is already entitled to see.
 | Removal | A removed member cannot place, split or have resting orders fill. Their resting orders are cancelled by the operator service (funds return to the owner), and matching rejects them regardless. |
 | Exits | Cancel, withdraw, merge and redeem never require membership. Removal never confiscates or strands a position. |
 | Resolution | Any **current club admin** proposes or corrects under the existing windows, review delay and correction deadline. No fallback resolver for club markets. Finalization stays as today (see issue #18). |
-| Fees | Traders pay the normal taker fee. A protocol-wide **club share** of it accrues to the club; only the owner withdraws it. Not part of the first club release. |
+| Fees | Traders pay the normal taker fee. A protocol-wide **club share** of it (`ClubRules.clubShareBps`, at most 5,000 bps) accrues to the club inside the book's fee pool; only the owner withdraws it (`Club_WithdrawFees`). See `fee-accounting.md`. |
 | License | Apache-2.0 (PR #23), before the factory is presented as reusable. |
 
 ### What differs from Solana, and why

@@ -29,7 +29,9 @@ import DA.Optional (fromOptional, isSome, optionalToList)
 import DA.Text qualified as T
 import DA.Time (addRelTime, days)
 import Outcomia.Factory
+import Outcomia.Orders (FeeWithdrawalResult, OrderBook(..), OrderBook_WithdrawClubFees(..), maxClubShareBps)
 import Outcomia.ProtocolRoles qualified as Roles
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Outcomia.Validation (boundedText)
 
 -- | Who may create markets in a club.
@@ -69,17 +71,21 @@ data ClubRules = ClubRules with
     privateMemberCap : Int
     maxOwnedClubs : Int
     maxClubAdmins : Int
+    -- | Share of club-market taker fees owed to the club (0 to 5,000 bps);
+    -- the operator applies it to each club market's order book.
+    clubShareBps : Int
   deriving (Eq, Show)
 
 defaultClubRules : ClubRules
 defaultClubRules = ClubRules with
   publicMemberCap = maxMembers; privateMemberCap = maxMembers
-  maxOwnedClubs = 2; maxClubAdmins = 5
+  maxOwnedClubs = 2; maxClubAdmins = 5; clubShareBps = 0
 
 validRules : ClubRules -> Bool
 validRules r =
   inRange r.publicMemberCap maxMembers && inRange r.privateMemberCap maxMembers &&
-  r.maxOwnedClubs >= 1 && r.maxOwnedClubs <= 1000 && inRange r.maxClubAdmins maxAdmins
+  r.maxOwnedClubs >= 1 && r.maxOwnedClubs <= 1000 && inRange r.maxClubAdmins maxAdmins &&
+  r.clubShareBps >= 0 && r.clubShareBps <= maxClubShareBps
   where inRange v limit = v >= 1 && v <= limit
 
 memberCapFor : ClubRules -> ClubKind -> Int
@@ -405,6 +411,20 @@ template Club
       do
         assertMsg "Club rules must be within the contract limits" (validRules rules)
         create this with memberCap = memberCapFor rules kind; adminCap = rules.maxClubAdmins
+
+    -- | The owner withdraws fees owed to the club from one of its markets'
+    -- order books, to the owner's own wallet.
+    nonconsuming choice Club_WithdrawFees : FeeWithdrawalResult
+      with
+        book : ContractId OrderBook
+        amount : Decimal
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        current <- fetch book
+        assertMsg "That order book is not one of this club's markets"
+          (current.key.operator == operator && current.key.scope == Some factoryRef)
+        exercise book OrderBook_WithdrawClubFees with recipient = owner; amount; extraArgs
 
     -- | The owner lists a public club or changes its listing; any change
     -- clears the protocol admin's verification.

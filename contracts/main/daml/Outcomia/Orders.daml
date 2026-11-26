@@ -208,6 +208,7 @@ template OrderRegistry
           nextOrderId = 1
           orders = []
           fees = MarketFees.FeePoolState 0.0 None
+          clubShareBps = 0; clubFees = 0.0
         pure (next, book)
 
 -- | One bounded committed index per market, covering YES/NO and both sides.
@@ -225,6 +226,12 @@ template OrderBook
     nextOrderId : Int
     orders : [OrderReference]
     fees : MarketFees.FeePoolState
+    -- | Share of each taker fee owed to the market's club, in basis points;
+    -- set by the operator for club markets and applied to later fills only.
+    clubShareBps : Int
+    -- | Part of 'fees' owed to the club. It stays in the same backed pool;
+    -- the operator withdraws only the rest, the club owner withdraws this.
+    clubFees : Decimal
   where
     signatory key.operator, vault
     observer creator
@@ -233,6 +240,9 @@ template OrderBook
       assetDecimals >= 0 && assetDecimals <= 10 &&
       Numeric.roundNumeric assetDecimals Numeric.RoundingDown (terms.priceTick * intToDecimal terms.quantityLot) == terms.priceTick * intToDecimal terms.quantityLot &&
       MarketFees.validPool assetDecimals fees &&
+      clubShareBps >= 0 && clubShareBps <= maxClubShareBps &&
+      (clubShareBps == 0 || key.scope /= None) &&
+      clubFees >= 0.0 && clubFees <= fees.amount && MarketFees.aligned assetDecimals clubFees &&
       length orders <= 128 && unique (map (\r -> r.orderId) orders) &&
       unique (map (\r -> r.order) orders) &&
       all (\r -> r.orderId > 0 && r.orderId < nextOrderId && validPrice terms.priceTick r.price) orders
@@ -247,8 +257,37 @@ template OrderBook
         extraArgs : ExtraArgs
       controller key.operator
       do
+        assertMsg "Fees owed to the club cannot be withdrawn by the operator"
+          (amount <= fees.amount - clubFees)
         moved <- MarketFees.withdrawFees key.operator vault terms.collateral factory assetDecimals fees amount extraArgs
         next <- create this with fees = moved.pool
+        pure FeeWithdrawalResult with book = next; walletHoldings = moved.walletHoldings
+
+    -- | The operator sets the club share for later fills (0 to 5,000 bps).
+    -- Only factory-scoped (club) books may carry a share; fees already
+    -- collected keep the split they were collected under.
+    choice OrderBook_SetClubShare : ContractId OrderBook
+      with bps : Int
+      controller key.operator
+      do
+        assertMsg "The club share must be 0 to 5,000 basis points" (bps >= 0 && bps <= maxClubShareBps)
+        assertMsg "Only club markets carry a club share" (bps == 0 || key.scope /= None)
+        create this with clubShareBps = bps
+
+    -- | Pays fees owed to the club to `recipient`, who must authorize it.
+    -- Reached through 'Club_WithdrawFees', which binds the club owner and this
+    -- book's scope; the operator's authority comes from the club contract.
+    choice OrderBook_WithdrawClubFees : FeeWithdrawalResult
+      with
+        recipient : Party
+        amount : Decimal
+        extraArgs : ExtraArgs
+      controller key.operator, recipient
+      do
+        assertMsg "Club fee withdrawal must be positive and at most what the club is owed"
+          (amount > 0.0 && amount <= clubFees)
+        moved <- MarketFees.withdrawFees recipient vault terms.collateral factory assetDecimals fees amount extraArgs
+        next <- create this with fees = moved.pool; clubFees = clubFees - amount
         pure FeeWithdrawalResult with book = next; walletHoldings = moved.walletHoldings
 
     -- | Inputs: owner, current Open market, enrolled account, outcome, price,
@@ -618,6 +657,7 @@ template LimitOrder
         next <- create index with
           orders = filter (\r -> r.order /= buyOrder && r.order /= self) index.orders ++ refs
           fees = collected.pool
+          clubFees = index.clubFees + clubPart index feeAmount
         now <- getTime
         receipt <- create TradeFill with
           key; vault; buyer; instrument; plan; executedAt = now; seller = owner
@@ -787,6 +827,7 @@ template LimitOrder
         next <- create index with
           orders = filter (\r -> r.order /= yesOrder && r.order /= self) index.orders ++ refs
           fees = settled.pool
+          clubFees = index.clubFees + clubPart index settled.feeAmount
         now <- getTime
         receipt <- create ComplementFill with
           key; vault; yesOwner; noOwner = owner; instrument; plan; executedAt = now
@@ -1068,3 +1109,14 @@ credit balance amount source sourceAmount extraArgs = if amount <= 0.0 then pure
   moved <- exercise balance AssetBalance_Repartition with
     otherCash = source; otherAmount = sourceAmount; delta = amount; extraArgs
   pure (moved.balance, moved.otherCash)
+
+-- | Highest club share of a taker fee, as on Solana: half.
+maxClubShareBps : Int
+maxClubShareBps = 5000
+
+-- | The club's part of a collected fee, rounded down to the asset's precision
+-- so the protocol never owes more than it collected.
+clubPart : OrderBook -> Decimal -> Decimal
+clubPart book fee =
+  Numeric.roundNumeric book.assetDecimals Numeric.RoundingDown
+    (fee * intToDecimal book.clubShareBps / 10000.0)
