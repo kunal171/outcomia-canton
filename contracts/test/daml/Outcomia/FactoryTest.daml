@@ -148,7 +148,8 @@ test_rejects_unadmitted_collateral_bad_outcomes_and_foreign_policies = script do
       foreignPolicy = MF.PolicyRef with operator = a.alice; namespace = "outcomia"; policyId = "invite"
   createFailsAs f (iface f.factory) f.admin (terms with collateral = MF.InstrumentRef with admin = a.alice; id = "OTHER") MF.Public
   createFailsAs f (iface f.factory) f.admin (terms with outcomes = ["NO", "YES"]) MF.Public
-  createFailsAs f (iface f.factory) f.admin (terms with outcomes = ["Up", "Down"]) MF.Public
+  createFailsAs f (iface f.factory) f.admin (terms with outcomes = ["Up", "Up"]) MF.Public
+  createFailsAs f (iface f.factory) f.admin (terms with outcomes = ["A", "B", "C", "D", "E", "F", "G", "H", "I"]; outcomeCriteria = replicate 9 "c") MF.Public
   createFailsAs f (iface f.factory) f.admin terms (MF.Restricted foreignPolicy)
   createFailsAs f (iface f.factory) f.admin (terms with closeAt = a.now) MF.Public
   -- A 7-decimal tick cannot settle in the 6-decimal test asset.

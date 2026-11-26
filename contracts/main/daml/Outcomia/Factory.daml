@@ -17,6 +17,7 @@ import DA.Text qualified as T
 import Outcomia.Assets (AssetAdmission(..))
 import Outcomia.Binary
 import Outcomia.MarketFees qualified as MarketFees
+import Outcomia.MultiOutcome
 import Outcomia.Orders
 import Outcomia.Positions
 import Outcomia.ProtocolRoles qualified as Roles
@@ -57,7 +58,7 @@ template OutcomiaMarketFactory
 
     interface instance MF.MarketFactory for OutcomiaMarketFactory where
       view = MF.FactoryView with
-        ref; creationPolicy = policy; nextNumber; minOutcomes = 2; maxOutcomes = 2
+        ref; creationPolicy = policy; nextNumber; minOutcomes = 2; maxOutcomes = maxOutcomeCount
       create' creator terms access proof = createBundle this creator terms access proof
 
     -- Lets resolution corrections verify current admins of this exact scope.
@@ -192,9 +193,8 @@ createBundle factory creator terms access proof = do
         (MF.validPolicyRef policyRef && policyRef.operator == factory.operator &&
          policyRef.namespace == factory.protocolName)
       pure (Some policyRef)
-  let shape = MF.termsShapeErrors 2 2 terms
+  let shape = MF.termsShapeErrors 2 maxOutcomeCount terms
   assertMsg (T.intercalate "; " shape) (null shape)
-  assertMsg "Binary factory markets use the outcomes YES and NO" (terms.outcomes == ["YES", "NO"])
   let instrument = CollateralInstrument with admin = terms.collateral.admin; id = terms.collateral.id
   asset <- case filter (\a -> a.instrument == instrument) factory.assets of
     found :: _ -> pure found
@@ -204,6 +204,14 @@ createBundle factory creator terms access proof = do
     (admitted.operator == factory.operator && admitted.instrument == instrument)
   assertMsg "Market number limit reached" (factory.nextNumber < 9223372036854775807)
   now <- getTime
+  assertMsg "Binary factory markets list YES before NO" (terms.outcomes /= ["NO", "YES"])
+  if terms.outcomes /= ["YES", "NO"]
+    then createMulti factory creator terms restriction instrument admitted now
+    else createBinary factory creator terms restriction instrument admitted now
+
+-- | YES/NO terms: an Open binary market with its reserve and order book.
+createBinary : OutcomiaMarketFactory -> Party -> MF.MarketTerms -> Optional MF.PolicyRef -> CollateralInstrument -> AssetAdmission -> Time -> Update MF.MarketCreated
+createBinary factory creator terms restriction instrument admitted now = do
   let binary = toBinaryTerms terms instrument
       problems = termsErrors creator now binary
       aligned value = Numeric.roundNumeric admitted.assetDecimals Numeric.RoundingDown value == value
@@ -234,6 +242,44 @@ createBundle factory creator terms access proof = do
     nextOrderId = 1; orders = []
     fees = MarketFees.FeePoolState 0.0 None
     clubShareBps = 0; clubFees = 0.0
+  pure MF.MarketCreated with
+    factory = toInterfaceContractId next
+    market = toInterfaceContractId market
+    ref = MF.MarketRef with factory = factory.ref; number
+
+-- | Any other 2 to 8 outcomes: an Open multi-outcome market and its reserve.
+-- Rejects a lot whose invalid refund (lot / outcomes) is inexact at the
+-- collateral's precision.
+createMulti : OutcomiaMarketFactory -> Party -> MF.MarketTerms -> Optional MF.PolicyRef -> CollateralInstrument -> AssetAdmission -> Time -> Update MF.MarketCreated
+createMulti factory creator terms restriction instrument admitted now = do
+  let multi = MultiTerms with
+        question = terms.question; collateral = instrument
+        outcomes = terms.outcomes; outcomeCriteria = terms.outcomeCriteria
+        invalidCriteria = terms.invalidCriteria; evidenceRequirements = terms.evidenceRequirements
+        documentUri = terms.rulesUri; documentSha256 = terms.rulesHash
+        closeAt = terms.closeAt; earliestResolutionAt = terms.earliestResolutionAt
+        resolutionDelaySeconds = terms.resolutionDelaySeconds
+        priceTick = terms.priceTick; quantityLot = terms.quantityLot
+      problems = multiTermsErrors now multi
+      lotNotional = multi.priceTick * intToDecimal multi.quantityLot
+  assertMsg (T.intercalate "; " problems) (null problems)
+  assertMsg "Price tick times quantity lot must align to asset precision"
+    (lotNotional > 0.0 &&
+     Numeric.roundNumeric admitted.assetDecimals Numeric.RoundingDown lotNotional == lotNotional)
+  assertMsg "Invalid-result refunds (lot / outcomes) must align with collateral precision"
+    (refundAligned multi.quantityLot (length multi.outcomes) admitted.assetDecimals)
+  next <- create factory with nextNumber = factory.nextNumber + 1
+  let number = factory.nextNumber
+      key = MarketKey with
+        operator = factory.operator; protocolName = factory.protocolName
+        marketId = number; scope = Some factory.ref
+  market <- create MultiMarket with
+    key; creator; terms = multi; createdAt = now; openedAt = now
+    status = Open; closeReason = None; access = restriction
+  _ <- create MultiReserve with
+    key; vault = factory.vault; creator; terms = multi; createdAt = now
+    factory = admitted.factory; assetDecimals = admitted.assetDecimals
+    completeSets = 0; cash = None
   pure MF.MarketCreated with
     factory = toInterfaceContractId next
     market = toInterfaceContractId market

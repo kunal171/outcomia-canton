@@ -1,6 +1,7 @@
 # Multi-outcome markets on Canton
 
-Status: **plan (2026-11-26)**. Nothing here is implemented yet. It brings
+Status: **MO1 contracts built (2026-11-26)**; MO1 UI and MO2–MO4 pending
+(see [Progress](#progress)). It brings
 Canton to parity with Solana's multi-outcome markets
 (kunal171/outcomia `docs/multi-outcome-markets.md`), changed only where
 Canton's ledger model requires it. Each milestone ships as a contracts PR in
@@ -36,9 +37,12 @@ both market kinds use one implementation of the resolution windows.
 | `MultiBook` / `MultiOrder` / `MultiFill` | One bounded book per market holding every outcome's orders, the fee pool (including the club fee share) and fill receipts. |
 
 **Creation through the market factory.** The factory standard already carries
-a list of outcomes. Two outcomes keep creating binary markets; three to eight
-create multi-outcome markets, for public and club factories alike, so club
-policies, eligibility and club fees apply unchanged.
+a list of outcomes. Exactly `YES, NO` keeps creating binary markets (`NO, YES`
+is rejected); any other list of 2 to 8 labels creates a multi-outcome market,
+for public and club factories alike, so club policies and eligibility apply
+unchanged. Multi-outcome markets exist only in factory scope, so the issuing
+factory's current admins close, propose and correct them; there is no draft
+state and no fallback resolver.
 
 **Bounded books.** As on binary Canton books, one market's orders live in one
 book (at most 128 references), not in linked ladders. Matching is driven by
@@ -59,3 +63,34 @@ the operator service, which proposes fills and the ledger revalidates.
   Solana allows a configurable face payout; Canton can add it later.
 - Book capacity (128 orders) is shared by all outcomes of a market. A busy
   8-outcome market may need a larger bound, at the cost of bigger contracts.
+
+## Progress
+
+**MO1 contracts — done** (branch `feat/multi-outcome-mo1`, 238 tests pass).
+
+- `contracts/main/daml/Outcomia/MultiOutcome.daml`: `MultiTerms`,
+  `MultiResult = Winner Int | InvalidResult`, `multiTermsErrors`,
+  `refundAligned` (`L × 10^d` divisible by `N`, computed modulo `N`),
+  `multiPayout`; templates `MultiMarket` (`Multi_Close`, `Multi_Propose`),
+  `MultiProposal` (`MultiProposal_Correct`, `MultiProposal_Finalize`),
+  `MultiFinal`, `MultiLot { counts }`, `MultiReserve` (`MultiReserve_Split`,
+  `MultiReserve_Merge`, `MultiReserve_BindResolution`) and
+  `MultiSettledReserve` (`MultiSettled_Redeem`).
+- `Factory.daml`: `maxOutcomes = 8`; `createBundle` routes to `createBinary`
+  or `createMulti`. Multi markets get a market and reserve; the book comes in MO2.
+- `contracts/test/daml/Outcomia/MultiOutcomeTest.daml`: routing, exact refunds,
+  split/merge, admin resolution with corrections, close, winner and invalid
+  payouts.
+
+**Next steps**
+
+1. MO1 UI in `outcomia-solana/app` (Canton side): `lib/canton/commands.ts`
+   actions `multiSplit`, `multiMerge`, `multiPropose`, `multiCorrect`,
+   `multiClose`, `multiFinalize`, `multiBind`, `multiRedeem`; templates in
+   `lib/canton/server.ts` queries; create form accepting 2–8 outcome rows;
+   market page listing outcomes, the holder's `MultiLot` counts and the
+   resolution state.
+2. MO2: `MultiBook` / `MultiOrder` / `MultiFill` with per-outcome place,
+   cancel and same-outcome matching, reusing `Fees` quotes, eligibility and the
+   club fee share (`clubShareBps`).
+3. MO3 full-set matching; MO4 indexer history.
