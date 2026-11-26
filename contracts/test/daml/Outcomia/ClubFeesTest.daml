@@ -1,0 +1,135 @@
+-- | Club fee share: a share of each club-market taker fee is owed to the club,
+-- stays in the book's backed fee pool, and only the club owner withdraws it;
+-- the operator withdraws only the rest.
+module Outcomia.ClubFeesTest where
+
+import Canton.MarketFactory qualified as MF
+import DA.Assert ((===))
+import Daml.Script
+import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.Binary
+import Outcomia.Clubs
+import Outcomia.ClubsTest qualified as CT
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Fees qualified as Fees
+import Outcomia.Orders
+import Outcomia.Positions
+import Outcomia.TokenHarness
+import Outcomia.Types
+
+data Traded = Traded with
+    f : CT.Fixture
+    club : ContractId Club
+    book : ContractId OrderBook
+  deriving (Eq, Show)
+
+-- | Members Alice (buyer) and Bob (seller) trade 3 YES at 0.40 in a
+-- members-only club market with a 25 bps taker fee: Alice's later buy is the
+-- taker and pays 0.003 on 1.20.
+tradeInClubMarket : Int -> Script Traded
+tradeInClubMarket shareBps = script do
+  f <- CT.setup
+  let a = f.custody.asset
+      c = f.custody
+      reads = [a.operator, a.issuer, c.vault, a.alice, a.bob, f.owner]
+  funded <- C.deposit c c.balance 5.0 [toInterfaceContractId @H.Holding a.input]
+  club <- CT.admitWallet f f.created.club a.alice
+  club <- CT.admitWallet f club a.bob
+  value <- CT.clubValue f club
+  created <- CT.as f f.owner (CT.createMarket f f.created.factory f.owner club (MF.Restricted value.ref))
+  let market = fromInterfaceContractId @BinaryMarket created.market
+      proof = Some EligibilityProof with policy = toInterfaceContractId club; evidence = []
+  policy <- submit a.operator do
+    exerciseCmd a.protocol Protocol_SetTakerFee with replacementFeeBps = 25
+  -- Bob funds an account and splits three complete sets in the club market.
+  (_, bobAccount) <- submit (actAs a.bob <> readAs a.operator) do
+    exerciseCmd c.authority VaultAuthority_OpenBalance with owner = a.bob; admission = a.admission
+  input <- submit a.issuer do
+    createCmd TestHolding with
+      issuer = a.issuer; account = H.Account (Some a.bob) None ""
+      instrument = H.InstrumentId a.issuer "test-USD"; amount = 5.0; locked = None
+  bobFunded <- submit (actAs a.bob <> readAs reads) do
+    exerciseCmd bobAccount AssetBalance_Deposit with
+      admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0
+      extraArgs = C.registryContext
+  [(reserve, _)] <- query @MarketReserve c.vault
+  split <- submit (actAs a.bob <> readAs reads) do
+    exerciseCmd reserve MarketReserve_Split with
+      owner = a.bob; market; balance = bobFunded.balance; quantity = 3
+      extraArgs = C.registryContext; eligibility = proof
+  [(book, _)] <- query @OrderBook c.vault
+  shared <- submit a.operator do exerciseCmd book OrderBook_SetClubShare with bps = shareBps
+  let terms = Fees.FeeTerms 25 6
+  ask <- submit (actAs a.bob <> readAs reads) do
+    exerciseCmd shared OrderBook_PlaceSell with
+      owner = a.bob; market; positions = [split.position]; outcome = Yes; price = 0.4; quantity = 3
+      feePolicy = policy; expectedFeeRevision = 1; expectedFeeTerms = terms; eligibility = proof
+  bid <- submit (actAs a.alice <> readAs reads) do
+    exerciseCmd ask.book OrderBook_PlaceBuy with
+      owner = a.alice; market; balance = funded.balance; outcome = Yes; price = 0.6; quantity = 3
+      feePolicy = policy; expectedFeeRevision = 1; expectedFeeTerms = terms
+      extraArgs = C.registryContext; eligibility = proof
+  buyerBalance <- case bid.balance of
+    Some b -> pure b
+    None -> abort "Expected the buyer's revised account"
+  settled <- submit (actAs a.operator <> readAs reads) do
+    exerciseCmd bid.book OrderBook_MatchBest with
+      market; outcome = Yes; buyerBalance; sellerBalance = split.balance
+      extraArgs = C.registryContext; buyerEligibility = proof; sellerEligibility = proof
+  pure Traded with f; club; book = settled.book
+
+loadBook : CT.Fixture -> ContractId OrderBook -> Script OrderBook
+loadBook f cid = do
+  Some value <- queryContractId f.custody.vault cid
+  pure value
+
+test_the_club_share_of_each_fee_is_owed_to_the_club : Script ()
+test_the_club_share_of_each_fee_is_owed_to_the_club = script do
+  t <- tradeInClubMarket 2000
+  book <- loadBook t.f t.book
+  -- 20% of 0.003 is 0.0006, kept in the same backed pool.
+  (book.fees.amount, book.clubFees) === (0.003, 0.0006)
+  let a = t.f.custody.asset
+      reads = [t.f.custody.vault, a.issuer, t.f.owner]
+  -- The operator can withdraw only what is not owed to the club.
+  submitMustFail (actAs a.operator <> readAs reads) do
+    exerciseCmd t.book OrderBook_WithdrawFees with amount = 0.003; extraArgs = C.registryContext
+  rest <- submit (actAs a.operator <> readAs reads) do
+    exerciseCmd t.book OrderBook_WithdrawFees with amount = 0.0024; extraArgs = C.registryContext
+  -- Only the club owner withdraws the club's part, at most what is owed.
+  CT.failsAs t.f a.alice do
+    exerciseCmd t.club Club_WithdrawFees with book = rest.book; amount = 0.0006; extraArgs = C.registryContext
+  CT.failsAs t.f t.f.owner do
+    exerciseCmd t.club Club_WithdrawFees with book = rest.book; amount = 0.0007; extraArgs = C.registryContext
+  paid <- CT.as t.f t.f.owner do
+    exerciseCmd t.club Club_WithdrawFees with book = rest.book; amount = 0.0006; extraArgs = C.registryContext
+  final <- loadBook t.f paid.book
+  (final.fees.amount, final.clubFees) === (0.0, 0.0)
+  length paid.walletHoldings === 1
+
+test_a_zero_share_leaves_every_fee_to_the_protocol : Script ()
+test_a_zero_share_leaves_every_fee_to_the_protocol = script do
+  t <- tradeInClubMarket 0
+  book <- loadBook t.f t.book
+  (book.fees.amount, book.clubFees) === (0.003, 0.0)
+
+test_only_the_operator_sets_a_bounded_share_on_club_books : Script ()
+test_only_the_operator_sets_a_bounded_share_on_club_books = script do
+  t <- tradeInClubMarket 0
+  let a = t.f.custody.asset
+  CT.failsAs t.f t.f.owner do exerciseCmd t.book OrderBook_SetClubShare with bps = 100
+  CT.failsAs t.f a.operator do exerciseCmd t.book OrderBook_SetClubShare with bps = 5001
+  CT.failsAs t.f a.operator do exerciseCmd t.book OrderBook_SetClubShare with bps = -1
+  raised <- CT.as t.f a.operator do exerciseCmd t.book OrderBook_SetClubShare with bps = 5000
+  book <- loadBook t.f raised
+  -- Fees already collected keep their split.
+  (book.clubShareBps, book.clubFees) === (5000, 0.0)
+  -- Club rules carry the platform share, bounded the same way.
+  CT.failsAs t.f a.operator do
+    exerciseCmd t.f.created.registry ClubRegistry_SetRules with
+      replacementRules = defaultClubRules with clubShareBps = 5001
+  _ <- CT.as t.f a.operator do
+    exerciseCmd t.f.created.registry ClubRegistry_SetRules with
+      replacementRules = defaultClubRules with clubShareBps = 1000
+  pure ()

@@ -200,3 +200,19 @@ registry-backed collection and withdrawal tests.
 
 The shared UI builds wallet commands, but deployment, actual registry
 compatibility and live wallet-to-ledger verification remain separate work. Local test success must not enable unconfigured public trading.
+
+## Club fee share
+
+Club markets owe part of each taker fee to their club, as on Solana. The
+platform share (`ClubRules.clubShareBps`, 0 to 5,000 bps) is set on the club
+registry; the operator applies it to each club market's book with
+`OrderBook_SetClubShare` (only factory-scoped books may carry a share). Each
+fee-bearing fill adds the club's part, rounded down to the asset precision, to
+`OrderBook.clubFees`. It stays inside the same backed fee pool, so fills make
+no extra transfers.
+
+`OrderBook_WithdrawFees` (operator) can only take `fees.amount - clubFees`.
+The club owner withdraws the rest through `Club_WithdrawFees`, which checks the
+book belongs to the club's factory and pays the owner; the inner
+`OrderBook_WithdrawClubFees` needs both the operator (from the club contract)
+and the recipient. Changing the share affects later fills only.

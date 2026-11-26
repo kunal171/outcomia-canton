@@ -233,6 +233,7 @@ createBundle factory creator terms access proof = do
     factory = admitted.factory; assetDecimals = admitted.assetDecimals
     nextOrderId = 1; orders = []
     fees = MarketFees.FeePoolState 0.0 None
+    clubShareBps = 0; clubFees = 0.0
   pure MF.MarketCreated with
     factory = toInterfaceContractId next
     market = toInterfaceContractId market
