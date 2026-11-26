@@ -12,17 +12,79 @@
 -- Club roles never grant protocol-admin authority. Every roster change
 -- consumes the club, so changes within one club are serialized; clubs never
 -- contend with each other. Exits from positions never consult clubs.
+--
+-- Platform rules (docs/clubs-private-markets.md, "Club rules"): a club is
+-- public or private, fixed at creation; each type has a member cap, every
+-- club an admin cap, and a wallet may own a limited number of clubs. The
+-- registry counts owned clubs, so creation and ownership transfer go through
+-- it. Only public clubs may carry a listing; a protocol admin verifies it
+-- before it admits join requests (public) or direct joins (open).
 module Outcomia.Clubs where
 
 import Canton.MarketFactory qualified as MF
 import DA.List (unique)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional, isSome, optionalToList)
+import DA.Text qualified as T
 import DA.Time (addRelTime, days)
 import Outcomia.Factory
+import Outcomia.ProtocolRoles qualified as Roles
 import Outcomia.Validation (boundedText)
 
 -- | Who may create markets in a club.
 data ClubMarketPolicy = AdminsOnly | AnyMember
   deriving (Eq, Show)
+
+-- | Public clubs may be listed for discovery; private clubs are invite-only.
+data ClubKind = PrivateClub | PublicClub
+  deriving (Eq, Show)
+
+-- | How a listed club admits members: by request and admin approval, or
+-- directly.
+data ClubVisibility = RequestToJoin | OpenToAll
+  deriving (Eq, Show)
+
+-- | Discovery terms of a public club. Any change by the owner clears the
+-- protocol admin's verification.
+data ClubListing = ClubListing with
+    visibility : ClubVisibility
+    topic : Text
+    description : Text
+    verifiedBy : Optional Party
+    updatedAt : Time
+  deriving (Eq, Show)
+
+-- | A pending, seven-day request to join a listed club.
+data ClubJoinRequest = ClubJoinRequest with
+    requester : Party
+    note : Text
+    expiresAt : Time
+  deriving (Eq, Show)
+
+-- | Operator-set platform limits. Member caps are bounded by 'maxMembers',
+-- the roster size one club contract can hold.
+data ClubRules = ClubRules with
+    publicMemberCap : Int
+    privateMemberCap : Int
+    maxOwnedClubs : Int
+    maxClubAdmins : Int
+  deriving (Eq, Show)
+
+defaultClubRules : ClubRules
+defaultClubRules = ClubRules with
+  publicMemberCap = maxMembers; privateMemberCap = maxMembers
+  maxOwnedClubs = 2; maxClubAdmins = 5
+
+validRules : ClubRules -> Bool
+validRules r =
+  inRange r.publicMemberCap maxMembers && inRange r.privateMemberCap maxMembers &&
+  r.maxOwnedClubs >= 1 && r.maxOwnedClubs <= 1000 && inRange r.maxClubAdmins maxAdmins
+  where inRange v limit = v >= 1 && v <= limit
+
+memberCapFor : ClubRules -> ClubKind -> Int
+memberCapFor r PublicClub = r.publicMemberCap
+memberCapFor r PrivateClub = r.privateMemberCap
 
 -- | A pending, seven-day invitation.
 data ClubInvitation = ClubInvitation with
@@ -55,6 +117,12 @@ maxAdmins = 64
 maxInvitations : Int
 maxInvitations = 64
 
+maxJoinRequests : Int
+maxJoinRequests = 64
+
+ownedBy : Map Party Int -> Party -> Int
+ownedBy owned party = fromOptional 0 (Map.lookup party owned)
+
 -- | Allocates club numbers for one deployment and the collateral club
 -- factories admit. Any party may create a club and becomes its owner.
 template ClubRegistry
@@ -64,36 +132,79 @@ template ClubRegistry
     protocolName : Text
     assets : [FactoryAsset]
     nextClub : Int
+    rules : ClubRules
+    -- | Clubs each wallet owns right now.
+    owned : Map Party Int
   where
     signatory operator, vault
     ensure operator /= vault && boundedText 64 protocolName && nextClub > 0 &&
-      length assets <= 64 && unique (map (\a -> a.instrument) assets)
+      length assets <= 64 && unique (map (\a -> a.instrument) assets) &&
+      validRules rules && all (> 0) (Map.values owned)
 
-    -- | Inputs: the owner and a club name. Result: the club and its own
-    -- factory, which admits markets only through the club policy.
+    -- | Inputs: the owner, a club name and type. Result: the club and its own
+    -- factory, which admits markets only through the club policy. The owner
+    -- must own fewer clubs than the platform limit.
     choice ClubRegistry_CreateClub : ClubCreated
       with
         owner : Party
         name : Text
+        kind : ClubKind
       controller owner
       do
         assertMsg "Club names must be 1 to 64 characters without outer spaces" (MF.boundedLabel 64 name)
         assertMsg "Club number limit reached" (nextClub < 9223372036854775807)
+        assertMsg "This wallet already owns the maximum number of clubs"
+          (ownedBy owned owner < rules.maxOwnedClubs)
         now <- getTime
         let number = show nextClub
             clubRef = MF.PolicyRef with
               operator; namespace = protocolName; policyId = "club/" <> number
             factoryRef = MF.FactoryRef with
               operator; namespace = protocolName; factoryId = "club-" <> number
-        next <- create this with nextClub = nextClub + 1
+        next <- create this with
+          nextClub = nextClub + 1
+          owned = Map.insert owner (ownedBy owned owner + 1) owned
         factory <- create OutcomiaMarketFactory with
           operator; vault; protocolName; ref = factoryRef; admins = [owner]
           policy = MF.ByPolicy clubRef; assets; nextNumber = 1; nextPolicyNumber = 1
         club <- create Club with
           operator; owner; name; admins = [owner]; members = [owner]; invitations = []
           pendingOwner = None; marketPolicy = AdminsOnly; ref = clubRef; factoryRef
-          createdAt = now
+          createdAt = now; kind; memberCap = memberCapFor rules kind
+          adminCap = rules.maxClubAdmins; listing = None; requests = []
         pure ClubCreated with registry = next; club; factory
+
+    -- | The operator replaces the platform limits. They apply to clubs created
+    -- afterwards; 'Club_ApplyRules' brings existing clubs in line. Lowering a
+    -- limit never removes anyone.
+    choice ClubRegistry_SetRules : ContractId ClubRegistry
+      with replacementRules : ClubRules
+      controller operator
+      do
+        assertMsg "Club rules must be within the contract limits" (validRules replacementRules)
+        create this with rules = replacementRules
+
+    -- | The nominee accepts ownership through the registry, which moves the
+    -- owned-club count and holds the nominee to the owned-club limit.
+    choice ClubRegistry_AcceptOwnership : (ContractId ClubRegistry, ClubUpdated)
+      with
+        nominee : Party
+        club : ContractId Club
+        factory : ContractId OutcomiaMarketFactory
+      controller nominee
+      do
+        current <- fetch club
+        assertMsg "That club does not belong to this registry"
+          (current.operator == operator && current.ref.namespace == protocolName)
+        assertMsg "This wallet is not the nominated owner" (current.pendingOwner == Some nominee)
+        assertMsg "This wallet already owns the maximum number of clubs"
+          (ownedBy owned nominee < rules.maxOwnedClubs)
+        let previous = current.owner
+            left = ownedBy owned previous - 1
+            released = if left > 0 then Map.insert previous left owned else Map.delete previous owned
+        updated <- exercise club Club_AcceptOwnership with factory
+        next <- create this with owned = Map.insert nominee (ownedBy released nominee + 1) released
+        pure (next, updated)
 
     -- | Operator-managed collateral for clubs created from now on.
     choice ClubRegistry_SetAssets : ContractId ClubRegistry
@@ -120,9 +231,16 @@ template Club
     ref : MF.PolicyRef
     factoryRef : MF.FactoryRef
     createdAt : Time
+    kind : ClubKind
+    -- | Joins stop at this many members; lowering it never removes anyone.
+    memberCap : Int
+    -- | Promotions stop at this many admins, the owner included.
+    adminCap : Int
+    listing : Optional ClubListing
+    requests : [ClubJoinRequest]
   where
     signatory operator, owner
-    observer members, map (\i -> i.invitee) invitations
+    observer members, map (\i -> i.invitee) invitations, map (\r -> r.requester) requests
     ensure validClub this
 
     interface instance MF.EligibilityPolicy for Club where
@@ -167,8 +285,10 @@ template Club
         invitation <- pendingFor invitee invitations
         now <- getTime
         assertMsg "The invitation has expired" (now < invitation.expiresAt)
+        requireRoom this
         create this with
           members = members ++ [invitee]; invitations = withoutInvite invitee invitations
+          requests = withoutRequest invitee requests
 
     choice Club_Decline : ContractId Club
       with invitee : Party
@@ -188,17 +308,21 @@ template Club
         _ <- pendingFor invitee invitations
         create this with invitations = withoutInvite invitee invitations
 
-    -- | Any member or invitee clears expired invitations.
+    -- | Any member, invitee or requester clears expired invitations and join
+    -- requests.
     choice Club_ClearExpired : ContractId Club
       with closer : Party
       controller closer
       do
-        assertMsg "Only members and invitees can clear invitations"
-          (closer `elem` members || closer `elem` map (\i -> i.invitee) invitations)
+        assertMsg "Only members, invitees and requesters can clear expired entries"
+          (closer `elem` members || closer `elem` map (\i -> i.invitee) invitations ||
+            closer `elem` map (\r -> r.requester) requests)
         now <- getTime
         let live = filter (\i -> now < i.expiresAt) invitations
-        assertMsg "No invitation has expired" (length live < length invitations)
-        create this with invitations = live
+            liveRequests = filter (\r -> now < r.expiresAt) requests
+        assertMsg "Nothing has expired"
+          (length live < length invitations || length liveRequests < length requests)
+        create this with invitations = live; requests = liveRequests
 
     -- | Admins remove members; only the owner removes an admin; the owner
     -- cannot be removed. Removing an admin updates the club factory's admins.
@@ -236,6 +360,8 @@ template Club
       do
         assertMsg "Only members can be admins" (wallet `elem` members)
         assertMsg "The owner always stays an admin" (wallet /= owner)
+        assertMsg "This club already has the maximum number of admins"
+          (not makeAdmin || wallet `elem` admins || length admins < adminCap)
         let without = filter (/= wallet) admins
             replacement = if makeAdmin then without ++ [wallet] else without
         next <- create this with admins = replacement
@@ -255,17 +381,129 @@ template Club
         create this with pendingOwner = nominee
 
     -- | The nominee becomes owner and admin; the previous owner stays an admin.
+    -- The operator's authority is required too, so ownership only moves
+    -- through 'ClubRegistry_AcceptOwnership', which keeps owned-club counts.
     choice Club_AcceptOwnership : ClubUpdated
       with factory : ContractId OutcomiaMarketFactory
-      controller pendingOwner
+      controller operator :: optionalToList pendingOwner
       do
         nominee <- case pendingOwner of
           Some party -> pure party
           None -> abort "There is no pending ownership nomination"
+        assertMsg "This club already has the maximum number of admins"
+          (nominee `elem` admins || length admins < adminCap)
         let replacement = if nominee `elem` admins then admins else admins ++ [nominee]
         next <- create this with owner = nominee; admins = replacement; pendingOwner = None
         synced <- syncFactory factory factoryRef replacement
         pure ClubUpdated with club = next; factory = synced
+
+    -- | The operator applies current platform caps to this club. Lowering a
+    -- cap never removes members or admins; it only blocks further growth.
+    choice Club_ApplyRules : ContractId Club
+      with rules : ClubRules
+      controller operator
+      do
+        assertMsg "Club rules must be within the contract limits" (validRules rules)
+        create this with memberCap = memberCapFor rules kind; adminCap = rules.maxClubAdmins
+
+    -- | The owner lists a public club or changes its listing; any change
+    -- clears the protocol admin's verification.
+    choice Club_SetListing : ContractId Club
+      with
+        visibility : ClubVisibility
+        topic : Text
+        description : Text
+      controller owner
+      do
+        assertMsg "Only public clubs can be listed" (kind == PublicClub)
+        now <- getTime
+        let terms = ClubListing with
+              visibility; topic; description; verifiedBy = None; updatedAt = now
+        create this with listing = Some terms
+
+    -- | The owner removes the listing; pending requests stay until they are
+    -- handled or expire.
+    choice Club_CloseListing : ContractId Club
+      controller owner
+      do
+        assertMsg "This club is not listed" (isSome listing)
+        create this with listing = None
+
+    -- | A protocol admin verifies (or withdraws verification of) the listing.
+    choice Club_VerifyListing : ContractId Club
+      with
+        verifier : Party
+        protocol : ContractId Roles.ProtocolRoles
+        verified : Bool
+      controller verifier
+      do
+        roles <- view <$> fetch protocol
+        assertMsg "Only protocol admins can verify listings"
+          (roles.operator == operator && roles.protocolName == ref.namespace &&
+            -- Club factories expose their own (club) admins with a scope;
+            -- only the protocol root's admins may verify.
+            roles.scope == None && verifier `elem` roles.admins)
+        current <- case listing of
+          Some l -> pure l
+          None -> abort "This club is not listed"
+        let terms = current with verifiedBy = if verified then Some verifier else None
+        create this with listing = Some terms
+
+    -- | A wallet asks to join a verified request-to-join listing.
+    choice Club_RequestJoin : ContractId Club
+      with
+        requester : Party
+        note : Text
+      controller requester
+      do
+        assertMsg "This club does not accept join requests"
+          (listingAdmits RequestToJoin listing)
+        assertMsg "That wallet is already a member" (requester `notElem` members)
+        assertMsg "Notes are at most 140 characters" (T.length note <= 140)
+        now <- getTime
+        let request = ClubJoinRequest with
+              requester; note; expiresAt = addRelTime now (days inviteLifetimeDays)
+        create this with requests = request :: withoutRequest requester requests
+
+    -- | Any admin approves a pending request before it expires.
+    choice Club_ApproveRequest : ContractId Club
+      with
+        actor : Party
+        requester : Party
+      controller actor
+      do
+        requireAdmin this actor
+        request <- requestFrom requester requests
+        now <- getTime
+        assertMsg "The join request has expired" (now < request.expiresAt)
+        requireRoom this
+        create this with
+          members = members ++ [requester]; requests = withoutRequest requester requests
+          invitations = withoutInvite requester invitations
+
+    -- | Any admin rejects a request; the requester may cancel their own.
+    choice Club_CloseRequest : ContractId Club
+      with
+        actor : Party
+        requester : Party
+      controller actor
+      do
+        assertMsg "Only club admins or the requester can close a join request"
+          (actor == requester || actor `elem` admins)
+        _ <- requestFrom requester requests
+        create this with requests = withoutRequest requester requests
+
+    -- | A wallet joins a verified open listing directly.
+    choice Club_JoinOpen : ContractId Club
+      with wallet : Party
+      controller wallet
+      do
+        assertMsg "This club is not open to join" (listingAdmits OpenToAll listing)
+        assertMsg "That wallet is already a member" (wallet `notElem` members)
+        requireRoom this
+        create this with
+          members = members ++ [wallet]; requests = withoutRequest wallet requests
+          invitations = withoutInvite wallet invitations
 
 validClub : Club -> Bool
 validClub c =
@@ -275,11 +513,20 @@ validClub c =
   length c.invitations <= maxInvitations && unique invitees &&
   all (`notElem` c.members) invitees &&
   MF.validPolicyRef c.ref && c.ref.operator == c.operator &&
+  c.memberCap >= 1 && c.memberCap <= maxMembers &&
+  c.adminCap >= 1 && c.adminCap <= maxAdmins &&
+  length c.requests <= maxJoinRequests && unique requesters &&
+  all (`notElem` c.members) requesters &&
+  (case c.listing of
+    None -> True
+    Some l -> c.kind == PublicClub && MF.boundedLabel 32 l.topic && T.length l.description <= 280) &&
   c.factoryRef.operator == c.operator &&
   (case c.pendingOwner of
     None -> True
     Some party -> party /= c.owner && party `elem` c.members)
-  where invitees = map (\i -> i.invitee) c.invitations
+  where
+    invitees = map (\i -> i.invitee) c.invitations
+    requesters = map (\r -> r.requester) c.requests
 
 requireAdmin : Club -> Party -> Update ()
 requireAdmin club actor = assertMsg "Only club admins can do this" (actor `elem` club.admins)
@@ -291,6 +538,24 @@ pendingFor invitee invitations = case filter (\i -> i.invitee == invitee) invita
 
 withoutInvite : Party -> [ClubInvitation] -> [ClubInvitation]
 withoutInvite invitee = filter (\i -> i.invitee /= invitee)
+
+withoutRequest : Party -> [ClubJoinRequest] -> [ClubJoinRequest]
+withoutRequest requester = filter (\r -> r.requester /= requester)
+
+requestFrom : Party -> [ClubJoinRequest] -> Update ClubJoinRequest
+requestFrom requester requests = case filter (\r -> r.requester == requester) requests of
+  request :: _ -> pure request
+  [] -> abort "There is no pending join request from that wallet"
+
+-- | Joins stop at the club's member cap.
+requireRoom : Club -> Update ()
+requireRoom club = assertMsg "This club has reached its member limit" (length club.members < club.memberCap)
+
+-- | A verified listing with the given visibility.
+listingAdmits : ClubVisibility -> Optional ClubListing -> Bool
+listingAdmits wanted listing = case listing of
+  Some l -> l.visibility == wanted && isSome l.verifiedBy
+  None -> False
 
 -- | Removes a member (and admin role), clears a nomination naming them and
 -- syncs the club factory's admins.

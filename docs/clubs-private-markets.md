@@ -89,6 +89,30 @@ separate market path:
 - Operator cleanup of departed members' resting orders and member-scoped
   disclosure of club market data remain Phase E.
 
+## Club rules, listings and join requests
+
+Parity with Solana's club rules (outcomia `docs/club-rules-and-disputes.md`,
+milestone 1) and public club listings.
+
+| Rule | Canton |
+| --- | --- |
+| Club type | `ClubKind` (`PrivateClub` / `PublicClub`), fixed at creation. Only public clubs may carry a listing. |
+| Member caps | `ClubRules.publicMemberCap` / `privateMemberCap`, copied to the club as `memberCap`. Bounded by `maxMembers` (256): the roster lives in one contract, so Solana's 100,000 / 1,000 caps are not reachable until membership moves to per-member contracts. Every join path (`Club_Accept`, `Club_ApproveRequest`, `Club_JoinOpen`) checks it. |
+| Admin cap | `ClubRules.maxClubAdmins`, copied as `adminCap` (owner included); checked on promotion and ownership transfer. |
+| Owned clubs | `ClubRegistry.owned` counts clubs per owner; creation is refused at `maxOwnedClubs`. Ownership moves only through `ClubRegistry_AcceptOwnership` (`Club_AcceptOwnership` also needs the operator), which moves the count and holds the nominee to the limit. |
+| Changing rules | `ClubRegistry_SetRules` (operator) applies to new clubs; `Club_ApplyRules` (operator) updates an existing club's caps. Lowering a cap never removes anyone; it only blocks further growth. |
+| Listing | `Club_SetListing` (owner): request-to-join or open, a 1–32 character topic and up to 280 characters of description. Any change clears verification. `Club_CloseListing` removes it. |
+| Verification | `Club_VerifyListing` by an admin of the **protocol root** (`ProtocolRoles` with no scope). A club factory also implements `ProtocolRoles` with the club's own admins, so scoped roles are rejected: clubs cannot verify themselves. |
+| Join requests | `Club_RequestJoin` with a note of at most 140 characters, valid for 7 days, only on a verified request-to-join listing. Admins approve (`Club_ApproveRequest`) within the cap or reject; the requester can cancel (`Club_CloseRequest`); expired requests are cleared with invitations (`Club_ClearExpired`). |
+| Open joins | `Club_JoinOpen` on a verified open listing, within the cap. |
+
+**Discovery and privacy.** Strangers cannot see a club contract. The app's
+operator service serves only **verified public** clubs, each with a disclosure
+so a wallet can request or join. Disclosure hands over the whole club
+contract, including its member list, to wallets that interact with it, as on
+Solana where everything is public. Private clubs are never disclosed;
+requesters observe the club only while their request is pending.
+
 ## Visibility matrix
 
 | Data | Who receives it |

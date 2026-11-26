@@ -4,6 +4,7 @@ module Outcomia.ClubsTest where
 
 import Canton.MarketFactory qualified as MF
 import DA.Assert ((===))
+import DA.Map qualified as Map
 import DA.Time (addRelTime, days)
 import Daml.Script
 import Splice.Api.Token.HoldingV2 qualified as H
@@ -42,9 +43,9 @@ setup = script do
     createCmd ClubRegistry with
       operator = a.operator; vault = custody.vault; protocolName = "outcomia"
       assets = [FactoryAsset with instrument = a.instrument; admission = a.admission]
-      nextClub = 1
+      nextClub = 1; rules = defaultClubRules; owned = Map.empty
   created <- submit (actAs owner <> readAs a.operator) do
-    exerciseCmd registry ClubRegistry_CreateClub with owner; name = "Chess club"
+    exerciseCmd registry ClubRegistry_CreateClub with owner; name = "Chess club"; kind = PublicClub
   pure Fixture with custody; owner; bob; outsider; created
 
 as : Fixture -> Party -> Commands b -> Script b
@@ -87,9 +88,9 @@ test_creating_a_club_sets_up_the_roster_and_factory = script do
   -- The owner sees the club from their own wallet.
   Some _ <- queryContractId f.owner f.created.club
   failsAs f f.outsider do
-    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = " padded"
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = " padded"; kind = PrivateClub
   second <- as f f.outsider do
-    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = "Rival"
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = "Rival"; kind = PrivateClub
   rival <- clubValue f second.club
   rival.ref.policyId === "club/2"
 
@@ -145,7 +146,7 @@ test_club_markets_follow_the_club_policy = script do
   second.ref.number === 2
   -- Another club cannot stand in as this factory's policy.
   rival <- as f f.outsider do
-    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = "Rival"
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = "Rival"; kind = PrivateClub
   failsAs f f.outsider do createMarket f (fromInterfaceContractId second.factory) f.outsider rival.club MF.Public
 
 test_members_only_entry_stops_at_removal_while_exits_work : Script ()
@@ -223,7 +224,16 @@ test_ownership_moves_only_when_the_nominee_accepts = script do
   failsAs f f.owner do exerciseCmd club Club_Nominate with nominee = Some f.outsider
   nominated <- as f f.owner do exerciseCmd club Club_Nominate with nominee = Some f.bob
   failsAs f f.outsider do exerciseCmd nominated Club_AcceptOwnership with factory = f.created.factory
-  transferred <- as f f.bob do exerciseCmd nominated Club_AcceptOwnership with factory = f.created.factory
+  -- Ownership moves only through the registry, which keeps owned-club counts.
+  failsAs f f.bob do exerciseCmd nominated Club_AcceptOwnership with factory = f.created.factory
+  failsAs f f.outsider do
+    exerciseCmd f.created.registry ClubRegistry_AcceptOwnership with
+      nominee = f.outsider; club = nominated; factory = f.created.factory
+  (registry, transferred) <- as f f.bob do
+    exerciseCmd f.created.registry ClubRegistry_AcceptOwnership with
+      nominee = f.bob; club = nominated; factory = f.created.factory
+  Some counts <- queryContractId op registry
+  counts.owned === Map.fromList [(f.bob, 1)]
   value <- clubValue f transferred.club
   (value.owner, value.admins, value.pendingOwner) === (f.bob, [f.owner, f.bob], None)
   Some factory <- queryContractId op transferred.factory
