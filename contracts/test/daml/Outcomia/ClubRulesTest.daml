@@ -1,0 +1,184 @@
+-- | Platform club rules and discovery: club types, member and admin caps,
+-- the owned-club limit, listings verified by protocol admins, join requests
+-- and open joins.
+module Outcomia.ClubRulesTest where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, days)
+import Daml.Script
+import Outcomia.Binary
+import Outcomia.Clubs
+import Outcomia.ClubsTest (Fixture(..), admitWallet, as, clubValue, failsAs, operatorOf, setup)
+import Outcomia.ProtocolRoles qualified as Roles
+
+-- | A protocol root with one extra admin who verifies listings.
+protocolWithAdmin : Fixture -> Script (Party, ContractId Roles.ProtocolRoles)
+protocolWithAdmin f = do
+  let op = operatorOf f
+  admin <- allocateParty "ProtocolAdmin"
+  protocol <- submit op do
+    createCmd Protocol with
+      operator = op; protocolName = "outcomia"; admins = [op, admin]
+      nextMarketId = 1; takerFeeBps = 0; feeRevision = 0
+  pure (admin, toInterfaceContractId protocol)
+
+setRules : Fixture -> ContractId ClubRegistry -> ClubRules -> Script (ContractId ClubRegistry)
+setRules f registry rules =
+  as f (operatorOf f) do exerciseCmd registry ClubRegistry_SetRules with replacementRules = rules
+
+test_owners_are_held_to_the_owned_club_limit : Script ()
+test_owners_are_held_to_the_owned_club_limit = script do
+  f <- setup
+  -- The setup club is the owner's first; the default limit is two.
+  second <- as f f.owner do
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with
+      owner = f.owner; name = "Second"; kind = PrivateClub
+  failsAs f f.owner do
+    exerciseCmd second.registry ClubRegistry_CreateClub with
+      owner = f.owner; name = "Third"; kind = PrivateClub
+  -- Only the operator changes the rules, and only within contract limits.
+  failsAs f f.owner do
+    exerciseCmd second.registry ClubRegistry_SetRules with
+      replacementRules = defaultClubRules with maxOwnedClubs = 3
+  failsAs f (operatorOf f) do
+    exerciseCmd second.registry ClubRegistry_SetRules with
+      replacementRules = defaultClubRules with publicMemberCap = maxMembers + 1
+  failsAs f (operatorOf f) do
+    exerciseCmd second.registry ClubRegistry_SetRules with
+      replacementRules = defaultClubRules with maxClubAdmins = 0
+  raised <- setRules f second.registry (defaultClubRules with maxOwnedClubs = 3)
+  third <- as f f.owner do
+    exerciseCmd raised ClubRegistry_CreateClub with owner = f.owner; name = "Third"; kind = PublicClub
+  club <- clubValue f third.club
+  (club.kind, club.memberCap, club.adminCap) === (PublicClub, maxMembers, 5)
+
+test_member_caps_follow_the_type_and_never_evict : Script ()
+test_member_caps_follow_the_type_and_never_evict = script do
+  f <- setup
+  registry <- setRules f f.created.registry (defaultClubRules with privateMemberCap = 2)
+  created <- as f f.owner do
+    exerciseCmd registry ClubRegistry_CreateClub with owner = f.owner; name = "Small"; kind = PrivateClub
+  full <- admitWallet f created.club f.bob
+  invited <- as f f.owner do exerciseCmd full Club_Invite with inviter = f.owner; invitee = f.outsider
+  failsAs f f.outsider do exerciseCmd invited Club_Accept with invitee = f.outsider
+  -- Lowering a cap keeps members; only the operator applies rules to a club.
+  failsAs f f.owner do
+    exerciseCmd invited Club_ApplyRules with rules = defaultClubRules with privateMemberCap = 1
+  lowered <- as f (operatorOf f) do
+    exerciseCmd invited Club_ApplyRules with rules = defaultClubRules with privateMemberCap = 1
+  value <- clubValue f lowered
+  (value.memberCap, length value.members) === (1, 2)
+
+test_admins_are_capped_including_the_owner : Script ()
+test_admins_are_capped_including_the_owner = script do
+  f <- setup
+  club <- admitWallet f f.created.club f.bob
+  club <- admitWallet f club f.outsider
+  capped <- as f (operatorOf f) do
+    exerciseCmd club Club_ApplyRules with rules = defaultClubRules with maxClubAdmins = 2
+  promoted <- as f f.owner do
+    exerciseCmd capped Club_SetAdmin with wallet = f.bob; makeAdmin = True; factory = f.created.factory
+  failsAs f f.owner do
+    exerciseCmd promoted.club Club_SetAdmin with
+      wallet = f.outsider; makeAdmin = True; factory = promoted.factory
+  -- Demotion is always allowed.
+  demoted <- as f f.owner do
+    exerciseCmd promoted.club Club_SetAdmin with
+      wallet = f.bob; makeAdmin = False; factory = promoted.factory
+  value <- clubValue f demoted.club
+  value.admins === [f.owner]
+
+test_only_root_admins_verify_public_listings : Script ()
+test_only_root_admins_verify_public_listings = script do
+  f <- setup
+  (admin, protocol) <- protocolWithAdmin f
+  -- Private clubs cannot be listed.
+  private <- as f f.outsider do
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with
+      owner = f.outsider; name = "Hidden"; kind = PrivateClub
+  failsAs f f.outsider do
+    exerciseCmd private.club Club_SetListing with
+      visibility = RequestToJoin; topic = "Chess"; description = ""
+  failsAs f f.bob do
+    exerciseCmd f.created.club Club_SetListing with
+      visibility = RequestToJoin; topic = "Chess"; description = ""
+  failsAs f f.owner do
+    exerciseCmd f.created.club Club_SetListing with
+      visibility = RequestToJoin; topic = " padded"; description = ""
+  listed <- as f f.owner do
+    exerciseCmd f.created.club Club_SetListing with
+      visibility = RequestToJoin; topic = "Chess"; description = "Weekly puzzles"
+  -- Unverified listings admit nobody.
+  failsAs f f.bob do exerciseCmd listed Club_RequestJoin with requester = f.bob; note = "Hi"
+  -- A club's own factory exposes the club admins with a scope; it cannot verify.
+  failsAs f f.owner do
+    exerciseCmd listed Club_VerifyListing with
+      verifier = f.owner; protocol = toInterfaceContractId f.created.factory; verified = True
+  failsAs f f.bob do
+    exerciseCmd listed Club_VerifyListing with verifier = f.bob; protocol; verified = True
+  verified <- submit (actAs admin <> readAs (operatorOf f)) do
+    exerciseCmd listed Club_VerifyListing with verifier = admin; protocol; verified = True
+  value <- clubValue f verified
+  (fmap (.verifiedBy) value.listing) === Some (Some admin)
+  -- Any change by the owner clears verification.
+  changed <- as f f.owner do
+    exerciseCmd verified Club_SetListing with
+      visibility = RequestToJoin; topic = "Chess"; description = "Monthly"
+  after <- clubValue f changed
+  (fmap (.verifiedBy) after.listing) === Some None
+  closed <- as f f.owner do exerciseCmd changed Club_CloseListing
+  final <- clubValue f closed
+  final.listing === None
+
+test_join_requests_are_approved_rejected_cancelled_and_expire : Script ()
+test_join_requests_are_approved_rejected_cancelled_and_expire = script do
+  f <- setup
+  (admin, protocol) <- protocolWithAdmin f
+  listed <- as f f.owner do
+    exerciseCmd f.created.club Club_SetListing with
+      visibility = RequestToJoin; topic = "Chess"; description = ""
+  open <- submit (actAs admin <> readAs (operatorOf f)) do
+    exerciseCmd listed Club_VerifyListing with verifier = admin; protocol; verified = True
+  -- Requests: notes are bounded; members cannot request; open joins are refused.
+  failsAs f f.bob do exerciseCmd open Club_RequestJoin with requester = f.bob; note = mconcat (replicate 141 "x")
+  failsAs f f.owner do exerciseCmd open Club_RequestJoin with requester = f.owner; note = ""
+  failsAs f f.bob do exerciseCmd open Club_JoinOpen with wallet = f.bob
+  requested <- as f f.bob do exerciseCmd open Club_RequestJoin with requester = f.bob; note = "Rated 1800"
+  -- The requester sees the club; a non-admin cannot approve.
+  Some _ <- queryContractId f.bob requested
+  failsAs f f.outsider do exerciseCmd requested Club_ApproveRequest with actor = f.outsider; requester = f.bob
+  approved <- as f f.owner do exerciseCmd requested Club_ApproveRequest with actor = f.owner; requester = f.bob
+  value <- clubValue f approved
+  (value.members, value.requests) === ([f.owner, f.bob], [])
+  -- Reject (admin) and cancel (requester).
+  again <- as f f.outsider do exerciseCmd approved Club_RequestJoin with requester = f.outsider; note = ""
+  failsAs f f.bob do exerciseCmd again Club_CloseRequest with actor = f.bob; requester = f.outsider
+  rejected <- as f f.owner do exerciseCmd again Club_CloseRequest with actor = f.owner; requester = f.outsider
+  once <- as f f.outsider do exerciseCmd rejected Club_RequestJoin with requester = f.outsider; note = ""
+  cancelled <- as f f.outsider do exerciseCmd once Club_CloseRequest with actor = f.outsider; requester = f.outsider
+  -- Expiry: approval fails after seven days and anyone involved clears it.
+  expiring <- as f f.outsider do exerciseCmd cancelled Club_RequestJoin with requester = f.outsider; note = ""
+  now <- getTime
+  setTime (addRelTime now (days 7))
+  failsAs f f.owner do exerciseCmd expiring Club_ApproveRequest with actor = f.owner; requester = f.outsider
+  cleared <- as f f.outsider do exerciseCmd expiring Club_ClearExpired with closer = f.outsider
+  final <- clubValue f cleared
+  final.requests === []
+
+test_open_listings_admit_direct_joins_within_the_cap : Script ()
+test_open_listings_admit_direct_joins_within_the_cap = script do
+  f <- setup
+  (admin, protocol) <- protocolWithAdmin f
+  capped <- as f (operatorOf f) do
+    exerciseCmd f.created.club Club_ApplyRules with rules = defaultClubRules with publicMemberCap = 2
+  listed <- as f f.owner do
+    exerciseCmd capped Club_SetListing with visibility = OpenToAll; topic = "Chess"; description = ""
+  failsAs f f.bob do exerciseCmd listed Club_JoinOpen with wallet = f.bob
+  open <- submit (actAs admin <> readAs (operatorOf f)) do
+    exerciseCmd listed Club_VerifyListing with verifier = admin; protocol; verified = True
+  failsAs f f.bob do exerciseCmd open Club_RequestJoin with requester = f.bob; note = ""
+  joined <- as f f.bob do exerciseCmd open Club_JoinOpen with wallet = f.bob
+  failsAs f f.bob do exerciseCmd joined Club_JoinOpen with wallet = f.bob
+  failsAs f f.outsider do exerciseCmd joined Club_JoinOpen with wallet = f.outsider
+  value <- clubValue f joined
+  value.members === [f.owner, f.bob]
