@@ -1,6 +1,6 @@
 # Multi-outcome markets on Canton
 
-Status: **MO1 contracts built (2026-11-26)**; MO1 UI and MO2–MO4 pending
+Status: **MO1 built (2026-11-26)**, contracts and UI; MO2–MO4 pending
 (see [Progress](#progress)). It brings
 Canton to parity with Solana's multi-outcome markets
 (kunal171/outcomia `docs/multi-outcome-markets.md`), changed only where
@@ -82,15 +82,27 @@ the operator service, which proposes fills and the ledger revalidates.
   split/merge, admin resolution with corrections, close, winner and invalid
   payouts.
 
+**MO1 UI — done** (outcomia-solana branch `feat/canton-multi-outcome-mo1`).
+
+- `app/lib/canton/model.ts`: the six `Multi*` templates, `finalRecord`,
+  `multiResult`, decoding checks. `transport.ts` reads the wallet's `MultiLot`s.
+- `app/lib/canton/commands.ts`: `multiSplit`, `multiMerge`, `multiRedeem`,
+  `multiClose`, `multiPropose`, `multiCorrect`, `multiFinalize`, `multiBind`;
+  `standardTerms` accepts 2–8 unique labels. `server.ts` allows registry
+  context for split, merge and redeem.
+- `app/lib/canton/multi.ts`: `lotTotals`, `multiClaim`, `parseOutcomes`.
+- `app/components/canton/multi-market.tsx`: outcomes with holdings, mint and
+  return complete sets, claim, close, propose/correct, finalize, prepare claims,
+  rules. The create form (`manage.tsx`) has a YES/NO or multiple-outcomes switch
+  (one `Label: criterion` per line).
+- `app/scripts/canton-multi.test.mjs` (5 tests, part of `npm run test:canton`).
+
 **Next steps**
 
-1. MO1 UI in `outcomia-solana/app` (Canton side): `lib/canton/commands.ts`
-   actions `multiSplit`, `multiMerge`, `multiPropose`, `multiCorrect`,
-   `multiClose`, `multiFinalize`, `multiBind`, `multiRedeem`; templates in
-   `lib/canton/server.ts` queries; create form accepting 2–8 outcome rows;
-   market page listing outcomes, the holder's `MultiLot` counts and the
-   resolution state.
-2. MO2: `MultiBook` / `MultiOrder` / `MultiFill` with per-outcome place,
+1. MO2: `MultiBook` / `MultiOrder` / `MultiFill` with per-outcome place,
    cancel and same-outcome matching, reusing `Fees` quotes, eligibility and the
-   club fee share (`clubShareBps`).
-3. MO3 full-set matching; MO4 indexer history.
+   club fee share (`clubShareBps`). Create the book in `createMulti`. UI: trade
+   ticket per outcome, book view, operator match, orders list; show `MultiLot`s
+   on the positions page.
+2. MO3 full-set matching (mint when buy prices sum ≤ 1, merge when sell prices
+   sum ≥ 1); MO4 indexer history.
