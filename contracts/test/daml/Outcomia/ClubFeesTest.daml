@@ -13,6 +13,9 @@ import Outcomia.ClubsTest qualified as CT
 import Outcomia.Custody
 import Outcomia.CustodyTest qualified as C
 import Outcomia.Fees qualified as Fees
+import Outcomia.MultiOrders
+import Outcomia.MultiOutcome
+import Outcomia.MultiOutcomeTest qualified as MT
 import Outcomia.Orders
 import Outcomia.Positions
 import Outcomia.TokenHarness
@@ -133,3 +136,72 @@ test_only_the_operator_sets_a_bounded_share_on_club_books = script do
     exerciseCmd t.f.created.registry ClubRegistry_SetRules with
       replacementRules = defaultClubRules with clubShareBps = 1000
   pure ()
+
+-- | The same split in a members-only 4-outcome club market: the owner
+-- withdraws the club's part of a multi-outcome book's fees through the club.
+test_the_club_owner_withdraws_multi_outcome_fees : Script ()
+test_the_club_owner_withdraws_multi_outcome_fees = script do
+  f <- CT.setup
+  let a = f.custody.asset
+      c = f.custody
+      reads = [a.operator, a.issuer, c.vault, a.alice, a.bob, f.owner]
+  funded <- C.deposit c c.balance 5.0 [toInterfaceContractId @H.Holding a.input]
+  club <- CT.admitWallet f f.created.club a.alice
+  club <- CT.admitWallet f club a.bob
+  value <- CT.clubValue f club
+  created <- CT.as f f.owner do
+    exerciseCmd (toInterfaceContractId @MF.MarketFactory f.created.factory) MF.MarketFactory_Create with
+      creator = f.owner; terms = MT.fourTerms a; access = MF.Restricted value.ref; proof = CT.clubProof club
+  let market = fromInterfaceContractId @MultiMarket created.market
+      proof = Some EligibilityProof with policy = toInterfaceContractId club; evidence = []
+  policy <- submit a.operator do
+    exerciseCmd a.protocol Protocol_SetTakerFee with replacementFeeBps = 25
+  (_, bobAccount) <- submit (actAs a.bob <> readAs a.operator) do
+    exerciseCmd c.authority VaultAuthority_OpenBalance with owner = a.bob; admission = a.admission
+  input <- submit a.issuer do
+    createCmd TestHolding with
+      issuer = a.issuer; account = H.Account (Some a.bob) None ""
+      instrument = H.InstrumentId a.issuer "test-USD"; amount = 5.0; locked = None
+  bobFunded <- submit (actAs a.bob <> readAs reads) do
+    exerciseCmd bobAccount AssetBalance_Deposit with
+      admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0
+      extraArgs = C.registryContext
+  [(reserve, _)] <- query @MultiReserve c.vault
+  split <- submit (actAs a.bob <> readAs reads) do
+    exerciseCmd reserve MultiReserve_Split with
+      owner = a.bob; market; balance = bobFunded.balance; quantity = 3
+      extraArgs = C.registryContext; eligibility = proof
+  [(book, _)] <- query @MultiBook c.vault
+  shared <- submit a.operator do exerciseCmd book MultiBook_SetClubShare with bps = 2000
+  let terms = Fees.FeeTerms 25 6
+  ask <- submit (actAs a.bob <> readAs reads) do
+    exerciseCmd shared MultiBook_PlaceSell with
+      owner = a.bob; market; positions = [split.position]; outcome = 1; price = 0.4; quantity = 3
+      feePolicy = policy; expectedFeeRevision = 1; expectedFeeTerms = terms; eligibility = proof
+  bid <- submit (actAs a.alice <> readAs reads) do
+    exerciseCmd ask.book MultiBook_PlaceBuy with
+      owner = a.alice; market; balance = funded.balance; outcome = 1; price = 0.6; quantity = 3
+      feePolicy = policy; expectedFeeRevision = 1; expectedFeeTerms = terms
+      extraArgs = C.registryContext; eligibility = proof
+  Some buyerBalance <- pure bid.balance
+  settled <- submit (actAs a.operator <> readAs reads) do
+    exerciseCmd bid.book MultiBook_MatchBest with
+      market; outcome = 1; buyerBalance; sellerBalance = split.balance
+      extraArgs = C.registryContext; buyerEligibility = proof; sellerEligibility = proof
+  Some traded <- queryContractId c.vault settled.book
+  (traded.fees.amount, traded.clubFees) === (0.003, 0.0006)
+  -- A member who is not the owner cannot withdraw, nor can the owner take more than is owed.
+  CT.failsAs f a.alice do
+    exerciseCmd club Club_WithdrawMultiFees with book = settled.book; amount = 0.0006; extraArgs = C.registryContext
+  CT.failsAs f f.owner do
+    exerciseCmd club Club_WithdrawMultiFees with book = settled.book; amount = 0.0007; extraArgs = C.registryContext
+  paid <- CT.as f f.owner do
+    exerciseCmd club Club_WithdrawMultiFees with book = settled.book; amount = 0.0006; extraArgs = C.registryContext
+  Some final <- queryContractId c.vault paid.book
+  (final.fees.amount, final.clubFees) === (0.0024, 0.0)
+  length paid.walletHoldings === 1
+  -- Another club's owner cannot reach this book through their own club.
+  rival <- CT.as f f.outsider do
+    exerciseCmd f.created.registry ClubRegistry_CreateClub with owner = f.outsider; name = "Rival"; kind = PrivateClub
+  CT.failsAs f f.outsider do
+    exerciseCmd rival.club Club_WithdrawMultiFees with book = paid.book; amount = 0.0001; extraArgs = C.registryContext
