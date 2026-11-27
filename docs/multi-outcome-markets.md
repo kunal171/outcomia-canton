@@ -1,6 +1,6 @@
 # Multi-outcome markets on Canton
 
-Status: **MO1–MO2 merged; MO3–MO4 built (2026-11-27)** in contracts, indexer and UI
+Status: **MO1–MO4 merged (2026-11-27)** in contracts, indexer and UI
 (see [Progress](#progress)). It brings
 Canton to parity with Solana's multi-outcome markets
 (kunal171/outcomia `docs/multi-outcome-markets.md`), changed only where
@@ -136,21 +136,26 @@ books.
 - Tests: `MultiFullSetTest.daml` (mint with taker improvement and a partial
   remainder, merge, self-trade cancellation, planner edges).
 
-**MO4 indexer — done** (outcomia-canton-indexer branch
-`feat/multi-outcome-history`): models `multi_markets`, `multi_reserves`,
+**MO4 indexer — merged** (outcomia-canton-indexer #5): models `multi_markets`, `multi_reserves`,
 `multi_proposals`, `multi_finals`, `multi_orders`, `multi_trade_fills` (volume
 by outcome) and `multi_full_set_fills` (sets by side). The engine's limits
 (16 models, 4 group-by fields, object fields only) leave out settled reserves,
 lot counts and full-set legs.
 
-**MO3/MO4 UI — done** (outcomia-solana branch
-`feat/canton-multi-outcome-mo3-mo4`): `multiMatchFullSet` command and operator
+**MO3/MO4 UI — merged** (outcomia #103): `multiMatchFullSet` command and operator
 form; best bid/ask, implied prices through full sets and last trade per
 outcome; the catalog publishes a party-free fill history shown as recent
 activity on the market page.
 
+**Follow-ups — done:** `ClubFeesTest` covers `Club_WithdrawMultiFees` (only the
+owner, at most what is owed, not through another club); the Positions page
+lists multi-outcome lots by market with per-outcome counts and the claim once
+the market is settled.
+
 **Next steps**
 
-1. Point the app's charts at the Canton indexer once it is deployed (today the
-   activity list reads receipts from the ledger catalog).
-2. A club test for `Club_WithdrawMultiFees`; multi lots on the Positions page.
+1. Point the app's charts at the Canton indexer once it is deployed. Today the
+   activity list reads receipts from the ledger catalog. The indexer runs only
+   against LocalNet: CantonGrid 0.4.0 does not support remote or TestNet
+   sources, so this waits on a CantonGrid release with remote support and an
+   authorized TestNet participant.
