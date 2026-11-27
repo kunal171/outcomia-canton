@@ -30,6 +30,7 @@ import DA.Text qualified as T
 import DA.Time (addRelTime, days)
 import Outcomia.Factory
 import Outcomia.Orders (FeeWithdrawalResult, OrderBook(..), OrderBook_WithdrawClubFees(..), maxClubShareBps)
+import Outcomia.MultiOrders (MultiBook(..), MultiBook_WithdrawClubFees(..), MultiFeeWithdrawal)
 import Outcomia.ProtocolRoles qualified as Roles
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Outcomia.Validation (boundedText)
@@ -425,6 +426,19 @@ template Club
         assertMsg "That order book is not one of this club's markets"
           (current.key.operator == operator && current.key.scope == Some factoryRef)
         exercise book OrderBook_WithdrawClubFees with recipient = owner; amount; extraArgs
+
+    -- | The same, from a multi-outcome market's book.
+    nonconsuming choice Club_WithdrawMultiFees : MultiFeeWithdrawal
+      with
+        book : ContractId MultiBook
+        amount : Decimal
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        current <- fetch book
+        assertMsg "That order book is not one of this club's markets"
+          (current.key.operator == operator && current.key.scope == Some factoryRef)
+        exercise book MultiBook_WithdrawClubFees with recipient = owner; amount; extraArgs
 
     -- | The owner lists a public club or changes its listing; any change
     -- clears the protocol admin's verification.
