@@ -1,0 +1,223 @@
+-- | Multi-outcome order books: per-outcome placement, best-price fills with
+-- fees and price improvement, self-trade cancellation, cancellation and the
+-- club fee share.
+module Outcomia.MultiOrdersTest where
+
+import DA.Assert ((===))
+import Daml.Script
+import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.Binary (Protocol_SetTakerFee(..))
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Fees qualified as Fees
+import Outcomia.FactoryTest qualified as FT
+import Outcomia.MultiOrders
+import Outcomia.MultiOutcome
+import Outcomia.MultiOutcomeTest qualified as MT
+import Outcomia.TokenHarness
+import Outcomia.Types
+
+data Desk = Desk with
+    m : MT.Market
+    book : ContractId MultiBook
+    -- | Alice's account after splitting 3 sets, and her lot of 3 of each.
+    alice : ContractId AssetBalance
+    lot : ContractId MultiLot
+    -- | Bob's funded account (5 units).
+    bob : ContractId AssetBalance
+    reserve : ContractId MultiReserve
+  deriving (Eq, Show)
+
+-- | A 4-outcome market; Alice holds 3 sets, Bob has 5 units of cash.
+desk : Script Desk
+desk = script do
+  m <- MT.open
+  let a = FT.asset m.f
+      c = m.f.custody
+  made <- MT.split m 3
+  (_, account) <- submit (actAs a.bob <> readAs a.operator) do
+    exerciseCmd c.authority VaultAuthority_OpenBalance with owner = a.bob; admission = a.admission
+  input <- submit a.issuer do
+    createCmd TestHolding with
+      issuer = a.issuer; account = H.Account (Some a.bob) None ""
+      instrument = H.InstrumentId a.issuer "test-USD"; amount = 5.0; locked = None
+  funded <- submit (actAs a.bob <> readAs (MT.reads m.f)) do
+    exerciseCmd account AssetBalance_Deposit with
+      admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0
+      extraArgs = C.registryContext
+  [(book, _)] <- query @MultiBook c.vault
+  pure Desk with
+    m; book; alice = made.balance; lot = made.position; bob = funded.balance; reserve = made.reserve
+
+as : Desk -> Party -> Commands a -> Script a
+as d party cmds = submit (actAs party <> readAs (MT.reads d.m.f)) cmds
+
+zeroFee : Fees.FeeTerms
+zeroFee = Fees.FeeTerms 0 6
+
+sell : Desk -> ContractId MultiBook -> Int -> Decimal -> Int -> Script MultiPlacement
+sell d book outcome price quantity = let a = FT.asset d.m.f in as d a.alice do
+  exerciseCmd book MultiBook_PlaceSell with
+    owner = a.alice; market = d.m.market; positions = [d.lot]; outcome; price; quantity
+    feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = zeroFee; eligibility = None
+
+buy : Desk -> ContractId MultiBook -> Party -> ContractId AssetBalance -> Int -> Decimal -> Int -> Script MultiPlacement
+buy d book owner balance outcome price quantity = let a = FT.asset d.m.f in as d owner do
+  exerciseCmd book MultiBook_PlaceBuy with
+    owner; market = d.m.market; balance; outcome; price; quantity
+    feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = zeroFee
+    extraArgs = C.registryContext; eligibility = None
+
+loadBook : Desk -> ContractId MultiBook -> Script MultiBook
+loadBook d cid = do
+  Some value <- queryContractId d.m.f.custody.vault cid
+  pure value
+
+test_sells_and_buys_fill_per_outcome : Script ()
+test_sells_and_buys_fill_per_outcome = script do
+  d <- desk
+  let a = FT.asset d.m.f
+  ask <- sell d d.book 2 0.3 2
+  -- The rest of Alice's lot stays usable: 3 of each, minus 2 Green.
+  Some (Some rest) <- pure (Some ask.remainder)
+  Some left <- queryContractId d.m.f.custody.vault rest
+  left.counts === [3, 3, 1, 3]
+  -- A Blue bid does not cross a Green ask.
+  blue <- buy d ask.book a.bob d.bob 1 0.5 1
+  Some bobAfterBlue <- pure blue.balance
+  bid <- buy d blue.book a.bob bobAfterBlue 2 0.4 3
+  Some bobBalance <- pure bid.balance
+  -- Bob escrowed 0.5 + 1.2.
+  freeOf d bobBalance >>= (=== 3.3)
+  filled <- as d a.operator do
+    exerciseCmd bid.book MultiBook_MatchBest with
+      market = d.m.market; outcome = 2; buyerBalance = bobBalance; sellerBalance = d.alice
+      extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
+  case filled.decision of
+    MultiFill plan -> (plan.price, plan.quantity, plan.buyerRemaining) === (0.3, 2, 1)
+    other -> abort ("Expected a fill, got " <> show other)
+  [bobAfter, aliceAfter] <- pure filled.balances
+  -- Alice receives 0.60; Bob gets 0.20 price improvement back, 1 remains bid.
+  freeOf d aliceAfter >>= (=== 2.6)
+  freeOf d bobAfter >>= (=== 3.5)
+  Some (Some lotId) <- pure (Some filled.position)
+  Some bought <- queryContractId d.m.f.custody.vault lotId
+  (bought.owner, bought.counts) === (a.bob, [0, 0, 2, 0])
+  book <- loadBook d filled.book
+  map (\r -> (r.outcome, r.side)) book.orders === [(1, Buy), (2, Buy)]
+  -- No more Green asks: nothing else crosses.
+  submitMustFail (actAs a.operator <> readAs (MT.reads d.m.f)) do
+    exerciseCmd filled.book MultiBook_MatchBest with
+      market = d.m.market; outcome = 2; buyerBalance = bobAfter; sellerBalance = aliceAfter
+      extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
+
+test_taker_fees_and_club_share : Script ()
+test_taker_fees_and_club_share = script do
+  d <- desk
+  let a = FT.asset d.m.f
+  policy <- submit a.operator do exerciseCmd a.protocol Protocol_SetTakerFee with replacementFeeBps = 25
+  shared <- as d a.operator do exerciseCmd d.book MultiBook_SetClubShare with bps = 2000
+  let terms = Fees.FeeTerms 25 6
+  ask <- as d a.alice do
+    exerciseCmd shared MultiBook_PlaceSell with
+      owner = a.alice; market = d.m.market; positions = [d.lot]; outcome = 0; price = 0.4; quantity = 3
+      feePolicy = policy; expectedFeeRevision = 1; expectedFeeTerms = terms; eligibility = None
+  bid <- as d a.bob do
+    exerciseCmd ask.book MultiBook_PlaceBuy with
+      owner = a.bob; market = d.m.market; balance = d.bob; outcome = 0; price = 0.6; quantity = 3
+      feePolicy = policy; expectedFeeRevision = 1; expectedFeeTerms = terms
+      extraArgs = C.registryContext; eligibility = None
+  Some bobBalance <- pure bid.balance
+  filled <- as d a.operator do
+    exerciseCmd bid.book MultiBook_MatchBest with
+      market = d.m.market; outcome = 0; buyerBalance = bobBalance; sellerBalance = d.alice
+      extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
+  book <- loadBook d filled.book
+  -- Bob is taker on 1.20: 25 bps is 0.003, of which 20% is owed to the club.
+  (book.fees.amount, book.clubFees) === (0.003, 0.0006)
+  submitMustFail (actAs a.operator <> readAs (MT.reads d.m.f)) do
+    exerciseCmd filled.book MultiBook_WithdrawFees with amount = 0.003; extraArgs = C.registryContext
+  paid <- as d a.operator do
+    exerciseCmd filled.book MultiBook_WithdrawFees with amount = 0.0024; extraArgs = C.registryContext
+  left <- loadBook d paid.book
+  left.fees.amount === 0.0006
+  submitMustFail a.operator do exerciseCmd paid.book MultiBook_SetClubShare with bps = 5001
+
+test_self_cross_cancels_the_newer_order : Script ()
+test_self_cross_cancels_the_newer_order = script do
+  d <- desk
+  let a = FT.asset d.m.f
+  ask <- sell d d.book 1 0.4 1
+  bid <- buy d ask.book a.alice d.alice 1 0.5 1
+  Some aliceBalance <- pure bid.balance
+  done <- as d a.operator do
+    exerciseCmd bid.book MultiBook_MatchBest with
+      market = d.m.market; outcome = 1; buyerBalance = aliceBalance; sellerBalance = aliceBalance
+      extraArgs = C.registryContext; buyerEligibility = None; sellerEligibility = None
+  done.decision === MultiCancelSelfTrade 2
+  [refunded] <- pure done.balances
+  freeOf d refunded >>= (=== 2.0)
+  book <- loadBook d done.book
+  map (\r -> (r.orderId, r.side)) book.orders === [(1, Sell)]
+
+test_cancel_restores_backing_and_works_after_close : Script ()
+test_cancel_restores_backing_and_works_after_close = script do
+  d <- desk
+  let a = FT.asset d.m.f
+  ask <- sell d d.book 3 0.7 3
+  bid <- buy d ask.book a.bob d.bob 0 0.5 2
+  Some bobBalance <- pure bid.balance
+  -- An unknown outcome index and an off-tick price are rejected.
+  submitMustFail (actAs a.bob <> readAs (MT.reads d.m.f)) do
+    exerciseCmd bid.book MultiBook_PlaceBuy with
+      owner = a.bob; market = d.m.market; balance = bobBalance; outcome = 4; price = 0.5; quantity = 1
+      feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = zeroFee
+      extraArgs = C.registryContext; eligibility = None
+  submitMustFail (actAs a.bob <> readAs (MT.reads d.m.f)) do
+    exerciseCmd bid.book MultiBook_PlaceBuy with
+      owner = a.bob; market = d.m.market; balance = bobBalance; outcome = 0; price = 0.505; quantity = 1
+      feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = zeroFee
+      extraArgs = C.registryContext; eligibility = None
+  closed <- submit (actAs d.m.f.admin <> readAs a.operator) do
+    exerciseCmd d.m.market Multi_Close with
+      actor = d.m.f.admin; roles = FT.factoryRoles d.m.factory; reason = "Event postponed"
+  -- Others cannot cancel; owners can, even after the market closed.
+  submitMustFail (actAs a.alice <> readAs (MT.reads d.m.f)) do
+    exerciseCmd bid.book MultiBook_Cancel with
+      owner = a.alice; order = bid.order; balance = Some d.alice; extraArgs = C.registryContext
+  cancelled <- as d a.bob do
+    exerciseCmd bid.book MultiBook_Cancel with
+      owner = a.bob; order = bid.order; balance = Some bobBalance; extraArgs = C.registryContext
+  Some back <- pure cancelled.released.balance
+  freeOf d back >>= (=== 5.0)
+  returned <- as d a.alice do
+    exerciseCmd cancelled.book MultiBook_Cancel with
+      owner = a.alice; order = ask.order; balance = None; extraArgs = C.registryContext
+  Some lotId <- pure returned.released.position
+  Some lot <- queryContractId d.m.f.custody.vault lotId
+  lot.counts === [0, 0, 0, 3]
+  book <- loadBook d returned.book
+  book.orders === []
+  -- Placement needs an open market.
+  submitMustFail (actAs a.bob <> readAs (MT.reads d.m.f)) do
+    exerciseCmd returned.book MultiBook_PlaceBuy with
+      owner = a.bob; market = closed; balance = back; outcome = 0; price = 0.5; quantity = 1
+      feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = zeroFee
+      extraArgs = C.registryContext; eligibility = None
+
+test_planner_never_skips_the_head : Script ()
+test_planner_never_skips_the_head = script do
+  d <- desk
+  let a = FT.asset d.m.f
+      o i owner side price q = MultiMatchOrder i owner 1 side price q
+  planMultiFill 0.01 1 1 [o 1 a.alice Sell 0.4 1, o 2 a.bob Buy 0.39 1] === Right MultiNoMatch
+  planMultiFill 0.01 1 1 [o 1 a.alice Sell 0.4 1, o 2 a.alice Buy 0.5 1, o 3 a.bob Buy 0.45 1]
+    === Right (MultiCancelSelfTrade 2)
+  -- Another outcome's orders are ignored.
+  planMultiFill 0.01 1 2 [o 1 a.alice Sell 0.4 1, o 2 a.bob Buy 0.5 1] === Right MultiNoMatch
+
+-- | Free balance of any trader's account, read as the vault.
+freeOf : Desk -> ContractId AssetBalance -> Script Decimal
+freeOf d cid = do
+  Some account <- queryContractId d.m.f.custody.vault cid
+  pure account.available

@@ -1,6 +1,6 @@
 # Multi-outcome markets on Canton
 
-Status: **MO1 built (2026-11-26)**, contracts and UI; MO2–MO4 pending
+Status: **MO1 merged (2026-11-26); MO2 built (2026-11-27)**, contracts and UI; MO3–MO4 pending
 (see [Progress](#progress)). It brings
 Canton to parity with Solana's multi-outcome markets
 (kunal171/outcomia `docs/multi-outcome-markets.md`), changed only where
@@ -97,12 +97,32 @@ the operator service, which proposes fills and the ledger revalidates.
   (one `Label: criterion` per line).
 - `app/scripts/canton-multi.test.mjs` (5 tests, part of `npm run test:canton`).
 
+**MO2 contracts — done** (branch `feat/multi-outcome-mo2`, 244 tests pass).
+
+- `contracts/main/daml/Outcomia/MultiOrders.daml`: `MultiBook` (place buy/sell
+  per outcome with fee quotes and eligibility, `MatchBest`, `Cancel`,
+  `CancelIneligible`, fee withdrawal, club share), `MultiOrder` (settlement via
+  buy→sell delegation, self-trade cancellation, release), `MultiTradeFill`,
+  pure `planMultiFill`. Orders carry `outcomeCount` so released contracts form
+  a full-width lot.
+- `createMulti` now also creates the book; `Club_WithdrawMultiFees` pays the
+  club owner from multi books.
+- `MultiOrdersTest.daml`: per-outcome fills with price improvement, taker fee
+  and club share, self-cross cancellation, cancel after close, planner heads.
+
+**MO2 UI — done** (outcomia-solana branch `feat/canton-multi-outcome-mo2`):
+commands `multiBuy`, `multiSell`, `multiCancel`, `multiClearDeparted`,
+`multiMatch`, `multiWithdrawFees`, `multiSetShare`, `clubWithdrawMultiFees`;
+catalog quotes include multi orders; market page shows the book, an order
+ticket, your orders, and operator match/clear/fees; club screens include multi
+books.
+
 **Next steps**
 
-1. MO2: `MultiBook` / `MultiOrder` / `MultiFill` with per-outcome place,
-   cancel and same-outcome matching, reusing `Fees` quotes, eligibility and the
-   club fee share (`clubShareBps`). Create the book in `createMulti`. UI: trade
-   ticket per outcome, book view, operator match, orders list; show `MultiLot`s
-   on the positions page.
-2. MO3 full-set matching (mint when buy prices sum ≤ 1, merge when sell prices
-   sum ≥ 1); MO4 indexer history.
+1. MO3 full-set matching: mint when the best buys of every outcome sum to at
+   most 1, merge when the best sells sum to at least 1 (a multi-leg version of
+   `OrderBook_MatchComplement`), with fees and partial fills; UI implied prices
+   and an operator "match full set" action.
+2. MO4 indexer history (`MultiTradeFill`, resolution) and charts.
+3. Not covered yet: a club test for `Club_WithdrawMultiFees`; multi lots on the
+   Positions page.

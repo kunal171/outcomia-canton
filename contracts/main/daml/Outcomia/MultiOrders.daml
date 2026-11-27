@@ -1,0 +1,663 @@
+-- | Order books for multi-outcome markets: independent buy and sell queues per
+-- outcome, best price then FIFO, one fill per match, with the same fee, escrow
+-- and club-share rules as binary books (Outcomia.Orders).
+--
+-- A buy escrows its trade plus maximum fee in cash; a sell escrows contracts of
+-- its outcome taken from the owner's lots. The operator submits matches; the
+-- signed buy delegates its owner into the signed sell, whose body verifies the
+-- whole book snapshot, moves cash, delivers contracts and writes a receipt.
+-- Full-set matching across outcomes comes in MO3.
+module Outcomia.MultiOrders where
+
+import DA.List (sortOn, unique)
+import DA.Numeric qualified as Numeric
+import Canton.MarketFactory qualified as MF
+import Splice.Api.Token.HoldingV2 qualified as H
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import Splice.Api.Token.TransferInstructionV2 qualified as T
+import Outcomia.Assets (holdingTotal)
+import Outcomia.Binary (EligibilityProof(..), Protocol(..))
+import Outcomia.Custody
+import Outcomia.Fees qualified as Fees
+import Outcomia.MarketFees qualified as MarketFees
+import Outcomia.Matching (priorityKey, validMatchPrice)
+import Outcomia.MultiOutcome
+import Outcomia.Types
+import Outcomia.Validation (boundedText)
+
+data MultiBacking = MultiCash (ContractId H.Holding) | MultiContracts
+  deriving (Eq, Show)
+
+data MultiOrderRef = MultiOrderRef with
+    orderId : Int
+    order : ContractId MultiOrder
+    outcome : Int
+    side : OrderSide
+    price : Decimal
+  deriving (Eq, Show)
+
+-- | A verified projection of one indexed order.
+data MultiMatchOrder = MultiMatchOrder with
+    orderId : Int
+    owner : Party
+    outcome : Int
+    side : OrderSide
+    price : Decimal
+    quantity : Int
+  deriving (Eq, Show)
+
+-- | One fill between the best buy and sell of an outcome. The older order
+-- (maker) sets the price; the smaller quantity fills.
+data MultiFillPlan = MultiFillPlan with
+    buyId : Int
+    sellId : Int
+    makerId : Int
+    takerId : Int
+    outcome : Int
+    price : Decimal
+    quantity : Int
+    sellerProceeds : Decimal
+    buyerRemaining : Int
+    sellerRemaining : Int
+  deriving (Eq, Show)
+
+data MultiDecision = MultiNoMatch | MultiCancelSelfTrade Int | MultiFill MultiFillPlan
+  deriving (Eq, Show)
+
+data MultiPlacement = MultiPlacement with
+    book : ContractId MultiBook
+    order : ContractId MultiOrder
+    balance : Optional (ContractId AssetBalance)
+    remainder : Optional (ContractId MultiLot)
+  deriving (Eq, Show)
+
+data MultiReleased = MultiReleased with
+    balance : Optional (ContractId AssetBalance)
+    position : Optional (ContractId MultiLot)
+  deriving (Eq, Show)
+
+data MultiCancellation = MultiCancellation with
+    book : ContractId MultiBook
+    released : MultiReleased
+  deriving (Eq, Show)
+
+-- | For a fill: balances are buyer then seller, position is the buyer's new
+-- lot. For a self-trade cancellation: the owner's account and any restored lot.
+data MultiSettlement = MultiSettlement with
+    book : ContractId MultiBook
+    decision : MultiDecision
+    balances : [ContractId AssetBalance]
+    position : Optional (ContractId MultiLot)
+    receipt : Optional (ContractId MultiTradeFill)
+  deriving (Eq, Show)
+
+data MultiFeeWithdrawal = MultiFeeWithdrawal with
+    book : ContractId MultiBook
+    walletHoldings : [ContractId H.Holding]
+  deriving (Eq, Show)
+
+-- | Audit record of one fill; never spendable.
+template MultiTradeFill
+  with
+    key : MarketKey
+    vault : Party
+    buyer : Party
+    seller : Party
+    instrument : CollateralInstrument
+    plan : MultiFillPlan
+    executedAt : Time
+    feeTerms : Fees.FeeTerms
+    feeAmount : Decimal
+    buyerRefund : Decimal
+  where
+    signatory key.operator, vault
+    observer buyer, seller
+    ensure key.operator /= vault && buyer /= seller && key.marketId > 0 &&
+      plan.quantity > 0 && plan.price > 0.0 && plan.price < 1.0 && plan.outcome >= 0 &&
+      plan.sellerProceeds == plan.price * intToDecimal plan.quantity &&
+      feeAmount >= 0.0 && feeAmount <= plan.sellerProceeds && buyerRefund >= 0.0
+
+-- | One bounded index per market covering every outcome and both sides.
+template MultiBook
+  with
+    key : MarketKey
+    vault : Party
+    creator : Party
+    terms : MultiTerms
+    marketCreatedAt : Time
+    factory : ContractId T.TransferFactory
+    assetDecimals : Int
+    nextOrderId : Int
+    orders : [MultiOrderRef]
+    fees : MarketFees.FeePoolState
+    clubShareBps : Int
+    clubFees : Decimal
+  where
+    signatory key.operator, vault
+    observer creator
+    ensure key.operator /= vault && key.marketId > 0 && boundedText 64 key.protocolName &&
+      null (multiTermsErrors marketCreatedAt terms) && nextOrderId > 0 &&
+      assetDecimals >= 0 && assetDecimals <= 10 &&
+      Numeric.roundNumeric assetDecimals Numeric.RoundingDown (terms.priceTick * intToDecimal terms.quantityLot) == terms.priceTick * intToDecimal terms.quantityLot &&
+      MarketFees.validPool assetDecimals fees &&
+      clubShareBps >= 0 && clubShareBps <= maxMultiClubShareBps &&
+      clubFees >= 0.0 && clubFees <= fees.amount && MarketFees.aligned assetDecimals clubFees &&
+      length orders <= maxMultiOrders && unique (map (\r -> r.orderId) orders) &&
+      unique (map (\r -> r.order) orders) &&
+      all (\r -> r.orderId > 0 && r.orderId < nextOrderId && validMatchPrice terms.priceTick r.price &&
+        r.outcome >= 0 && r.outcome < length terms.outcomes) orders
+
+    -- | The operator withdraws collected fees, except the club's part.
+    choice MultiBook_WithdrawFees : MultiFeeWithdrawal
+      with
+        amount : Decimal
+        extraArgs : ExtraArgs
+      controller key.operator
+      do
+        assertMsg "Fees owed to the club cannot be withdrawn by the operator"
+          (amount <= fees.amount - clubFees)
+        moved <- MarketFees.withdrawFees key.operator vault terms.collateral factory assetDecimals fees amount extraArgs
+        next <- create this with fees = moved.pool
+        pure MultiFeeWithdrawal with book = next; walletHoldings = moved.walletHoldings
+
+    -- | The operator sets the club share of later taker fees (0 to 5,000 bps).
+    choice MultiBook_SetClubShare : ContractId MultiBook
+      with bps : Int
+      controller key.operator
+      do
+        assertMsg "The club share must be 0 to 5,000 basis points" (bps >= 0 && bps <= maxMultiClubShareBps)
+        create this with clubShareBps = bps
+
+    -- | Pays fees owed to the club to `recipient`; reached through
+    -- 'Club_WithdrawMultiFees', which binds the club owner and scope.
+    choice MultiBook_WithdrawClubFees : MultiFeeWithdrawal
+      with
+        recipient : Party
+        amount : Decimal
+        extraArgs : ExtraArgs
+      controller key.operator, recipient
+      do
+        assertMsg "Club fee withdrawal must be positive and at most what the club is owed"
+          (amount > 0.0 && amount <= clubFees)
+        moved <- MarketFees.withdrawFees recipient vault terms.collateral factory assetDecimals fees amount extraArgs
+        next <- create this with fees = moved.pool; clubFees = clubFees - amount
+        pure MultiFeeWithdrawal with book = next; walletHoldings = moved.walletHoldings
+
+    -- | Escrow trade plus maximum fee and add a buy for one outcome.
+    choice MultiBook_PlaceBuy : MultiPlacement
+      with
+        owner : Party
+        market : ContractId MultiMarket
+        balance : ContractId AssetBalance
+        outcome : Int
+        price : Decimal
+        quantity : Int
+        feePolicy : ContractId Protocol
+        expectedFeeRevision : Int
+        expectedFeeTerms : Fees.FeeTerms
+        extraArgs : ExtraArgs
+        eligibility : Optional EligibilityProof
+      controller owner
+      do
+        current <- checkMultiPlacement this market outcome price quantity
+        requireAccess current.access owner MF.Place eligibility
+        feeTerms <- checkMultiFeeQuote this feePolicy expectedFeeRevision expectedFeeTerms
+        checkMultiAccount key vault terms.collateral factory owner balance
+        funding <- feeChecked (Fees.buyFunding feeTerms (Fees.BuyFeeState quantity quantity price 0.0 0.0))
+        partition <- exercise balance AssetBalance_Repartition with
+          otherCash = None; otherAmount = 0.0; delta = negate funding.totalEscrow; extraArgs
+        cash <- case partition.otherCash of Some cid -> pure cid; None -> abort "Buy order must have cash backing"
+        now <- getTime
+        order <- create MultiOrder with
+          key; vault; owner; factory; outcome; price; quantity
+          outcomeCount = length terms.outcomes
+          feeTerms; feeRevision = expectedFeeRevision
+          originalQuantity = quantity; takerNotional = 0.0; paidFee = 0.0
+          instrument = terms.collateral; side = Buy; orderId = nextOrderId
+          acceptedAt = now; backing = MultiCash cash
+        next <- create this with
+          nextOrderId = nextOrderId + 1
+          orders = orders ++ [MultiOrderRef nextOrderId order outcome Buy price]
+        pure MultiPlacement with book = next; order; balance = Some partition.balance; remainder = None
+
+    -- | Escrow `quantity` contracts of one outcome from 1..16 lots and add a sell.
+    choice MultiBook_PlaceSell : MultiPlacement
+      with
+        owner : Party
+        market : ContractId MultiMarket
+        positions : [ContractId MultiLot]
+        outcome : Int
+        price : Decimal
+        quantity : Int
+        feePolicy : ContractId Protocol
+        expectedFeeRevision : Int
+        expectedFeeTerms : Fees.FeeTerms
+        eligibility : Optional EligibilityProof
+      controller owner
+      do
+        current <- checkMultiPlacement this market outcome price quantity
+        requireAccess current.access owner MF.Place eligibility
+        feeTerms <- checkMultiFeeQuote this feePolicy expectedFeeRevision expectedFeeTerms
+        let n = length terms.outcomes
+        totals <- takeLots key vault owner n positions
+        assertMsg "Insufficient outcome contracts for sell" (atIndex outcome totals >= quantity)
+        remainder <- lotFor key vault owner (adjustAt outcome (\c -> c - quantity) totals)
+        now <- getTime
+        order <- create MultiOrder with
+          key; vault; owner; factory; outcome; price; quantity
+          outcomeCount = length terms.outcomes
+          feeTerms; feeRevision = expectedFeeRevision
+          originalQuantity = quantity; takerNotional = 0.0; paidFee = 0.0
+          instrument = terms.collateral; side = Sell; orderId = nextOrderId
+          acceptedAt = now; backing = MultiContracts
+        next <- create this with
+          nextOrderId = nextOrderId + 1
+          orders = orders ++ [MultiOrderRef nextOrderId order outcome Sell price]
+        pure MultiPlacement with book = next; order; balance = None; remainder
+
+    -- | Operator: fill the best crossed buy and sell of one outcome, or cancel
+    -- the newer order of a self-cross. The inner settlement archives this book.
+    nonconsuming choice MultiBook_MatchBest : MultiSettlement
+      with
+        market : ContractId MultiMarket
+        outcome : Int
+        buyerBalance : ContractId AssetBalance
+        sellerBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+        buyerEligibility : Optional EligibilityProof
+        sellerEligibility : Optional EligibilityProof
+      controller key.operator
+      do
+        _ <- checkMultiTrading this market
+        buyRef <- requireBestRef orders outcome Buy
+        sellRef <- requireBestRef orders outcome Sell
+        buy <- fetch buyRef.order
+        sell <- fetch sellRef.order
+        if buy.owner == sell.owner then do
+          assertMsg "Self-trade cancellation uses one owner account" (buyerBalance == sellerBalance)
+          let newer = if buyRef.orderId > sellRef.orderId then buyRef.order else sellRef.order
+          exercise newer MultiOrder_CancelSelfTrade with book = self; market; outcome; balance = buyerBalance; extraArgs
+        else do
+          current <- fetch market
+          requireAccess current.access buy.owner MF.Fill buyerEligibility
+          requireAccess current.access sell.owner MF.Fill sellerEligibility
+          exercise buyRef.order MultiOrder_SettleBuy with
+            book = self; market; sellOrder = sellRef.order; buyerBalance; sellerBalance; extraArgs
+
+    -- | Operator: clear the resting order of an owner the market's policy now
+    -- excludes; backing returns to the owner exactly as on cancellation.
+    choice MultiBook_CancelIneligible : MultiCancellation
+      with
+        market : ContractId MultiMarket
+        order : ContractId MultiOrder
+        policy : ContractId MF.EligibilityPolicy
+        balance : Optional (ContractId AssetBalance)
+        extraArgs : ExtraArgs
+      controller key.operator
+      do
+        current <- checkMultiTrading this market
+        expected <- case current.access of
+          Some ref -> pure ref
+          None -> abort "Public markets have no ineligible owners"
+        value <- fetch order
+        assertMsg "Order does not belong to this book" (indexed this order value)
+        MF.requireExcluded policy expected value.owner
+        released <- exercise order MultiOrder_Release with balance; extraArgs; byOperator = True
+        next <- create this with orders = filter (\r -> r.order /= order) orders
+        pure MultiCancellation with book = next; released
+
+    -- | Owner cancellation; works whatever the market's state.
+    choice MultiBook_Cancel : MultiCancellation
+      with
+        owner : Party
+        order : ContractId MultiOrder
+        balance : Optional (ContractId AssetBalance)
+        extraArgs : ExtraArgs
+      controller owner
+      do
+        value <- fetch order
+        assertMsg "Order does not belong to this book or owner" (indexed this order value && value.owner == owner)
+        released <- exercise order MultiOrder_Release with balance; extraArgs; byOperator = False
+        next <- create this with orders = filter (\r -> r.order /= order) orders
+        pure MultiCancellation with book = next; released
+
+template MultiOrder
+  with
+    key : MarketKey
+    vault : Party
+    owner : Party
+    instrument : CollateralInstrument
+    factory : ContractId T.TransferFactory
+    -- | The market's number of outcomes, so released contracts form a usable lot.
+    outcomeCount : Int
+    outcome : Int
+    side : OrderSide
+    price : Decimal
+    quantity : Int
+    feeTerms : Fees.FeeTerms
+    feeRevision : Int
+    originalQuantity : Int
+    takerNotional : Decimal
+    paidFee : Decimal
+    orderId : Int
+    acceptedAt : Time
+    backing : MultiBacking
+  where
+    signatory vault, owner
+    observer key.operator
+    ensure vault /= key.operator && owner /= vault && key.marketId > 0 &&
+      boundedText 64 key.protocolName && boundedText 128 instrument.id &&
+      outcomeCount >= 2 && outcomeCount <= maxOutcomeCount && outcome >= 0 && outcome < outcomeCount &&
+      price > 0.0 && price < 1.0 && quantity > 0 && orderId > 0 && feeRevision >= 0 &&
+      validMultiFeeHistory this &&
+      (case (side, backing) of (Buy, MultiCash _) -> True; (Sell, MultiContracts) -> True; _ -> False)
+
+    -- | Entry of a fill: delegates the buyer into the sell's settlement.
+    nonconsuming choice MultiOrder_SettleBuy : MultiSettlement
+      with
+        book : ContractId MultiBook
+        market : ContractId MultiMarket
+        sellOrder : ContractId MultiOrder
+        buyerBalance : ContractId AssetBalance
+        sellerBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault
+      do
+        assertMsg "Settlement entry requires a buy" (side == Buy)
+        exercise sellOrder MultiOrder_SettleSell with
+          buyer = owner; buyOrder = self; book; market; buyerBalance; sellerBalance; extraArgs
+
+    -- | Verifies the plan against the full snapshot, pays the seller, collects
+    -- the taker fee, refunds price improvement, delivers contracts to the buyer,
+    -- keeps partial remainders and records a receipt. Any failure rolls back all.
+    postconsuming choice MultiOrder_SettleSell : MultiSettlement
+      with
+        buyer : Party
+        buyOrder : ContractId MultiOrder
+        book : ContractId MultiBook
+        market : ContractId MultiMarket
+        buyerBalance : ContractId AssetBalance
+        sellerBalance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault, buyer
+      do
+        index <- fetch book
+        _ <- checkMultiTrading index market
+        snapshot <- multiSnapshot index
+        buy <- fetch buyOrder
+        assertMsg "Settlement buyer identity does not match its signed order" (buy.owner == buyer)
+        plan <- case planMultiFill index.terms.priceTick index.terms.quantityLot outcome snapshot of
+          Right (MultiFill value) -> pure value
+          _ -> abort "No eligible crossed pair for settlement"
+        buyRef <- requireBestRef index.orders outcome Buy
+        sellRef <- requireBestRef index.orders outcome Sell
+        assertMsg "Settlement must use the best indexed buy and sell"
+          (outcomeCount == length index.terms.outcomes && buyRef.order == buyOrder && sellRef.order == self && side == Sell &&
+           buy.side == Buy && buy.orderId == plan.buyId && orderId == plan.sellId &&
+           key == index.key && vault == index.vault && buyer /= owner)
+        checkMultiAccount key vault instrument factory buyer buyerBalance
+        checkMultiAccount key vault instrument factory owner sellerBalance
+        cash <- case buy.backing of MultiCash cid -> pure cid; _ -> abort "Buy must have cash escrow"
+        funding <- feeChecked (Fees.buyFunding buy.feeTerms (multiBuyState buy))
+        buyMovement <- feeChecked (Fees.buyFillFunding buy.feeTerms (multiBuyState buy)
+          plan.price plan.quantity (plan.takerId == buy.orderId))
+        sellMovement <- feeChecked (Fees.sellFillFunding feeTerms takerNotional paidFee
+          plan.sellerProceeds (plan.takerId == orderId))
+        assertMsg "Fee movement must agree with the verified fill gross"
+          (buyMovement.tradeCost == plan.sellerProceeds &&
+           sellMovement.netProceeds + sellMovement.accrual.charge == plan.sellerProceeds)
+        let feeAmount = buyMovement.feeCharged + sellMovement.accrual.charge
+            takerTerms = if plan.takerId == buy.orderId then buy.feeTerms else feeTerms
+            originalCash = funding.totalEscrow
+        total <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") [cash]
+        assertMsg "Buy escrow amount is incorrect" (total == originalCash)
+        (nextSellerBalance, afterSellerCash) <- if sellMovement.netProceeds > 0.0 then do
+          paid <- exercise sellerBalance AssetBalance_Repartition with
+            otherCash = Some cash; otherAmount = originalCash; delta = sellMovement.netProceeds; extraArgs
+          pure (paid.balance, paid.otherCash)
+          else pure (sellerBalance, Some cash)
+        let afterPayment = originalCash - sellMovement.netProceeds
+        collected <- MarketFees.collectFees vault instrument factory index.assetDecimals index.fees
+          feeAmount afterSellerCash afterPayment extraArgs
+        let afterFees = afterPayment - feeAmount
+        (nextBuyerBalance, remainingCash) <- if buyMovement.refund > 0.0 then do
+          refunded <- exercise buyerBalance AssetBalance_Repartition with
+            otherCash = collected.remainingCash; otherAmount = afterFees; delta = buyMovement.refund; extraArgs
+          pure (refunded.balance, refunded.otherCash)
+          else pure (buyerBalance, collected.remainingCash)
+        left <- holdingTotal (H.InstrumentId instrument.admin instrument.id) (H.Account (Some vault) None "") (optionalHoldings remainingCash)
+        assertMsg "Remaining buy escrow is incorrect" (left == buyMovement.funding.totalEscrow)
+        let n = length index.terms.outcomes
+        position <- lotFor key vault buyer (adjustAt outcome (const plan.quantity) (replicate n 0))
+        exercise buyOrder Archive
+        buyRemainder <- if plan.buyerRemaining == 0 then do
+          assertMsg "Completed buy must have no remaining escrow" (remainingCash == None)
+          pure None
+          else do
+            backingCash <- case remainingCash of Some cid -> pure cid; None -> abort "Partial buy requires escrow"
+            Some <$> create buy with
+              quantity = plan.buyerRemaining; backing = MultiCash backingCash
+              takerNotional = buyMovement.nextState.takerNotional
+              paidFee = buyMovement.nextState.paidFee
+        sellRemainder <- if plan.sellerRemaining == 0 then pure None else
+          Some <$> create this with
+            quantity = plan.sellerRemaining
+            takerNotional = sellMovement.accrual.takerNotional
+            paidFee = sellMovement.accrual.paidFee
+        refs <- mapA refFor (optionalHoldings buyRemainder ++ optionalHoldings sellRemainder)
+        exercise book Archive
+        next <- create index with
+          orders = filter (\r -> r.order /= buyOrder && r.order /= self) index.orders ++ refs
+          fees = collected.pool
+          clubFees = index.clubFees + multiClubPart index feeAmount
+        now <- getTime
+        receipt <- create MultiTradeFill with
+          key; vault; buyer; seller = owner; instrument; plan; executedAt = now
+          feeTerms = takerTerms; feeAmount; buyerRefund = buyMovement.refund
+        pure MultiSettlement with
+          book = next; decision = MultiFill plan
+          balances = [nextBuyerBalance, nextSellerBalance]; position; receipt = Some receipt
+
+    -- | Cancel this order when it is the newer side of the best self-cross.
+    postconsuming choice MultiOrder_CancelSelfTrade : MultiSettlement
+      with
+        book : ContractId MultiBook
+        market : ContractId MultiMarket
+        outcome : Int
+        balance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault
+      do
+        index <- fetch book
+        _ <- checkMultiTrading index market
+        snapshot <- multiSnapshot index
+        decision <- case planMultiFill index.terms.priceTick index.terms.quantityLot outcome snapshot of
+          Right value@(MultiCancelSelfTrade newer) | newer == orderId -> pure value
+          _ -> abort "Only the newer best self-cross may be cancelled"
+        assertMsg "Self-trade order must be indexed" (any (\r -> r.order == self) index.orders)
+        checkMultiAccount key vault instrument factory owner balance
+        released <- releaseMulti this (if side == Buy then Some balance else None) extraArgs
+        exercise book Archive
+        next <- create index with orders = filter (\r -> r.order /= self) index.orders
+        pure MultiSettlement with
+          book = next; decision; position = released.position; receipt = None
+          balances = [fromOptionalBalance balance released.balance]
+
+    -- | Return the backing to the owner; the book removes the reference. The
+    -- owner's own cancellation and the operator's ineligible clearing both
+    -- end here; the book checks which one applies.
+    choice MultiOrder_Release : MultiReleased
+      with
+        balance : Optional (ContractId AssetBalance)
+        extraArgs : ExtraArgs
+        byOperator : Bool
+      controller (if byOperator then key.operator else owner), vault
+      do
+        releaseMulti this balance extraArgs
+
+fromOptionalBalance : ContractId AssetBalance -> Optional (ContractId AssetBalance) -> ContractId AssetBalance
+fromOptionalBalance fallback value = case value of Some cid -> cid; None -> fallback
+
+-- | Exact release: a buy's full escrow to its owner's account, or a sell's
+-- contracts back into a lot.
+releaseMulti : MultiOrder -> Optional (ContractId AssetBalance) -> ExtraArgs -> Update MultiReleased
+releaseMulti order balance extraArgs = case order.backing of
+  MultiCash cash -> do
+    account <- case balance of Some cid -> pure cid; None -> abort "Buy cancellation requires its owner's account"
+    checkMultiAccount order.key order.vault order.instrument order.factory order.owner account
+    funding <- feeChecked (Fees.buyFunding order.feeTerms (multiBuyState order))
+    let amount = funding.totalEscrow
+    total <- holdingTotal (H.InstrumentId order.instrument.admin order.instrument.id) (H.Account (Some order.vault) None "") [cash]
+    assertMsg "Buy escrow amount is incorrect" (total == amount)
+    partition <- exercise account AssetBalance_Repartition with
+      otherCash = Some cash; otherAmount = amount; delta = amount; extraArgs
+    assertMsg "Cancelled buy must release all escrow" (partition.otherCash == None)
+    pure MultiReleased with balance = Some partition.balance; position = None
+  MultiContracts -> do
+    assertMsg "Sell cancellation does not take a cash account" (balance == None)
+    position <- lotFor order.key order.vault order.owner
+      (adjustAt order.outcome (const order.quantity) (replicate order.outcomeCount 0))
+    pure MultiReleased with balance = None; position
+
+-- | Highest club share of a taker fee: half, as for binary books.
+maxMultiClubShareBps : Int
+maxMultiClubShareBps = 5000
+
+-- | One market's orders across all outcomes.
+maxMultiOrders : Int
+maxMultiOrders = 128
+
+multiClubPart : MultiBook -> Decimal -> Decimal
+multiClubPart book fee =
+  Numeric.roundNumeric book.assetDecimals Numeric.RoundingDown
+    (fee * intToDecimal book.clubShareBps / 10000.0)
+
+indexed : MultiBook -> ContractId MultiOrder -> MultiOrder -> Bool
+indexed book cid value =
+  value.key == book.key && value.vault == book.vault && value.instrument == book.terms.collateral &&
+  value.factory == book.factory &&
+  MultiOrderRef value.orderId cid value.outcome value.side value.price `elem` book.orders
+
+-- | The market must match this book and be open before cutoff.
+checkMultiTrading : MultiBook -> ContractId MultiMarket -> Update MultiMarket
+checkMultiTrading book market = do
+  current <- fetch market
+  assertMsg "Market identity or terms do not match order book"
+    (current.key == book.key && current.creator == book.creator &&
+     current.createdAt == book.marketCreatedAt && current.terms == book.terms)
+  now <- getTime
+  assertMsg "Orders require an Open market before cutoff" (current.status == Open && now < book.terms.closeAt)
+  pure current
+
+checkMultiPlacement : MultiBook -> ContractId MultiMarket -> Int -> Decimal -> Int -> Update MultiMarket
+checkMultiPlacement book market outcome price quantity = do
+  current <- checkMultiTrading book market
+  assertMsg "Outcome must be one of the market's outcomes" (outcome >= 0 && outcome < length book.terms.outcomes)
+  assertMsg "Price must lie strictly between 0 and 1 and follow the market tick" (validMatchPrice book.terms.priceTick price)
+  checkLot book.terms.quantityLot quantity
+  assertMsg "Market active-order limit reached" (length book.orders < maxMultiOrders)
+  assertMsg "Order sequence limit reached" (book.nextOrderId < 9223372036854775807)
+  pure current
+
+checkMultiFeeQuote : MultiBook -> ContractId Protocol -> Int -> Fees.FeeTerms -> Update Fees.FeeTerms
+checkMultiFeeQuote book policy expectedRevision expectedTerms = do
+  current <- fetch policy
+  assertMsg "Fee policy belongs to another protocol"
+    (current.operator == book.key.operator && current.protocolName == book.key.protocolName)
+  let actual = Fees.FeeTerms current.takerFeeBps book.assetDecimals
+  assertMsg "Fee approval quote is stale or has wrong asset precision"
+    (current.feeRevision == expectedRevision && expectedTerms == actual)
+  pure actual
+
+checkMultiAccount : MarketKey -> Party -> CollateralInstrument -> ContractId T.TransferFactory -> Party -> ContractId AssetBalance -> Update ()
+checkMultiAccount key vault instrument factory owner cid = do
+  account <- fetch cid
+  assertMsg "Order account owner, asset, factory or deployment does not match"
+    (account.operator == key.operator && account.protocolName == key.protocolName &&
+     account.vault == vault && account.owner == owner && account.instrument == instrument && account.factory == factory)
+
+multiSnapshot : MultiBook -> Update [MultiMatchOrder]
+multiSnapshot book = mapA (\ref -> do
+  current <- fetch ref.order
+  assertMsg "Indexed order does not match its committed reference"
+    (current.key == book.key && current.vault == book.vault && current.instrument == book.terms.collateral &&
+     current.factory == book.factory && current.feeTerms.assetDecimals == book.assetDecimals &&
+     current.orderId == ref.orderId && current.outcome == ref.outcome &&
+     current.side == ref.side && current.price == ref.price)
+  pure MultiMatchOrder with
+    orderId = current.orderId; owner = current.owner; outcome = current.outcome
+    side = current.side; price = current.price; quantity = current.quantity) book.orders
+
+refFor : ContractId MultiOrder -> Update MultiOrderRef
+refFor cid = do
+  value <- fetch cid
+  pure (MultiOrderRef value.orderId cid value.outcome value.side value.price)
+
+bestRef : [MultiOrderRef] -> Int -> OrderSide -> Optional MultiOrderRef
+bestRef refs outcome side =
+  case sortOn (\r -> priorityKey side r.price r.orderId)
+       (filter (\r -> r.outcome == outcome && r.side == side) refs) of
+    [] -> None
+    first :: _ -> Some first
+
+requireBestRef : [MultiOrderRef] -> Int -> OrderSide -> Update MultiOrderRef
+requireBestRef refs outcome side = case bestRef refs outcome side of
+  Some ref -> pure ref
+  None -> abort "Both sides are required for matching"
+
+-- | Pure planner: the best buy and sell of `outcome`, never skipping the head.
+planMultiFill : Decimal -> Int -> Int -> [MultiMatchOrder] -> Either Text MultiDecision
+planMultiFill tick lot outcome orders
+  | tick <= 0.0 || tick >= 1.0 || lot <= 0 = Left "Invalid market increments"
+  | length orders > maxMultiOrders = Left "Matching snapshot exceeds the order limit"
+  | not (unique (map (\o -> o.orderId) orders)) = Left "Duplicate acceptance IDs"
+  | not (all valid orders) = Left "Invalid order in matching snapshot"
+  | otherwise = Right $ case (best Buy, best Sell) of
+      (Some buy, Some sell)
+        | buy.price < sell.price -> MultiNoMatch
+        | buy.owner == sell.owner -> MultiCancelSelfTrade (max buy.orderId sell.orderId)
+        | otherwise ->
+            let filled = min buy.quantity sell.quantity
+                executed = if buy.orderId < sell.orderId then buy.price else sell.price
+            in MultiFill MultiFillPlan with
+              buyId = buy.orderId; sellId = sell.orderId
+              makerId = min buy.orderId sell.orderId; takerId = max buy.orderId sell.orderId
+              outcome; price = executed; quantity = filled
+              sellerProceeds = executed * intToDecimal filled
+              buyerRemaining = buy.quantity - filled; sellerRemaining = sell.quantity - filled
+      _ -> MultiNoMatch
+  where
+    valid o = o.orderId > 0 && o.outcome >= 0 && validMatchPrice tick o.price &&
+      o.quantity > 0 && o.quantity % lot == 0
+    best side = case sortOn (\o -> priorityKey side o.price o.orderId)
+        (filter (\o -> o.outcome == outcome && o.side == side) orders) of
+      [] -> None
+      first :: _ -> Some first
+
+multiBuyState : MultiOrder -> Fees.BuyFeeState
+multiBuyState order = Fees.BuyFeeState order.originalQuantity order.quantity order.price order.takerNotional order.paidFee
+
+validMultiFeeHistory : MultiOrder -> Bool
+validMultiFeeHistory order =
+  order.originalQuantity >= order.quantity && order.takerNotional >= 0.0 &&
+  order.takerNotional <= intToDecimal (order.originalQuantity - order.quantity) &&
+  Fees.cumulativeFee order.feeTerms order.takerNotional == Right order.paidFee &&
+  Numeric.roundNumeric order.feeTerms.assetDecimals Numeric.RoundingDown order.takerNotional == order.takerNotional &&
+  (case order.side of
+    Sell -> True
+    Buy -> case Fees.buyFunding order.feeTerms (multiBuyState order) of Right _ -> True; Left _ -> False)
+
+feeChecked : Either Text a -> Update a
+feeChecked value = case value of Right result -> pure result; Left message -> abort message
+
+atIndex : Int -> [Int] -> Int
+atIndex i xs = case drop i xs of x :: _ -> x; [] -> 0
+
+adjustAt : Int -> (Int -> Int) -> [Int] -> [Int]
+adjustAt i f xs = zipWith (\j x -> if j == i then f x else x) [0 .. length xs - 1] xs
+
+-- | A lot for these counts, or none when all are zero.
+lotFor : MarketKey -> Party -> Party -> [Int] -> Update (Optional (ContractId MultiLot))
+lotFor key vault owner counts =
+  if all (== 0) counts then pure None
+  else Some <$> create MultiLot with key; vault; owner; counts

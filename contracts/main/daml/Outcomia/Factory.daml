@@ -17,6 +17,7 @@ import DA.Text qualified as T
 import Outcomia.Assets (AssetAdmission(..))
 import Outcomia.Binary
 import Outcomia.MarketFees qualified as MarketFees
+import Outcomia.MultiOrders (MultiBook(..))
 import Outcomia.MultiOutcome
 import Outcomia.Orders
 import Outcomia.Positions
@@ -247,7 +248,8 @@ createBinary factory creator terms restriction instrument admitted now = do
     market = toInterfaceContractId market
     ref = MF.MarketRef with factory = factory.ref; number
 
--- | Any other 2 to 8 outcomes: an Open multi-outcome market and its reserve.
+-- | Any other 2 to 8 outcomes: an Open multi-outcome market, its reserve and
+-- its order book.
 -- Rejects a lot whose invalid refund (lot / outcomes) is inexact at the
 -- collateral's precision.
 createMulti : OutcomiaMarketFactory -> Party -> MF.MarketTerms -> Optional MF.PolicyRef -> CollateralInstrument -> AssetAdmission -> Time -> Update MF.MarketCreated
@@ -280,6 +282,12 @@ createMulti factory creator terms restriction instrument admitted now = do
     key; vault = factory.vault; creator; terms = multi; createdAt = now
     factory = admitted.factory; assetDecimals = admitted.assetDecimals
     completeSets = 0; cash = None
+  _ <- create MultiBook with
+    key; vault = factory.vault; creator; terms = multi; marketCreatedAt = now
+    factory = admitted.factory; assetDecimals = admitted.assetDecimals
+    nextOrderId = 1; orders = []
+    fees = MarketFees.FeePoolState 0.0 None
+    clubShareBps = 0; clubFees = 0.0
   pure MF.MarketCreated with
     factory = toInterfaceContractId next
     market = toInterfaceContractId market
