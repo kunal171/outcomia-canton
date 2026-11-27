@@ -1,0 +1,57 @@
+-- | Profile claims: only the party creates its own claim, the operator only
+-- observes and clears it, and malformed claims are rejected.
+module Outcomia.ProfilesTest where
+
+import DA.Assert ((===))
+import Daml.Script
+import Outcomia.Profiles
+
+testNonce : Text
+testNonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+testWallet : Text
+testWallet = "AG4ztZvcZjzFKjoXLzH8M6U3if9CwVFTXH2FHjqg7SdL"
+
+claim : Party -> Party -> ClaimPurpose -> Optional Text -> ProfileClaim
+claim operator party purpose solanaWallet = ProfileClaim with operator; party; purpose; nonce = testNonce; solanaWallet
+
+test_a_party_claims_itself_and_the_operator_observes : Script ()
+test_a_party_claims_itself_and_the_operator_observes = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  signIn <- submit alice do createCmd (claim operator alice ClaimSignIn None)
+  link <- submit alice do createCmd (claim operator alice ClaimLink (Some testWallet))
+  Some seen <- queryContractId operator link
+  (seen.party, seen.solanaWallet) === (alice, Some testWallet)
+  -- The operator clears used claims; the party can archive its own.
+  submit operator do exerciseCmd link ProfileClaim_Clear
+  submit alice do archiveCmd signIn
+  claims <- query @ProfileClaim operator
+  claims === []
+
+test_nobody_claims_for_another_party : Script ()
+test_nobody_claims_for_another_party = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  submitMustFail bob do createCmd (claim operator alice ClaimSignIn None)
+  submitMustFail operator do createCmd (claim operator alice ClaimSignIn None)
+  created <- submit alice do createCmd (claim operator alice ClaimSignIn None)
+  submitMustFail bob do exerciseCmd created ProfileClaim_Clear
+
+test_malformed_claims_are_rejected : Script ()
+test_malformed_claims_are_rejected = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  let bad c = submitMustFail alice do createCmd c
+  -- Sign-in names no wallet; a link must name a well-formed one.
+  bad (claim operator alice ClaimSignIn (Some testWallet))
+  bad (claim operator alice ClaimLink None)
+  bad (claim operator alice ClaimLink (Some "0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl"))
+  bad (claim operator alice ClaimLink (Some "short"))
+  -- The nonce is 64 lowercase hex characters.
+  bad ((claim operator alice ClaimSignIn None) with nonce = "ABCDEF")
+  bad ((claim operator alice ClaimSignIn None) with nonce = "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef")
+  -- The operator cannot be the claimant.
+  submitMustFail operator do createCmd (claim operator operator ClaimSignIn None)
+  validSolanaAddress testWallet === True

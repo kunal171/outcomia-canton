@@ -1,0 +1,46 @@
+-- | Proof that a party controls itself, for Outcomia profiles. The party
+-- creates a claim through its wallet's ordinary transaction approval; the
+-- profile service reads it with the operator's read access and checks the
+-- one-time nonce it issued. No assets move and no other contract is touched.
+module Outcomia.Profiles where
+
+import qualified DA.Text as T
+import Outcomia.Validation (validDigest)
+
+-- | `ClaimSignIn` starts a session for the party's profile. `ClaimLink` adds
+-- the party to the profile of a signed-in Solana wallet, named in the claim.
+data ClaimPurpose = ClaimSignIn | ClaimLink
+  deriving (Eq, Show)
+
+template ProfileClaim
+  with
+    operator : Party
+    party : Party
+    purpose : ClaimPurpose
+    -- | The service's nonce: 64 lowercase hex characters, used once.
+    nonce : Text
+    -- | For `ClaimLink`: the Solana wallet whose profile the party joins.
+    solanaWallet : Optional Text
+  where
+    signatory party
+    observer operator
+    ensure operator /= party && validDigest nonce &&
+      case (purpose, solanaWallet) of
+        (ClaimSignIn, None) -> True
+        (ClaimLink, Some wallet) -> validSolanaAddress wallet
+        _ -> False
+
+    -- | The operator clears used or expired claims. The party can archive its
+    -- own claim at any time through the default `Archive` choice.
+    choice ProfileClaim_Clear : ()
+      controller operator
+      do pure ()
+
+-- | Base58 text of a Solana address: 32 to 44 characters of the Bitcoin
+-- alphabet. This checks the shape only; the service checks the wallet itself.
+validSolanaAddress : Text -> Bool
+validSolanaAddress value =
+  T.length value >= 32 && T.length value <= 44 && all base58 (T.toCodePoints value)
+  where
+    base58 c = (49 <= c && c <= 57) || (65 <= c && c <= 90 && c /= 73 && c /= 79) ||
+      (97 <= c && c <= 122 && c /= 108)
