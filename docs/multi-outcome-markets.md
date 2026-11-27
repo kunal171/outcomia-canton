@@ -1,6 +1,6 @@
 # Multi-outcome markets on Canton
 
-Status: **MO1 merged (2026-11-26); MO2 built (2026-11-27)**, contracts and UI; MO3–MO4 pending
+Status: **MO1–MO2 merged; MO3–MO4 built (2026-11-27)** in contracts, indexer and UI
 (see [Progress](#progress)). It brings
 Canton to parity with Solana's multi-outcome markets
 (kunal171/outcomia `docs/multi-outcome-markets.md`), changed only where
@@ -16,7 +16,7 @@ this repository plus the matching UI PR in the shared app.
 | Complete sets | Locking Q collateral units mints Q contracts of every outcome; merging Q of every outcome returns Q units. A winning contract pays 1 unit. |
 | Exact invalid refunds | Each contract refunds `1/N`. Every quantity must be a multiple of the lot `L`, and `L/N` must be exact at the asset's precision: `L × 10^d` divisible by `N`. Checked at creation; split, merge, matching and redemption keep the lot. |
 | Independent books per outcome | Buy and sell priority and FIFO per outcome. |
-| Full-set matching | Buys of every outcome mint sets when their prices sum to at most 1; sells of every outcome merge sets when their prices sum to at least 1. |
+| Full-set matching | Buys of every outcome mint sets when their limits sum to at least 1; sells of every outcome merge sets when their limits sum to at most 1. Makers trade at their limits and the taker (newest order) at 1 minus the makers' sum. |
 | Resolution | Same creator/admin, review delay, correction and fallback model as binary, choosing a winning outcome or invalid. |
 | Exits | Cancel, withdraw, merge and redeem never need membership or an open market. |
 
@@ -117,12 +117,40 @@ catalog quotes include multi orders; market page shows the book, an order
 ticket, your orders, and operator match/clear/fees; club screens include multi
 books.
 
+**MO3 contracts — done** (branch `feat/multi-outcome-mo3-mo4`, 249 tests pass).
+
+- `MultiBook_MatchFullSet` takes the best order of every outcome on one side,
+  with one account and eligibility proof per outcome. Each head's signed order
+  delegates its owner to the next (`MultiOrder_FullSetLeg`); the last leg
+  settles with every owner's authority (`settleFullSet`): buys move their cost
+  into the reserve and receive one-outcome lots, sells are paid from the
+  reserve; taker fees, price improvement, partial remainders and the club share
+  apply. `MultiOrder_CancelFullSetSelfTrade` removes the newest head of an
+  owner holding two heads. Receipt: `MultiFullSetFill`. Pure planner:
+  `planFullSet`.
+- If the makers' limits alone reach 1 on the buy side, the taker's price would
+  not be positive and nothing matches; such a book needs a new order or a
+  cancellation.
+- `MultiProposal.winnerIndex` mirrors `result` as a scalar so indexers can
+  record the winner.
+- Tests: `MultiFullSetTest.daml` (mint with taker improvement and a partial
+  remainder, merge, self-trade cancellation, planner edges).
+
+**MO4 indexer — done** (outcomia-canton-indexer branch
+`feat/multi-outcome-history`): models `multi_markets`, `multi_reserves`,
+`multi_proposals`, `multi_finals`, `multi_orders`, `multi_trade_fills` (volume
+by outcome) and `multi_full_set_fills` (sets by side). The engine's limits
+(16 models, 4 group-by fields, object fields only) leave out settled reserves,
+lot counts and full-set legs.
+
+**MO3/MO4 UI — done** (outcomia-solana branch
+`feat/canton-multi-outcome-mo3-mo4`): `multiMatchFullSet` command and operator
+form; best bid/ask, implied prices through full sets and last trade per
+outcome; the catalog publishes a party-free fill history shown as recent
+activity on the market page.
+
 **Next steps**
 
-1. MO3 full-set matching: mint when the best buys of every outcome sum to at
-   most 1, merge when the best sells sum to at least 1 (a multi-leg version of
-   `OrderBook_MatchComplement`), with fees and partial fills; UI implied prices
-   and an operator "match full set" action.
-2. MO4 indexer history (`MultiTradeFill`, resolution) and charts.
-3. Not covered yet: a club test for `Club_WithdrawMultiFees`; multi lots on the
-   Positions page.
+1. Point the app's charts at the Canton indexer once it is deployed (today the
+   activity list reads receipts from the ledger catalog).
+2. A club test for `Club_WithdrawMultiFees`; multi lots on the Positions page.

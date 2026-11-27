@@ -6,16 +6,20 @@
 -- its outcome taken from the owner's lots. The operator submits matches; the
 -- signed buy delegates its owner into the signed sell, whose body verifies the
 -- whole book snapshot, moves cash, delivers contracts and writes a receipt.
--- Full-set matching across outcomes comes in MO3.
+-- Full-set matching pairs the best order of every outcome on one side: buys
+-- mint complete sets when their limits sum to at least 1, sells merge them when
+-- their limits sum to at most 1 (docs/multi-outcome-markets.md).
 module Outcomia.MultiOrders where
 
-import DA.List (sortOn, unique)
+import DA.Action (foldlA)
+import DA.Foldable (mapA_, maximum, minimum)
+import DA.List (head, sortOn, unique)
 import DA.Numeric qualified as Numeric
 import Canton.MarketFactory qualified as MF
 import Splice.Api.Token.HoldingV2 qualified as H
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
 import Splice.Api.Token.TransferInstructionV2 qualified as T
-import Outcomia.Assets (holdingTotal)
+import Outcomia.Assets (holdingTotal, transferExact)
 import Outcomia.Binary (EligibilityProof(..), Protocol(..))
 import Outcomia.Custody
 import Outcomia.Fees qualified as Fees
@@ -90,6 +94,52 @@ data MultiSettlement = MultiSettlement with
     position : Optional (ContractId MultiLot)
     receipt : Optional (ContractId MultiTradeFill)
   deriving (Eq, Show)
+
+-- | One full-set fill: one leg per outcome, in outcome order. Makers trade at
+-- their limits; the taker (newest order) takes 1 minus the makers' sum, so the
+-- legs always sum to exactly one collateral unit per set.
+data FullSetPlan = FullSetPlan with
+    side : OrderSide
+    orderIds : [Int]
+    prices : [Decimal]
+    takerId : Int
+    quantity : Int
+    remaining : [Int]
+  deriving (Eq, Show)
+
+data FullSetDecision = NoFullSet | CancelFullSetSelfTrade Int | FullSet FullSetPlan
+  deriving (Eq, Show)
+
+-- | Result of full-set matching. For a fill, balances and positions are in
+-- outcome order (positions only when minting). For a self-trade cancellation,
+-- balances holds the one owner's account.
+data FullSetSettlement = FullSetSettlement with
+    book : ContractId MultiBook
+    decision : FullSetDecision
+    reserve : Optional (ContractId MultiReserve)
+    balances : [ContractId AssetBalance]
+    positions : [ContractId MultiLot]
+    receipt : Optional (ContractId MultiFullSetFill)
+  deriving (Eq, Show)
+
+-- | Audit record of one full-set fill; never spendable.
+template MultiFullSetFill
+  with
+    key : MarketKey
+    vault : Party
+    owners : [Party]
+    instrument : CollateralInstrument
+    plan : FullSetPlan
+    executedAt : Time
+    feeAmount : Decimal
+    credits : [Decimal]
+  where
+    signatory key.operator, vault
+    observer owners
+    ensure key.operator /= vault && key.marketId > 0 && unique owners &&
+      length owners == length plan.orderIds && length plan.prices == length plan.orderIds &&
+      plan.quantity > 0 && sum plan.prices == 1.0 && all (> 0.0) plan.prices &&
+      feeAmount >= 0.0 && all (>= 0.0) credits
 
 data MultiFeeWithdrawal = MultiFeeWithdrawal with
     book : ContractId MultiBook
@@ -283,6 +333,45 @@ template MultiBook
           requireAccess current.access sell.owner MF.Fill sellerEligibility
           exercise buyRef.order MultiOrder_SettleBuy with
             book = self; market; sellOrder = sellRef.order; buyerBalance; sellerBalance; extraArgs
+
+    -- | Operator: match the best order of every outcome on one side as complete
+    -- sets, or cancel the newest head of an owner holding two heads. Balances
+    -- and eligibility proofs are given in outcome order. Each head's signed
+    -- order delegates its owner to the next; the last leg settles and
+    -- archives this book.
+    nonconsuming choice MultiBook_MatchFullSet : FullSetSettlement
+      with
+        market : ContractId MultiMarket
+        reserve : ContractId MultiReserve
+        side : OrderSide
+        balances : [ContractId AssetBalance]
+        eligibility : [Optional EligibilityProof]
+        extraArgs : ExtraArgs
+      controller key.operator
+      do
+        current <- checkMultiTrading this market
+        let n = length terms.outcomes
+        assertMsg "Give one account and one eligibility proof per outcome"
+          (length balances == n && length eligibility == n)
+        snapshot <- multiSnapshot this
+        decision <- feeChecked (planFullSet terms.priceTick terms.quantityLot n side snapshot)
+        heads <- mapA (\i -> requireBestRef orders i side) [0 .. n - 1]
+        case decision of
+          NoFullSet -> abort "No full set to match on this side"
+          CancelFullSetSelfTrade newer -> do
+            target <- case filter (\r -> r.orderId == newer) heads of
+              r :: _ -> pure r
+              [] -> abort "Self-trade head is not indexed"
+            exercise target.order MultiOrder_CancelFullSetSelfTrade with
+              book = self; market; side; balance = atIndexOr (head balances) target.outcome balances; extraArgs
+          FullSet _ -> do
+            values <- mapA (\r -> fetch r.order) heads
+            mapA_ (\(o, proof) -> requireAccess current.access o.owner MF.Fill proof) (zip values eligibility)
+            case heads of
+              first :: rest -> exercise first.order MultiOrder_FullSetLeg with
+                book = self; market; reserve; side; legs = map (\r -> r.order) heads
+                rest = map (\r -> r.order) rest; owners = []; balances; extraArgs
+              [] -> abort "No outcomes"
 
     -- | Operator: clear the resting order of an owner the market's policy now
     -- excludes; backing returns to the owner exactly as on cancellation.
@@ -483,6 +572,55 @@ template MultiOrder
           book = next; decision; position = released.position; receipt = None
           balances = [fromOptionalBalance balance released.balance]
 
+    -- | One leg of a full-set match. Adds this order's owner to the delegated
+    -- owners and forwards to the next head; the last leg settles with every
+    -- owner's authority. Only reachable through 'MultiBook_MatchFullSet'.
+    nonconsuming choice MultiOrder_FullSetLeg : FullSetSettlement
+      with
+        book : ContractId MultiBook
+        market : ContractId MultiMarket
+        reserve : ContractId MultiReserve
+        side : OrderSide
+        legs : [ContractId MultiOrder]
+        rest : [ContractId MultiOrder]
+        owners : [Party]
+        balances : [ContractId AssetBalance]
+        extraArgs : ExtraArgs
+      controller key.operator, vault, owners
+      do
+        let delegated = owners ++ [owner]
+        case rest of
+          next :: more -> exercise next MultiOrder_FullSetLeg with
+            book; market; reserve; side; legs; rest = more; owners = delegated; balances; extraArgs
+          [] -> settleFullSet book market reserve side legs balances extraArgs
+
+    -- | Cancel this order when it is the newest head of an owner holding two
+    -- heads of a full set.
+    postconsuming choice MultiOrder_CancelFullSetSelfTrade : FullSetSettlement
+      with
+        book : ContractId MultiBook
+        market : ContractId MultiMarket
+        side : OrderSide
+        balance : ContractId AssetBalance
+        extraArgs : ExtraArgs
+      controller key.operator, vault
+      do
+        index <- fetch book
+        _ <- checkMultiTrading index market
+        snapshot <- multiSnapshot index
+        decision <- case planFullSet index.terms.priceTick index.terms.quantityLot (length index.terms.outcomes) side snapshot of
+          Right value@(CancelFullSetSelfTrade newer) | newer == orderId -> pure value
+          _ -> abort "Only the newest self-crossed full-set head may be cancelled"
+        assertMsg "Self-trade order must be indexed" (any (\r -> r.order == self) index.orders)
+        checkMultiAccount key vault instrument factory owner balance
+        released <- releaseMulti this (if this.side == Buy then Some balance else None) extraArgs
+        exercise book Archive
+        next <- create index with orders = filter (\r -> r.order /= self) index.orders
+        pure FullSetSettlement with
+          book = next; decision; reserve = None; receipt = None
+          balances = [fromOptionalBalance balance released.balance]
+          positions = optionalHoldings released.position
+
     -- | Return the backing to the owner; the book removes the reference. The
     -- owner's own cancellation and the operator's ineligible clearing both
     -- end here; the book checks which one applies.
@@ -661,3 +799,190 @@ lotFor : MarketKey -> Party -> Party -> [Int] -> Update (Optional (ContractId Mu
 lotFor key vault owner counts =
   if all (== 0) counts then pure None
   else Some <$> create MultiLot with key; vault; owner; counts
+
+-- | Pure full-set planner. Takes the best order of every outcome on `side`.
+-- Buys cross when their limits sum to at least 1 and sells when they sum to
+-- at most 1. An owner holding two heads gets the newer one cancelled. Makers
+-- trade at their limits and the taker at 1 minus the makers' sum; a buy taker
+-- whose price would not be positive leaves the book unmatched. Example: buys
+-- Red 0.30 (#1), Blue 0.30 (#2), Green 0.50 (#3) mint at 0.30/0.30/0.40.
+planFullSet : Decimal -> Int -> Int -> OrderSide -> [MultiMatchOrder] -> Either Text FullSetDecision
+planFullSet tick lot n side orders = do
+  checkMultiSnapshot tick lot orders
+  pure $ case mapA best [0 .. n - 1] of
+    None -> NoFullSet
+    Some heads ->
+      let total = sum (map (\o -> o.price) heads)
+          crosses = if side == Buy then total >= 1.0 else total <= 1.0
+          owners = map (\o -> o.owner) heads
+          shared = filter (\o -> length (filter (== o.owner) owners) > 1) heads
+          taker = maximum (map (\o -> o.orderId) heads)
+          makers = sum [o.price | o <- heads, o.orderId /= taker]
+          takerPrice = 1.0 - makers
+          quantity = minimum (map (\o -> o.quantity) heads)
+      in if n < 2 || not crosses then NoFullSet
+         else if not (null shared) then CancelFullSetSelfTrade (maximum (map (\o -> o.orderId) shared))
+         else if takerPrice <= 0.0 || takerPrice >= 1.0 then NoFullSet
+         else FullSet FullSetPlan with
+           side; takerId = taker; quantity
+           orderIds = map (\o -> o.orderId) heads
+           prices = map (\o -> if o.orderId == taker then takerPrice else o.price) heads
+           remaining = map (\o -> o.quantity - quantity) heads
+  where
+    best i = case sortOn (\o -> priorityKey side o.price o.orderId)
+        (filter (\o -> o.outcome == i && o.side == side) orders) of
+      [] -> None
+      first :: _ -> Some first
+
+checkMultiSnapshot : Decimal -> Int -> [MultiMatchOrder] -> Either Text ()
+checkMultiSnapshot tick lot orders
+  | tick <= 0.0 || tick >= 1.0 || lot <= 0 = Left "Invalid market increments"
+  | length orders > maxMultiOrders = Left "Matching snapshot exceeds the order limit"
+  | not (unique (map (\o -> o.orderId) orders)) = Left "Duplicate acceptance IDs"
+  | not (all valid orders) = Left "Invalid order in matching snapshot"
+  | otherwise = Right ()
+  where
+    valid o = o.orderId > 0 && o.outcome >= 0 && validMatchPrice tick o.price &&
+      o.quantity > 0 && o.quantity % lot == 0
+
+atIndexOr : a -> Int -> [a] -> a
+atIndexOr fallback i xs = case drop i xs of x :: _ -> x; [] -> fallback
+
+-- | Running state while settling the legs of a full set.
+data FullSetState = FullSetState with
+    reserveCash : Optional (ContractId H.Holding)
+    reserveAmount : Decimal
+    pool : MarketFees.FeePoolState
+    balances : [ContractId AssetBalance]
+    successors : [ContractId MultiOrder]
+    feeAmount : Decimal
+    credits : [Decimal]
+
+-- | Settles a verified full set with every owner's authority in scope: moves
+-- each buy's cost into the reserve (mint) or pays each seller from the reserve
+-- (merge), collects taker fees, refunds price improvement, delivers lots,
+-- keeps partial remainders and writes one receipt. Any failure rolls back all.
+settleFullSet : ContractId MultiBook -> ContractId MultiMarket -> ContractId MultiReserve -> OrderSide -> [ContractId MultiOrder] -> [ContractId AssetBalance] -> ExtraArgs -> Update FullSetSettlement
+settleFullSet book market reserve side legs accounts extraArgs = do
+  index <- fetch book
+  _ <- checkMultiTrading index market
+  let n = length index.terms.outcomes
+      key = index.key
+      vault = index.vault
+      instrument = index.terms.collateral
+      factory = index.factory
+      asset = H.InstrumentId instrument.admin instrument.id
+      vaultAccount = H.Account (Some vault) None ""
+  snapshot <- multiSnapshot index
+  plan <- case planFullSet index.terms.priceTick index.terms.quantityLot n side snapshot of
+    Right (FullSet value) -> pure value
+    _ -> abort "No eligible full set for settlement"
+  heads <- mapA (\i -> requireBestRef index.orders i side) [0 .. n - 1]
+  assertMsg "Settlement must use the best indexed order of every outcome"
+    (map (\r -> r.order) heads == legs && map (\r -> r.orderId) heads == plan.orderIds &&
+     length accounts == n)
+  orders <- mapA fetch legs
+  mapA_ (\(o, account) -> checkMultiAccount key vault instrument factory o.owner account) (zip orders accounts)
+  pool <- fetch reserve
+  assertMsg "Reserve does not belong to this book"
+    (pool.key == key && pool.vault == vault && pool.creator == index.creator &&
+     pool.terms == index.terms && pool.createdAt == index.marketCreatedAt &&
+     pool.factory == factory && pool.assetDecimals == index.assetDecimals)
+  backing <- holdingTotal asset vaultAccount (optionalHoldings pool.cash)
+  assertMsg "Reserve backing does not equal complete sets" (backing == intToDecimal pool.completeSets)
+  exercise reserve Archive
+  let q = plan.quantity
+      start = FullSetState with
+        reserveCash = pool.cash; reserveAmount = intToDecimal pool.completeSets
+        pool = index.fees; balances = []; successors = []; feeAmount = 0.0; credits = []
+      steps = zip4 legs orders accounts (zip plan.prices plan.remaining)
+  (final, nextSets) <- if side == Buy then do
+    assertMsg "Complete-set supply limit reached" (q <= 9223372036854775807 - pool.completeSets)
+    done <- foldlA (\st (cid, o, account, (price, left)) -> do
+      cash <- case o.backing of MultiCash c -> pure c; _ -> abort "Mint requires buy cash escrow"
+      funding <- feeChecked (Fees.buyFunding o.feeTerms (multiBuyState o))
+      total <- holdingTotal asset vaultAccount [cash]
+      assertMsg "Buy escrow amount is incorrect" (total == funding.totalEscrow)
+      movement <- feeChecked (Fees.buyFillFunding o.feeTerms (multiBuyState o) price q (o.orderId == plan.takerId))
+      intent <- transferIntent vault vault (st.reserveAmount + movement.tradeCost)
+        (optionalHoldings st.reserveCash ++ [cash]) extraArgs
+      moved <- transferExact factory instrument intent
+      nextReserve <- exactlyOne moved.received
+      let afterCost = total - movement.tradeCost
+      afterCostCash <- canonicalOptional afterCost moved.change
+      collected <- MarketFees.collectFees vault instrument factory index.assetDecimals st.pool
+        movement.feeCharged afterCostCash afterCost extraArgs
+      let afterFee = afterCost - movement.feeCharged
+      (nextBalance, remainingCash) <- if movement.refund > 0.0 then do
+        refunded <- exercise account AssetBalance_Repartition with
+          otherCash = collected.remainingCash; otherAmount = afterFee; delta = movement.refund; extraArgs
+        pure (refunded.balance, refunded.otherCash)
+        else pure (account, collected.remainingCash)
+      rest <- holdingTotal asset vaultAccount (optionalHoldings remainingCash)
+      assertMsg "Remaining buy escrow is incorrect" (rest == movement.funding.totalEscrow)
+      exercise cid Archive
+      successor <- if left == 0 then do
+        assertMsg "Completed buy must have no remaining escrow" (remainingCash == None)
+        pure []
+        else do
+          c <- case remainingCash of Some c -> pure c; None -> abort "Partial buy requires escrow"
+          r <- create o with
+            quantity = left; backing = MultiCash c
+            takerNotional = movement.nextState.takerNotional; paidFee = movement.nextState.paidFee
+          pure [r]
+      pure st with
+        reserveCash = Some nextReserve; reserveAmount = st.reserveAmount + movement.tradeCost
+        pool = collected.pool; balances = st.balances ++ [nextBalance]
+        successors = st.successors ++ successor; feeAmount = st.feeAmount + movement.feeCharged
+        credits = st.credits ++ [movement.refund]) start steps
+    assertMsg "Mint must add exactly one collateral unit per set"
+      (done.reserveAmount == intToDecimal (pool.completeSets + q))
+    pure (done, pool.completeSets + q)
+  else do
+    assertMsg "Merge exceeds reserved complete sets" (q <= pool.completeSets)
+    moves <- mapA (\(o, price) -> feeChecked (Fees.sellFillFunding o.feeTerms o.takerNotional o.paidFee
+      (price * intToDecimal q) (o.orderId == plan.takerId))) (zip orders plan.prices)
+    let fee = sum (map (\m -> m.accrual.charge) moves)
+        held = intToDecimal pool.completeSets
+    collected <- MarketFees.collectFees vault instrument factory index.assetDecimals index.fees fee pool.cash held extraArgs
+    done <- foldlA (\st ((cid, o, account, (_, left)), m) -> do
+      (nextBalance, source) <- if m.netProceeds <= 0.0 then pure (account, st.reserveCash) else do
+        paid <- exercise account AssetBalance_Repartition with
+          otherCash = st.reserveCash; otherAmount = st.reserveAmount; delta = m.netProceeds; extraArgs
+        pure (paid.balance, paid.otherCash)
+      exercise cid Archive
+      successor <- if left == 0 then pure [] else do
+        r <- create o with
+          quantity = left; takerNotional = m.accrual.takerNotional; paidFee = m.accrual.paidFee
+        pure [r]
+      pure st with
+        reserveCash = source; reserveAmount = st.reserveAmount - m.netProceeds
+        balances = st.balances ++ [nextBalance]; successors = st.successors ++ successor
+        credits = st.credits ++ [m.netProceeds])
+      (start with reserveCash = collected.remainingCash; reserveAmount = held - fee; pool = collected.pool; feeAmount = fee)
+      (zip steps moves)
+    actual <- holdingTotal asset vaultAccount (optionalHoldings done.reserveCash)
+    assertMsg "Merge must release exactly one collateral unit per set" (actual == held - intToDecimal q)
+    pure (done, pool.completeSets - q)
+  nextReserve <- create pool with completeSets = nextSets; cash = final.reserveCash
+  positions <- if side == Buy
+    then mapA (\(i, o) -> create MultiLot with
+      key; vault; owner = o.owner; counts = adjustAt i (const q) (replicate n 0)) (zip [0 .. n - 1] orders)
+    else pure []
+  refs <- mapA refFor final.successors
+  exercise book Archive
+  next <- create index with
+    orders = filter (\r -> not (r.order `elem` legs)) index.orders ++ refs
+    fees = final.pool
+    clubFees = index.clubFees + multiClubPart index final.feeAmount
+  now <- getTime
+  receipt <- create MultiFullSetFill with
+    key; vault; owners = map (\o -> o.owner) orders; instrument; plan; executedAt = now
+    feeAmount = final.feeAmount; credits = final.credits
+  pure FullSetSettlement with
+    book = next; decision = FullSet plan; reserve = Some nextReserve
+    balances = final.balances; positions; receipt = Some receipt
+
+zip4 : [a] -> [b] -> [c] -> [d] -> [(a, b, c, d)]
+zip4 (a :: as) (b :: bs) (c :: cs) (d :: ds) = (a, b, c, d) :: zip4 as bs cs ds
+zip4 _ _ _ _ = []

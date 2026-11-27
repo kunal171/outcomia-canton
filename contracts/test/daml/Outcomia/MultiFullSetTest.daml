@@ -1,0 +1,188 @@
+-- | Full-set matching on multi-outcome books: buys of every outcome mint
+-- complete sets, sells of every outcome merge them, and an owner holding two
+-- heads has the newer cancelled.
+module Outcomia.MultiFullSetTest where
+
+import DA.Action (foldlA)
+import DA.Assert ((===))
+import DA.List (head, (!!))
+import Daml.Script
+import Splice.Api.Token.HoldingV2 qualified as H
+import Outcomia.Custody
+import Outcomia.CustodyTest qualified as C
+import Outcomia.Fees qualified as Fees
+import Outcomia.FactoryTest qualified as FT
+import Outcomia.MultiOrders
+import Outcomia.MultiOutcome
+import Outcomia.MultiOutcomeTest qualified as MT
+import Outcomia.TokenHarness
+import Outcomia.Types
+
+data Trader = Trader with
+    party : Party
+    account : ContractId AssetBalance
+  deriving (Eq, Show)
+
+data Room = Room with
+    m : MT.Market
+    book : ContractId MultiBook
+    reserve : ContractId MultiReserve
+    -- | Red, Blue, Green and Gold traders, each funded with 5 units.
+    traders : [Trader]
+  deriving (Eq, Show)
+
+fund : MT.Market -> Party -> Script (ContractId AssetBalance)
+fund m party = do
+  let a = FT.asset m.f
+  -- Opening a balance revises the vault authority; use its current revision.
+  [(authority, _)] <- query @VaultAuthority m.f.custody.vault
+  (_, account) <- submit (actAs party <> readAs a.operator) do
+    exerciseCmd authority VaultAuthority_OpenBalance with owner = party; admission = a.admission
+  input <- submit a.issuer do
+    createCmd TestHolding with
+      issuer = a.issuer; account = H.Account (Some party) None ""
+      instrument = H.InstrumentId a.issuer "test-USD"; amount = 5.0; locked = None
+  funded <- submit (actAs party <> readAs (MT.reads m.f)) do
+    exerciseCmd account AssetBalance_Deposit with
+      admission = a.admission; inputs = [toInterfaceContractId @H.Holding input]; amount = 5.0
+      extraArgs = C.registryContext
+  pure funded.balance
+
+room : Script Room
+room = script do
+  m <- MT.open
+  let a = FT.asset m.f
+  carol <- allocateParty "Carol"
+  dave <- allocateParty "Dave"
+  bob <- fund m a.bob
+  carolAccount <- fund m carol
+  daveAccount <- fund m dave
+  [(book, _)] <- query @MultiBook m.f.custody.vault
+  [(reserve, _)] <- query @MultiReserve m.f.custody.vault
+  pure Room with
+    m; book; reserve
+    traders = [Trader a.alice m.balance, Trader a.bob bob, Trader carol carolAccount, Trader dave daveAccount]
+
+reads : Room -> [Party]
+reads r = MT.reads r.m.f
+
+zeroFee : Fees.FeeTerms
+zeroFee = Fees.FeeTerms 0 6
+
+-- | Place buys in order; returns the book and each trader's account.
+buys : Room -> [(Int, Decimal, Int)] -> Script (ContractId MultiBook, [ContractId AssetBalance])
+buys r specs = do
+  let a = FT.asset r.m.f
+  foldlA (\(book, accounts) (i, (outcome, price, quantity)) -> do
+    let t = r.traders !! i
+    placed <- submit (actAs t.party <> readAs (reads r)) do
+      exerciseCmd book MultiBook_PlaceBuy with
+        owner = t.party; market = r.m.market; balance = accounts !! i; outcome; price; quantity
+        feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = zeroFee
+        extraArgs = C.registryContext; eligibility = None
+    Some next <- pure placed.balance
+    pure (placed.book, replace i next accounts)) (r.book, map (\t -> t.account) r.traders)
+    (zip [0 .. length specs - 1] specs)
+  where
+    replace i x xs = [if j == i then x else y | (j, y) <- zip [0 .. length xs - 1] xs]
+
+matchFullSet : Room -> ContractId MultiBook -> ContractId MultiReserve -> OrderSide -> [ContractId AssetBalance] -> Commands FullSetSettlement
+matchFullSet r book reserve side balances = exerciseCmd book MultiBook_MatchFullSet with
+  market = r.m.market; reserve; side; balances; eligibility = replicate 4 None
+  extraArgs = C.registryContext
+
+freeOf : Room -> ContractId AssetBalance -> Script Decimal
+freeOf r cid = do
+  Some account <- queryContractId r.m.f.custody.vault cid
+  pure account.available
+
+-- | Four buys summing to 1.10 mint two sets: makers pay their limits and the
+-- taker (Gold, newest) pays 1 - 0.70 = 0.30 instead of 0.40.
+mint : Room -> Script FullSetSettlement
+mint r = do
+  (book, accounts) <- buys r [(0, 0.3, 2), (1, 0.2, 2), (2, 0.2, 2), (3, 0.4, 3)]
+  let a = FT.asset r.m.f
+  submit (actAs a.operator <> readAs (reads r)) do matchFullSet r book r.reserve Buy accounts
+
+test_buys_of_every_outcome_mint_complete_sets : Script ()
+test_buys_of_every_outcome_mint_complete_sets = script do
+  r <- room
+  done <- mint r
+  case done.decision of
+    FullSet plan -> (plan.prices, plan.quantity, plan.remaining) === ([0.3, 0.2, 0.2, 0.3], 2, [0, 0, 0, 1])
+    other -> abort ("Expected a full set, got " <> show other)
+  Some reserveId <- pure done.reserve
+  Some reserve <- queryContractId r.m.f.custody.vault reserveId
+  reserve.completeSets === 2
+  lots <- mapA (\cid -> do Some l <- queryContractId r.m.f.custody.vault cid; pure (l.owner, l.counts)) done.positions
+  lots === zip (map (\t -> t.party) r.traders) [[2, 0, 0, 0], [0, 2, 0, 0], [0, 0, 2, 0], [0, 0, 0, 2]]
+  -- Dave escrowed 1.20, paid 0.60, got 0.20 back; 0.40 stays for 1 more.
+  free <- mapA (freeOf r) done.balances
+  free === [4.4, 4.6, 4.6, 4.0]
+  Some book <- queryContractId r.m.f.custody.vault done.book
+  map (\o -> (o.outcome, o.side)) book.orders === [(3, Buy)]
+  Some receipt <- pure done.receipt
+  Some fill <- queryContractId r.m.f.custody.vault receipt
+  fill.credits === [0.0, 0.0, 0.0, 0.2]
+
+test_sells_of_every_outcome_merge_complete_sets : Script ()
+test_sells_of_every_outcome_merge_complete_sets = script do
+  r <- room
+  minted <- mint r
+  Some reserve <- pure minted.reserve
+  let a = FT.asset r.m.f
+      asks = [0.2, 0.2, 0.2, 0.3]
+  -- Each trader sells their 2 contracts; prices sum to 0.90.
+  book <- foldlA (\book (i, (t, lot)) -> do
+    placed <- submit (actAs t.party <> readAs (reads r)) do
+      exerciseCmd book MultiBook_PlaceSell with
+        owner = t.party; market = r.m.market; positions = [lot]; outcome = i; price = asks !! i; quantity = 2
+        feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = zeroFee; eligibility = None
+    pure placed.book) minted.book (zip [0 .. 3] (zip r.traders minted.positions))
+  -- Buys do not cross the sells' side: only sells are considered.
+  merged <- submit (actAs a.operator <> readAs (reads r)) do
+    matchFullSet r book reserve Sell minted.balances
+  case merged.decision of
+    FullSet plan -> plan.prices === [0.2, 0.2, 0.2, 0.4]
+    other -> abort ("Expected a full set, got " <> show other)
+  Some reserveId <- pure merged.reserve
+  Some after <- queryContractId r.m.f.custody.vault reserveId
+  after.completeSets === 0
+  free <- mapA (freeOf r) merged.balances
+  free === [4.8, 5.0, 5.0, 4.8]
+  -- Nothing is left to merge.
+  submitMustFail (actAs a.operator <> readAs (reads r)) do
+    matchFullSet r merged.book reserveId Sell merged.balances
+
+test_an_owner_with_two_heads_loses_the_newer : Script ()
+test_an_owner_with_two_heads_loses_the_newer = script do
+  r <- room
+  let a = FT.asset r.m.f
+      alice = head r.traders
+  (book, accounts) <- buys r [(0, 0.3, 1), (1, 0.3, 1), (2, 0.3, 1)]
+  -- Alice also bids on Gold: she now holds the Red and Gold heads.
+  placed <- submit (actAs alice.party <> readAs (reads r)) do
+    exerciseCmd book MultiBook_PlaceBuy with
+      owner = alice.party; market = r.m.market; balance = head accounts; outcome = 3; price = 0.2; quantity = 1
+      feePolicy = a.protocol; expectedFeeRevision = 0; expectedFeeTerms = zeroFee
+      extraArgs = C.registryContext; eligibility = None
+  Some aliceAccount <- pure placed.balance
+  done <- submit (actAs a.operator <> readAs (reads r)) do
+    -- Accounts follow outcome order: Alice owns both the Red and Gold heads.
+    matchFullSet r placed.book r.reserve Buy [aliceAccount, accounts !! 1, accounts !! 2, aliceAccount]
+  done.decision === CancelFullSetSelfTrade 4
+  [refunded] <- pure done.balances
+  freeOf r refunded >>= (=== 4.7)
+
+test_full_set_planner : Script ()
+test_full_set_planner = script do
+  r <- room
+  let [p0, p1, p2, p3] = map (\t -> t.party) r.traders
+      o i owner outcome side price = MultiMatchOrder i owner outcome side price 1
+  -- Buys summing below 1 do not mint; sells summing above 1 do not merge.
+  planFullSet 0.01 1 3 Buy [o 1 p0 0 Buy 0.3, o 2 p1 1 Buy 0.3, o 3 p2 2 Buy 0.3] === Right NoFullSet
+  planFullSet 0.01 1 3 Sell [o 1 p0 0 Sell 0.4, o 2 p1 1 Sell 0.4, o 3 p2 2 Sell 0.3] === Right NoFullSet
+  -- A missing outcome blocks the set.
+  planFullSet 0.01 1 4 Buy [o 1 p0 0 Buy 0.5, o 2 p1 1 Buy 0.5, o 3 p2 2 Buy 0.5] === Right NoFullSet
+  -- Makers alone already pay 1: the taker's price would not be positive.
+  planFullSet 0.01 1 3 Buy [o 1 p0 0 Buy 0.6, o 2 p1 1 Buy 0.5, o 3 p3 2 Buy 0.1] === Right NoFullSet

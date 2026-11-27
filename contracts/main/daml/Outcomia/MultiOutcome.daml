@@ -107,6 +107,11 @@ multiPayout result counts = case result of
     [] -> 0.0
   InvalidResult -> sum (map (\c -> intToDecimal c / intToDecimal (length counts)) counts)
 
+winnerOf : MultiResult -> Optional Int
+winnerOf result = case result of
+  Winner index -> Some index
+  InvalidResult -> None
+
 validResult : Int -> MultiResult -> Bool
 validResult n result = case result of
   Winner index -> index >= 0 && index < n
@@ -187,7 +192,7 @@ template MultiMarket
         assertMsg (T.intercalate "; " problems) (null problems)
         create MultiProposal with
           key; creator; terms; marketCreatedAt = createdAt; openedAt
-          proposedBy = actor; result; evidence; proposedAt = now
+          proposedBy = actor; result; winnerIndex = winnerOf result; evidence; proposedAt = now
           finalizableAt = addRelTime now (seconds terms.resolutionDelaySeconds)
           revision = 0
 
@@ -200,6 +205,9 @@ template MultiProposal
     openedAt : Time
     proposedBy : Party
     result : MultiResult
+    -- | The winner's index, or None when invalid; always mirrors `result`, so
+    -- indexers that read only scalar fields can record the outcome.
+    winnerIndex : Optional Int
     evidence : ResolutionEvidence
     proposedAt : Time
     finalizableAt : Time
@@ -227,7 +235,8 @@ template MultiProposal
           (replacementResult /= result || replacementEvidence /= evidence)
         assertMsg "Proposal revision limit reached" (revision < 9223372036854775807)
         create this with
-          proposedBy = resolver; result = replacementResult; evidence = replacementEvidence
+          proposedBy = resolver; result = replacementResult; winnerIndex = winnerOf replacementResult
+          evidence = replacementEvidence
           proposedAt = now
           finalizableAt = addRelTime now (seconds terms.resolutionDelaySeconds)
           revision = revision + 1
@@ -255,7 +264,7 @@ validMultiProposal p = p.key.marketId > 0 && boundedText 64 p.key.protocolName &
   null (multiTermsErrors p.marketCreatedAt p.terms) &&
   p.marketCreatedAt <= p.openedAt && p.openedAt < p.terms.closeAt &&
   earliest p.terms <= p.proposedAt &&
-  validResult (length p.terms.outcomes) p.result &&
+  validResult (length p.terms.outcomes) p.result && p.winnerIndex == winnerOf p.result &&
   null (evidenceErrors p.evidence) && p.revision >= 0 &&
   p.finalizableAt == addRelTime p.proposedAt (seconds p.terms.resolutionDelaySeconds)
 

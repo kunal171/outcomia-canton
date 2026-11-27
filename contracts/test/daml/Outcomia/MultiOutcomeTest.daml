@@ -161,6 +161,7 @@ test_admins_resolve_with_corrections = script do
   final <- submit a.operator do exerciseCmd corrected MultiProposal_Finalize
   Some value <- queryContractId a.operator final
   value.proposal.result === Winner 2
+  value.proposal.winnerIndex === Some 2
   value.proposal.revision === 1
 
 test_close_stops_split_but_not_merge : Script ()
