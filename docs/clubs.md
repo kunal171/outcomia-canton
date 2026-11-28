@@ -73,7 +73,7 @@ never changes when an implementation upgrades.
 ## Rules and listings
 
 These match Solana's club rules
-(outcomia `docs/club-rules-and-disputes.md`, milestone 1).
+(outcomia `docs/clubs.md`, club rules).
 
 | Rule | Canton |
 | --- | --- |

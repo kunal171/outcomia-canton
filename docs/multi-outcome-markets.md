@@ -1,7 +1,7 @@
 # Multi-outcome markets
 
 Markets with 2–8 named outcomes and exactly one winner, at parity with Solana
-(outcomia `docs/multi-outcome-markets.md`). They are created only through a market
+(outcomia `docs/prediction-markets.md`). They are created only through a market
 factory (public or club), so the factory's admins resolve them. They have no draft
 state and no fallback resolver. Binary contracts are untouched.
 
