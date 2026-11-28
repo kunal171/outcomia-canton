@@ -432,7 +432,7 @@ template OrderBook
     -- accounts or a foreign reserve. Result: one complete-set fill or the
     -- cancellation of the newer same-owner head. Like MatchBest, the inner
     -- settlement MUST archive this exact book; nested signed orders supply the
-    -- owners' authority. See docs/binary-complementary-matching.md.
+    -- owners' authority. See docs/trading.md (matching).
     nonconsuming choice OrderBook_MatchComplement : ComplementResult
       with
         market : ContractId BinaryMarket

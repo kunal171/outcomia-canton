@@ -13,7 +13,7 @@
 -- consumes the club, so changes within one club are serialized; clubs never
 -- contend with each other. Exits from positions never consult clubs.
 --
--- Platform rules (docs/clubs-private-markets.md, "Club rules"): a club is
+-- Platform rules (docs/clubs.md, "Rules and listings"): a club is
 -- public or private, fixed at creation; each type has a member cap, every
 -- club an admin cap, and a wallet may own a limited number of clubs. The
 -- registry counts owned clubs, so creation and ownership transfer go through
