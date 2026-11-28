@@ -1,52 +1,48 @@
 # Outcomia Canton
 
-Canton contracts and services for Outcomia's limit-order prediction markets.
-Binary markets come first, followed by multi-outcome markets, clubs/private
-markets and governance-created markets. Multi-outcome markets initially have
-exactly one winner. Canton spot trading is outside the current scope.
+Daml contracts for Outcomia's limit-order prediction markets on Canton. The UI
+lives in the shared app, [`kunal171/outcomia/app`](https://github.com/kunal171/outcomia/tree/master/app);
+there is no separate Canton frontend.
 
-## Shared frontend
+**What is built** (each locally tested, with its UI in the shared app):
 
-The UI lives in [`kunal171/outcomia/app`](https://github.com/kunal171/outcomia/tree/master/app).
-There is no separate Canton frontend. That app uses the selected wallet to open
-Solana markets or the Canton prediction workspace. Loop or Console Wallet verifies its primary party on the configured network
-(`canton:testnet` by default).
+- binary markets: lifecycle, collateral custody, complete sets, limit orders,
+  direct and complementary matching, fees, resolution and redemption;
+- the market factory standard, clubs (membership, roles, rules, listings, club
+  fee share) and invite-only markets;
+- multi-outcome markets (2–8 outcomes) with full-set matching;
+- on-ledger profile claims that link a Canton party to an Outcomia profile.
 
-Run the shared app using [its setup guide](https://github.com/kunal171/outcomia/blob/master/app/README.md).
-See [the wallet boundary](docs/wallet-gateway.md) and
-[verification](docs/checkpoint-01-verification.md).
+**Not done:** public-network deployment and a live wallet smoke test. Canton
+trading stays disabled in the app until both are verified.
 
-## Delivery
+## Docs
 
-Use small commits, a feature PR, and a merge before the next checkpoint. See
-[the plan](docs/delivery-plan.md). The shared wallet gateway,
-[binary lifecycle](docs/binary-market-lifecycle.md) and
-[Token Standard transfers](docs/collateral-transfers.md) are locally tested. The
-[dedicated-vault balances](docs/collateral-custody.md) support deposits and withdrawals;
-[complete sets](docs/complete-set-positions.md) support YES/NO split and merge.
-[Resting limit orders](docs/binary-limit-orders.md) lock buys/sells and support
-owner cancellation. The [matching planner](docs/binary-matching.md) selects
-price/FIFO pairs and computes partial fills and refunds. The [atomic settlement path](docs/binary-settlement.md) now applies one fill or
-cancel-newer self-trade action. The [fee rules and pure arithmetic](docs/fee-accounting.md) are locally checked;
-operator policy, funded fees, atomic collection and fee withdrawal are also checked.
-[Resolution proposals, corrections and delayed finalization](docs/binary-resolution.md)
-and [collateral-backed redemption](docs/binary-redemption.md) are locally checked. [Clubs/private markets](docs/clubs-private-markets.md)
-are planned and have no implementation yet.
-The shared UI includes wallet commands for the binary lifecycle. Deployment and live wallet testing remain outstanding; transaction controls stay disabled until verified.
+| Doc | Covers |
+| --- | --- |
+| [Architecture](docs/architecture.md) | Roles and trust, collateral custody, complete sets, visibility |
+| [Trading](docs/trading.md) | Orders, matching, settlement and fees |
+| [Resolution](docs/resolution.md) | Proposals, corrections, finalization and redemption |
+| [Clubs](docs/clubs.md) | Market factory standard, clubs, eligibility, rules and listings |
+| [Multi-outcome markets](docs/multi-outcome-markets.md) | 2–8 outcomes, full-set matching, limits |
+| [Wallets](docs/wallets.md) | Loop and Console through CIP-0103 |
+| [Development](docs/development.md) | Build, tests, dependencies and the DPM path workaround |
 
-## Contracts
+## Build
 
-The read-only protocol-role interface lives in `contracts/roles`, separately from
-template implementations for upgrade safety.
+DPM SDK 3.7.1, Java 17+ and Python 3.10+.
 
-Use DPM SDK 3.7.1, Java 17 or newer and Python 3.10+. `make deps` fetches and
-verifies pinned Token Standard interfaces. `make build` builds the production and
-test DARs; `make test` runs the IDE-ledger suite. The production package does not
-depend on `daml-script`. For checkouts with spaces, see the [DPM path issue
-and explicit local override](docs/dpm-local-path-issue.md).
+```bash
+make deps    # fetch and verify the pinned Token Standard interfaces
+make build   # production and test DARs
+make test    # IDE-ledger suite
+```
+
+Checkouts whose path contains spaces need the workaround in
+[development](docs/development.md).
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The license covers
-this repository's contracts, scripts and documentation; it does not grant access
-to any hosted Outcomia service, operator credentials or network deployment.
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). It covers this
+repository's contracts, scripts and docs, not access to any hosted Outcomia
+service, credentials or deployment.
